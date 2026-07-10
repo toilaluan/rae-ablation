@@ -9,6 +9,7 @@ import torch
 from torch import Tensor
 
 from .rng import preserve_global_rng
+from .sampling import class_balanced_labels
 
 
 @dataclass
@@ -57,11 +58,11 @@ def create_validation_plan(
     visualization_classes: list[int] | None = None,
     channels: int = 1024,
 ) -> ValidationPlan:
-    if final_samples % num_classes or periodic_samples % num_classes:
-        raise ValueError("validation sample counts must be class balanced")
+    # Construct both to validate that the final plan and its periodic prefix are balanced.
+    labels = class_balanced_labels(final_samples, num_classes)
+    class_balanced_labels(periodic_samples, num_classes)
     if periodic_samples > final_samples:
         raise ValueError("periodic plan must be a prefix of final plan")
-    labels = torch.arange(final_samples, dtype=torch.int64).remainder(num_classes)
     sample_ids = torch.arange(final_samples, dtype=torch.int64)
     seed_generator = torch.Generator().manual_seed(seed)
     noise_seeds = torch.randint(0, 2**63 - 1, (final_samples,), generator=seed_generator)

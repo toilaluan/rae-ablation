@@ -8,6 +8,17 @@ from torch import Tensor, nn
 from .flow import internal_guidance, shift_timestep, timestep_shift_alpha
 
 
+def class_balanced_labels(sample_count: int, num_classes: int) -> Tensor:
+    """Return deterministic labels with the same number of samples per class."""
+    if sample_count < 1 or num_classes < 1:
+        raise ValueError("sample count and number of classes must be positive")
+    if sample_count % num_classes:
+        raise ValueError(
+            "sample count must be class balanced (divisible by the number of classes)"
+        )
+    return torch.arange(sample_count, dtype=torch.int64).remainder(num_classes)
+
+
 @torch.inference_mode()
 def euler_sample(
     model: nn.Module,

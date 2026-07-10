@@ -23,6 +23,7 @@ from rae_ablation.config import CacheConfig, DepthAttentionConfig, ModelConfig, 
 from rae_ablation.latents import LatentStatistics
 from rae_ablation.model.dit import DiffusionTransformer
 from rae_ablation.rng import preserve_global_rng
+from rae_ablation.sampling import class_balanced_labels
 from rae_ablation.validation import (
     ValidationPlan,
     create_validation_plan,
@@ -124,6 +125,13 @@ def test_validation_plan_subset_noise_and_rng_preservation(tmp_path: Path) -> No
         random.random()
         np.random.rand()
     assert torch.equal(torch.random.get_rng_state(), state)
+
+
+def test_class_balanced_sampling_labels() -> None:
+    labels = class_balanced_labels(50_000, 1_000)
+    assert torch.equal(torch.bincount(labels), torch.full((1_000,), 50))
+    with pytest.raises(ValueError, match="divisible"):
+        class_balanced_labels(50_001, 1_000)
 
 
 def test_epoch_cadence_and_no_duplicate_validation() -> None:

@@ -163,6 +163,13 @@ torchrun --standalone --nproc-per-node=8 .venv/bin/rae-train \
 uv run rae-sample runs/rae/checkpoints/last/ema-export.safetensors \
   --codec rae --output samples/rae.png --classes 0 1 2 3
 
+# Generate the FID set. `--fid-samples` defaults to 50,000, giving 50 images/class.
+torchrun --standalone --nproc-per-node=8 .venv/bin/rae-sample \
+  runs/rae/checkpoints/last/ema-export.safetensors \
+  --codec rae --cache-dir /data/imagenet-rae-both \
+  --output generated/rae --fid-samples \
+  --plan runs/rae/validation-plan.pt
+
 uv run rae-eval generated/rae validation/real-imagenet-validation \
   --plan runs/rae/validation-plan.pt --output runs/rae/evaluation.json
 
@@ -171,6 +178,11 @@ uv run rae-compare runs/rae/evaluation.json runs/compact/evaluation.json \
 ```
 
 Comparison refuses mismatched validation-plan hashes.
+
+FID sampling uses the labels, sample IDs, and independent noise seeds from the immutable plan.
+It writes one numbered PNG per sample plus `.sampling.json`, refuses to mix checkpoints or plans
+in one directory, and safely resumes an interrupted run. The sample count must be divisible by
+the configured number of classes.
 
 ## Tiny smoke workflow
 
