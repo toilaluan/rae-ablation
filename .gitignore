@@ -18,3 +18,4 @@ validation/
 *.partial
 wandb/
 .hf-cache/
+data/

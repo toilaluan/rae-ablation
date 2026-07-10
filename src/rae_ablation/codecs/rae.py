@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Literal, overload
 
 from torch import Tensor, nn
+import torch
 
 from ..constants import COMPACT_REPO, COMPACT_REVISION, RAE_REPO, RAE_REVISION
 from .base import CodecProvenance, LatentCodec, LatentSpec
@@ -82,6 +83,7 @@ def load_codecs(
         .eval()
         .to(device)
     )
+    rae_model = torch.compile(rae_model, mode="default", fullgraph=True)
     rae = RAECodec(rae_model)
     if kind == "rae":
         return rae
@@ -95,6 +97,7 @@ def load_codecs(
         .eval()
         .to(device)
     )
+    compact_model = torch.compile(compact_model, mode="default", fullgraph=True)
     compact = CompactRAECodec(compact_model, rae)
     if kind == "rae_compact":
         return compact

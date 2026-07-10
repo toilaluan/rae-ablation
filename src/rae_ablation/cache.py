@@ -60,6 +60,7 @@ def read_manifest(path: str | Path) -> CacheManifest:
 
 def initialize_manifest(root: Path, expected: CacheManifest) -> CacheManifest:
     path = root / "manifest.json"
+    print(path)
     root.mkdir(parents=True, exist_ok=True)
     for partial in root.glob("*.partial"):
         partial.unlink()

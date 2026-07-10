@@ -33,6 +33,7 @@ from .validation import ValidationPlan, create_validation_plan
 from .validation_runtime import validate_ema
 from .wandb_utils import WandbLogger
 
+torch._dynamo.config.cache_size_limit = 1000
 
 def _base_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
