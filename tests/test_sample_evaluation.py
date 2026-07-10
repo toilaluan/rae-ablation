@@ -209,7 +209,7 @@ def test_online_validation_writes_shared_artifacts(
     import rae_ablation.validation_runtime as runtime
 
     class TinyModel(nn.Module):
-        def __init__(self, _config: object) -> None:
+        def __init__(self) -> None:
             super().__init__()
             self.weight = nn.Parameter(torch.zeros(()))
 
@@ -217,7 +217,7 @@ def test_online_validation_writes_shared_artifacts(
         def decode(self, latents: torch.Tensor) -> torch.Tensor:
             return torch.zeros((latents.shape[0], 3, 256, 256), device=latents.device)
 
-    monkeypatch.setattr(runtime, "DiffusionTransformer", TinyModel)
+    monkeypatch.setattr(runtime, "build_diffusion_model", lambda _config: TinyModel())
     monkeypatch.setattr(runtime, "compile_model_regions", lambda model, _config: model)
     monkeypatch.setattr(runtime, "load_codecs", lambda _codec, _device: TinyCodec())
     monkeypatch.setattr(runtime, "euler_sample", lambda _model, noise, *_args: noise)

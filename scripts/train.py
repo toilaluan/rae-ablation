@@ -19,7 +19,7 @@ from rae_ablation.constants import (
 from rae_ablation.distributed import initialize_distributed
 from rae_ablation.latents import LatentStatistics
 from rae_ablation.model.compile import compile_model_regions
-from rae_ablation.model.dit import DiffusionTransformer
+from rae_ablation.model.factory import build_diffusion_model
 from rae_ablation.optim import build_optimizer
 from rae_ablation.rng import RNGStreams
 from rae_ablation.sample_runtime import SamplingParameters
@@ -90,7 +90,7 @@ def main() -> None:
     streams = RNGStreams.create(config.train.seed, device)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(streams.initialization.initial_seed())
-        model = DiffusionTransformer(config.model).to(device)
+        model = build_diffusion_model(config.model).to(device)
     dataset = ShardedLatentDataset(config.cache.directory, config.codec)
     manifest = read_manifest(Path(config.cache.directory) / "manifest.json")
     statistics = LatentStatistics.load(

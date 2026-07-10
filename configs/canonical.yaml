@@ -10,6 +10,7 @@ cache:
   output_buffers: 3
   verify: true
 model:
+  architecture: depth_attention_dit
   in_channels: 1024
   hidden_size: 1024
   depth: 16
@@ -24,6 +25,17 @@ model:
   depth_attention:
     enabled: true
     stride: 4
+  ddt_ig:
+    encoder_hidden_size: 1440
+    decoder_hidden_size: 2048
+    encoder_depth: 28
+    decoder_depth: 2
+    encoder_num_heads: 20
+    decoder_num_heads: 16
+    mlp_ratio: 4.0
+    base_model_depth: 8
+    num_time_tokens: 4
+    num_class_tokens: 8
 compile:
   enabled: true
   backend: inductor

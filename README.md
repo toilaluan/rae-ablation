@@ -86,6 +86,27 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
 Structured config changes use repeatable `--override KEY=VALUE` arguments. Sampling algorithm
 settings are script flags, not `validation.*` config fields.
 
+The current causal depth-attention DiT remains the default. To use the opt-in architecture
+matching RAEv2's [`DiTwDDTHeadIG`](https://github.com/nanovisionx/RAEv2/blob/main/src/stage2/models/DDT.py),
+select it with one override:
+
+```bash
+uv run python scripts/train.py \
+  --codec rae --cache-dir /data/imagenet-rae-both --output runs/rae-ddt-ig \
+  --reference-npz /data/VIRTUAL_imagenet256_labeled.npz \
+  --override model.architecture=raev2_ddt_ig
+```
+
+Its default preset follows the RAEv2 DINOv3-L K7 configuration: a 28-block, 1440-wide encoder
+with 20 heads; a 2-block, 2048-wide decoder with 16 heads; an early prediction after encoder
+block 8; and four time plus eight class tokens. The local implementation generates 2D RoPE
+dynamically, so the same parameterization supports both 16x16 RAE and 8x8 compact latent grids.
+The DDT-IG settings can be changed beneath `model.ddt_ig.*`.
+
+Architecture choices are checkpoint-specific. Pass the same config or architecture override to
+`scripts/sample.py`, and do not resume a DDT-IG run from a depth-attention DiT checkpoint (or the
+reverse).
+
 ```bash
 uv run python scripts/train.py \
   --codec rae --cache-dir /data/imagenet-rae-both --output runs/rae-no-depth \

@@ -11,7 +11,7 @@ from rae_ablation.config import load_config
 from rae_ablation.distributed import broadcast_string, initialize_distributed
 from rae_ablation.latents import LatentStatistics
 from rae_ablation.model.compile import compile_model_regions
-from rae_ablation.model.dit import DiffusionTransformer
+from rae_ablation.model.factory import build_diffusion_model
 from rae_ablation.sample_runtime import (
     SamplingParameters,
     checkpoint_sha256,
@@ -63,7 +63,7 @@ def main() -> None:
     digest = checkpoint_sha256(args.checkpoint) if rank == 0 else None
     digest = broadcast_string(digest, rank)
 
-    model = DiffusionTransformer(config.model).to(device)
+    model = build_diffusion_model(config.model).to(device)
     model.load_state_dict(load_file(str(args.checkpoint), device=str(device)))
     model.eval()
     execution_model = compile_model_regions(model, config.compile)
@@ -85,17 +85,18 @@ def main() -> None:
             device,
             dtype=torch.float16 if device.type == "cuda" else torch.float32,
         )
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            with torch.no_grad():
-                normalized = euler_sample(
-                    execution_model,
-                    noise,
-                    batch_labels,
-                    parameters.sampling_steps,
-                    parameters.guidance_scale,
-                    parameters.guidance_start,
-                )
-                return codec.decode(statistics.denormalize(normalized))
+        with torch.autocast(
+            device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+        ), torch.no_grad():
+            normalized = euler_sample(
+                execution_model,
+                noise,
+                batch_labels,
+                parameters.sampling_steps,
+                parameters.guidance_scale,
+                parameters.guidance_start,
+            )
+            return codec.decode(statistics.denormalize(normalized))
 
     sample_to_archive(
         output_dir=args.output_dir,

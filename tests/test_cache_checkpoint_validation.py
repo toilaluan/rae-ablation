@@ -19,8 +19,15 @@ from rae_ablation.cache import (
     verify_cache,
 )
 from rae_ablation.checkpoint import EMA, CheckpointManager, should_checkpoint
-from rae_ablation.config import CacheConfig, DepthAttentionConfig, ModelConfig, WandbConfig
+from rae_ablation.config import (
+    CacheConfig,
+    DDTIGConfig,
+    DepthAttentionConfig,
+    ModelConfig,
+    WandbConfig,
+)
 from rae_ablation.latents import LatentStatistics
+from rae_ablation.model.ddt import RAEv2DDTIG
 from rae_ablation.model.dit import DiffusionTransformer
 from rae_ablation.rng import preserve_global_rng
 from rae_ablation.sampling import class_balanced_labels
@@ -45,6 +52,29 @@ def _tiny_model() -> DiffusionTransformer:
             early_exit_block=1,
             gradient_checkpointing=False,
             depth_attention=DepthAttentionConfig(True, 1),
+        )
+    )
+
+
+def _tiny_ddt_model() -> RAEv2DDTIG:
+    return RAEv2DDTIG(
+        ModelConfig(
+            architecture="raev2_ddt_ig",
+            in_channels=4,
+            num_classes=10,
+            gradient_checkpointing=False,
+            ddt_ig=DDTIGConfig(
+                encoder_hidden_size=16,
+                decoder_hidden_size=32,
+                encoder_depth=2,
+                decoder_depth=1,
+                encoder_num_heads=4,
+                decoder_num_heads=8,
+                mlp_ratio=2.0,
+                base_model_depth=1,
+                num_time_tokens=2,
+                num_class_tokens=3,
+            ),
         )
     )
 
@@ -174,6 +204,32 @@ def test_atomic_checkpoint_clean_keys_resume_retention_and_best(tmp_path: Path) 
     restored_ema = EMA(restored)
     resumed = manager.load(tmp_path / "epoch-0003", restored, restored_ema, "cache", "plan")
     assert resumed.epoch == 3 and resumed.wandb_run_id == "run"
+
+
+def test_ddt_checkpoint_and_ema_round_trip(tmp_path: Path) -> None:
+    model = _tiny_ddt_model()
+    ema = EMA(model)
+    manager = CheckpointManager(tmp_path)
+    manager.save(
+        completed_epoch=1,
+        global_step=2,
+        model=model,
+        ema=ema,
+        optimizer_state={"optimizers": []},
+        scheduler_state={"epoch": 1},
+        rng_streams={"noise": torch.get_rng_state()},
+        cache_fingerprint="cache",
+        validation_plan_hash="plan",
+        last_completed_validation_epoch=None,
+        wandb_run_id=None,
+        resolved_config={"model": {"architecture": "raev2_ddt_ig"}},
+    )
+    restored = _tiny_ddt_model()
+    restored_ema = EMA(restored)
+    manager.load(tmp_path / "epoch-0001", restored, restored_ema, "cache", "plan")
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, restored.state_dict()[key])
+        assert torch.equal(ema.state_dict()[key], restored_ema.state_dict()[key])
 
 
 def test_wandb_is_rank_zero_only_and_resumes(

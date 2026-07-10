@@ -21,6 +21,8 @@ def test_structured_config_and_unknown_key() -> None:
     config = load_config("configs/canonical.yaml", ["model.hidden_size=64", "model.num_heads=4"])
     assert isinstance(config, ExperimentConfig)
     assert config.model.hidden_size == 64
+    assert config.model.architecture == "depth_attention_dit"
+    assert config.model.ddt_ig.encoder_hidden_size == 1440
     with pytest.raises(ConfigKeyError):
         load_config("configs/canonical.yaml", ["model.typo=1"])
 
@@ -29,6 +31,18 @@ def test_config_validation() -> None:
     config = ExperimentConfig()
     config.model.hidden_size = 63
     with pytest.raises(ValueError, match="divisible"):
+        config.validate()
+
+
+def test_ddt_config_validation() -> None:
+    config = ExperimentConfig()
+    config.model.architecture = "raev2_ddt_ig"
+    config.validate()
+    config.model.ddt_ig.base_model_depth = config.model.ddt_ig.encoder_depth + 1
+    with pytest.raises(ValueError, match="base_model_depth"):
+        config.validate()
+    config.model.architecture = "unknown"
+    with pytest.raises(ValueError, match="architecture"):
         config.validate()
 
 

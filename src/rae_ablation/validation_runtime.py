@@ -12,7 +12,7 @@ from .distributed import broadcast_string
 from .evaluation import evaluate_npz, save_evaluation
 from .latents import LatentStatistics
 from .model.compile import compile_model_regions
-from .model.dit import DiffusionTransformer
+from .model.factory import build_diffusion_model
 from .rng import preserving_global_rng
 from .sample_runtime import SamplingParameters, sample_to_archive, state_dict_sha256
 from .sampling import euler_sample
@@ -55,7 +55,7 @@ def validate_ema(
     output = Path(output_root) / f"epoch-{completed_epoch:04d}-{name}"
     output.mkdir(parents=True, exist_ok=True)
 
-    model = DiffusionTransformer(config.model).to(device)
+    model = build_diffusion_model(config.model).to(device)
     model.load_state_dict(ema.state_dict())
     model.eval()
     execution_model = compile_model_regions(model, config.compile)
