@@ -29,9 +29,6 @@ dev = ["pytest>=9,<10", "pytest-cov>=7,<8", "ruff>=0.14,<1"]
 
 [project.scripts]
 rae-cache = "rae_ablation.cli:cache_main"
-rae-train = "rae_ablation.cli:train_main"
-rae-sample = "rae_ablation.cli:sample_main"
-rae-eval = "rae_ablation.cli:eval_main"
 rae-compare = "rae_ablation.cli:compare_main"
 
 [tool.hatch.build.targets.wheel]

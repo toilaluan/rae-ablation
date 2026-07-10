@@ -77,10 +77,6 @@ class ValidationConfig:
     interval: int = 5
     periodic_samples: int = 5_000
     final_samples: int = 50_000
-    batch_size: int = 32
-    sampling_steps: int = 50
-    guidance_scale: float = 1.78
-    guidance_start: float = 0.1
     plan_path: str = "validation-plan.pt"
     validate_now: bool = False
 
@@ -167,10 +163,6 @@ class ExperimentConfig:
             or self.validation.final_samples % m.num_classes
         ):
             raise ValueError("validation sample counts must be class balanced")
-        if self.validation.sampling_steps < 1:
-            raise ValueError("validation.sampling_steps must be positive")
-        if not 0 <= self.validation.guidance_start <= 1:
-            raise ValueError("validation.guidance_start must be in [0, 1]")
         if self.train.global_batch_size < self.train.micro_batch_size:
             raise ValueError("global batch size must be at least the micro batch size")
         if self.train.epochs < 1 or self.train.micro_batch_size < 1:

@@ -19,7 +19,7 @@ from .latents import LatentStatistics
 from .optim import CompositeOptimizer, learning_rate_at_epoch, set_learning_rate
 from .rng import RNGStreams
 from .validation import should_validate
-from .wandb_utils import WandbLogger
+from .wandb_utils import RunLogger
 
 
 @dataclass
@@ -86,7 +86,7 @@ def train(
     checkpoint_manager: CheckpointManager,
     cache_fingerprint: str,
     validation_plan_hash: str,
-    logger: WandbLogger,
+    logger: RunLogger,
     state: TrainState | None = None,
     validation_callback: ValidationCallback | None = None,
 ) -> TrainState:
@@ -101,6 +101,7 @@ def train(
     optimizer.zero_grad()
 
     for epoch_index in range(state.epoch, config.train.epochs):
+        logger.event(f"epoch {epoch_index + 1}/{config.train.epochs} started")
         if sampler is not None:
             sampler.set_epoch(epoch_index)
         execution_model.train()
@@ -157,7 +158,7 @@ def train(
             now = time.perf_counter()
             elapsed = max(now - step_started, 1e-9)
             images = config.train.global_batch_size
-            logger.log(
+            logger.log_training(
                 {
                     "train/loss_velocity_combined": losses.total.item(),
                     "train/loss_velocity_full": losses.full.item(),
@@ -200,17 +201,21 @@ def train(
             state.last_completed_validation_epoch,
             config.validation.validate_now,
         ):
+            logger.event(f"validation started after epoch {state.epoch}")
             validation_metrics = validation_callback(state.epoch, final_epoch)
             state.last_completed_validation_epoch = state.epoch
             config.validation.validate_now = False
             logger.log(validation_metrics, step=state.global_step)
+            for name, value in validation_metrics.items():
+                if "FID" in name:
+                    logger.event(f"{name}: {value:.6f}")
         if rank == 0 and (
             should_checkpoint(state.epoch, config.train.epochs, config.checkpoint.interval)
             or final_epoch
         ):
-            fid = validation_metrics.get("validation/FID-50K") or validation_metrics.get(
-                "validation/FID-5K"
-            )
+            fid = validation_metrics.get("validation/FID-50K")
+            if fid is None:
+                fid = validation_metrics.get("validation/FID-5K")
             path = checkpoint_manager.save(
                 completed_epoch=state.epoch,
                 global_step=state.global_step,
@@ -227,10 +232,14 @@ def train(
                 fid=fid,
             )
             checkpoint_manager.export_ema(ema, path / "ema-export.safetensors")
+            logger.event(f"checkpoint saved: {path}")
             if config.wandb.checkpoint_artifacts:
                 logger.log_checkpoint(str(path), f"checkpoint-epoch-{state.epoch:04d}")
         logger.log(
             {"train/epoch_seconds": time.perf_counter() - epoch_started}, step=state.global_step
+        )
+        logger.event(
+            f"epoch {state.epoch} finished in {time.perf_counter() - epoch_started:.1f}s"
         )
         if final_epoch:
             break

@@ -209,5 +209,20 @@ def test_wandb_is_rank_zero_only_and_resumes(
     logger = WandbLogger(config, {"codec": "rae"}, True, "existing")
     assert calls[0]["id"] == "existing" and calls[0]["resume"] == "allow"
     logger.log({"train/loss_velocity_full": 1.0}, step=2)
+    logger.log_training(
+        {
+            "train/epoch": 1.0,
+            "train/loss_velocity_combined": 2.0,
+            "train/loss_velocity_full": 1.0,
+            "train/loss_velocity_early": 1.0,
+            "train/lr": 1e-4,
+            "train/gradient_norm": 0.5,
+            "throughput/images_per_second": 10.0,
+            "throughput/step_seconds": 0.1,
+            "system/peak_memory_gib": 1.0,
+        },
+        step=3,
+    )
     logger.log_grid(str(tmp_path / "grid.png"), "classes", 2)
     assert any("values" in call for call in calls)
+    assert any(call.get("step") == 3 for call in calls)

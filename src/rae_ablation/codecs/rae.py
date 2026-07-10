@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Literal, overload
 
-from torch import Tensor, nn
 import torch
+from torch import Tensor, nn
 
 from ..constants import COMPACT_REPO, COMPACT_REVISION, RAE_REPO, RAE_REVISION
 from .base import CodecProvenance, LatentCodec, LatentSpec

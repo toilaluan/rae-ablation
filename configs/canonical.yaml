@@ -48,10 +48,6 @@ validation:
   interval: 10
   periodic_samples: 5000
   final_samples: 50000
-  batch_size: 32
-  sampling_steps: 50
-  guidance_scale: 1.78
-  guidance_start: 0.1
   plan_path: validation-plan.pt
 checkpoint:
   directory: checkpoints
