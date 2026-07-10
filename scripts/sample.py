@@ -20,6 +20,7 @@ from rae_ablation.sample_runtime import (
 from rae_ablation.sampling import euler_sample
 from rae_ablation.validation import ValidationPlan, noise_for_samples
 
+torch._dynamo.config.cache_size_limit = 1000
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Sample an EMA export into an ADM-compatible NPZ")
@@ -85,15 +86,16 @@ def main() -> None:
             dtype=torch.float16 if device.type == "cuda" else torch.float32,
         )
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            normalized = euler_sample(
-                execution_model,
-                noise,
-                batch_labels,
-                parameters.sampling_steps,
-                parameters.guidance_scale,
-                parameters.guidance_start,
-            )
-            return codec.decode(statistics.denormalize(normalized))
+            with torch.no_grad():
+                normalized = euler_sample(
+                    execution_model,
+                    noise,
+                    batch_labels,
+                    parameters.sampling_steps,
+                    parameters.guidance_scale,
+                    parameters.guidance_start,
+                )
+                return codec.decode(statistics.denormalize(normalized))
 
     sample_to_archive(
         output_dir=args.output_dir,

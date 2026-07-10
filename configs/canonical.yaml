@@ -5,7 +5,7 @@ cache:
   split: train
   shard_size: 2048
   batch_size: 1024
-  workers: 8
+  workers: 16
   prefetch_factor: 4
   output_buffers: 3
   verify: true
@@ -16,8 +16,8 @@ model:
   num_heads: 16
   mlp_size: 4096
   patch_size: 1
-  base_grid_size: 16
-  early_exit_block: 8
+  base_grid_size: 8
+  early_exit_block: 4
   num_classes: 1000
   dropout: 0.0
   gradient_checkpointing: false
@@ -39,8 +39,8 @@ train:
   seed: 0
   optimizer:
     kind: muon
-    lr: 0.0002
-    min_lr: 0.00002
+    lr: 0.0008
+    min_lr: 0.00008
     weight_decay: 0.05
     beta1: 0.9
     beta2: 0.95

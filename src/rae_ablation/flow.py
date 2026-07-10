@@ -16,7 +16,7 @@ class FlowLoss(NamedTuple):
 
 def timestep_shift_alpha(latent_shape: tuple[int, int, int]) -> float:
     """Resolution-aware shift ``sqrt(C*H*W / 4096)`` (8 for RAE, 4 compact)."""
-    return math.sqrt(math.prod(latent_shape) / 4096)
+    return math.sqrt(math.prod(latent_shape) / (4096 // 4))
 
 
 def shift_timestep(u: Tensor, alpha: float) -> Tensor:

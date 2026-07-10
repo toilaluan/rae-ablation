@@ -19,3 +19,4 @@ validation/
 wandb/
 .hf-cache/
 data/
+generated/
