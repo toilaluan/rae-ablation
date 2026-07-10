@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rae-ablation"
+version = "0.1.0"
+description = "Matched ImageNet-256 diffusion ablation for RAE and compact RAE latents"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "accelerate>=1.12,<2",
+  "datasets>=4.4,<5",
+  "huggingface-hub>=0.36,<1",
+  "numpy>=2.2,<3",
+  "omegaconf>=2.3,<3",
+  "pillow>=11,<13",
+  "safetensors>=0.6,<1",
+  "torch>=2.12,<2.13",
+  "torch-fidelity>=0.3,<1",
+  "torchmetrics[image]>=1.8,<2",
+  "torchvision>=0.27,<0.28",
+  "transformers>=4.57,<4.58",
+  "wandb>=0.23,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9,<10", "pytest-cov>=7,<8", "ruff>=0.14,<1"]
+
+[project.scripts]
+rae-cache = "rae_ablation.cli:cache_main"
+rae-train = "rae_ablation.cli:train_main"
+rae-sample = "rae_ablation.cli:sample_main"
+rae-eval = "rae_ablation.cli:eval_main"
+rae-compare = "rae_ablation.cli:compare_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rae_ablation"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["cuda: requires CUDA", "integration: requires remote models or full metrics"]
