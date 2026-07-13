@@ -1,9 +1,9 @@
 """Immutable experiment provenance."""
 
 RAE_REPO = "toilaluan/raev2-dinov3l-k7"
-RAE_REVISION = "c1205c99df492a7e1941274a0eee09e4754aee0b"
+RAE_REVISION = "46ce5a7e76df99eb5528020d3c65cef528a355fa"
 COMPACT_REPO = "toilaluan/raev2-compressor"
-COMPACT_REVISION = "12c4ae3f889adacaeea8bdec00f2c6d0995e5cb2"
+COMPACT_REVISION = "846e2213dcf6218d3b726448ae52d8104c925c0f"
 IMAGENET_REPO = "benjamin-paine/imagenet-1k-256x256"
 IMAGENET_REVISION = "1bd0400450249a7fe90c0aece37d0d03e7ea956a"
 

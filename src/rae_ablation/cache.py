@@ -217,6 +217,7 @@ def build_cache(config: CacheConfig, device: str | torch.device | None = None) -
     dataset = load_dataset(
         IMAGENET_REPO,
         split=config.split,
+        num_proc=8,
         revision=IMAGENET_REVISION,
     )
     sample_count = min(len(dataset), config.max_samples or len(dataset))
@@ -354,7 +355,7 @@ def compute_cache_statistics(root: str | Path, manifest: CacheManifest | None = 
     moments = {
         name: ChannelMoments(metadata["shape"][0]) for name, metadata in manifest.codecs.items()
     }
-    for shard_id in manifest.completed_shards:
+    for shard_id in manifest.completed_shards[:10]:
         tensors = load_file(str(root / f"shard-{shard_id:06d}.safetensors"), device="cpu")
         for name, accumulator in moments.items():
             accumulator.update(tensors[name])

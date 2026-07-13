@@ -3,14 +3,14 @@ cache:
   codec: both
   directory: cache/imagenet-train
   split: train
-  shard_size: 2048
+  shard_size: 8192
   batch_size: 1024
   workers: 16
   prefetch_factor: 4
   output_buffers: 3
   verify: true
 model:
-  architecture: depth_attention_dit
+  architecture: raev2_ddt_ig
   in_channels: 1024
   hidden_size: 1024
   depth: 16
@@ -26,14 +26,14 @@ model:
     enabled: true
     stride: 4
   ddt_ig:
-    encoder_hidden_size: 1440
+    encoder_hidden_size: 768
     decoder_hidden_size: 2048
-    encoder_depth: 28
+    encoder_depth: 12
     decoder_depth: 2
-    encoder_num_heads: 20
+    encoder_num_heads: 12
     decoder_num_heads: 16
     mlp_ratio: 4.0
-    base_model_depth: 8
+    base_model_depth: 4
     num_time_tokens: 4
     num_class_tokens: 8
 compile:
@@ -45,7 +45,7 @@ compile:
 train:
   epochs: 80
   global_batch_size: 1024
-  micro_batch_size: 256
+  micro_batch_size: 512
   grad_clip: 1.0
   ema_decay: 0.9995
   seed: 0
@@ -53,17 +53,17 @@ train:
     kind: muon
     lr: 0.0008
     min_lr: 0.00008
-    weight_decay: 0.05
+    weight_decay: 0.0
     beta1: 0.9
     beta2: 0.95
 validation:
-  interval: 10
+  interval: 5
   periodic_samples: 5000
   final_samples: 50000
   plan_path: validation-plan.pt
 checkpoint:
   directory: checkpoints
-  interval: 10
+  interval: 5
   keep_last_n: 8
   save_best_fid: true
 wandb:

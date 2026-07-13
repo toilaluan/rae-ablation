@@ -36,7 +36,7 @@ yourself; the scripts never download this input automatically.
 ```bash
 curl -L \
   https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz \
-  -o /data/VIRTUAL_imagenet256_labeled.npz
+  -o ./data/VIRTUAL_imagenet256_labeled.npz
 ```
 
 ## Cache latents
@@ -45,13 +45,14 @@ The dataset already contains 256x256 images. Caching performs RGB conversion, te
 conversion, and uint8-to-`[0,1]` scaling only.
 
 ```bash
-uv run rae-cache --config configs/canonical.yaml --codec rae --output /data/rae-cache
+uv run torchrun --standalone --nproc-per-node=8 .venv/bin/rae-cache \
+  --config configs/canonical.yaml --codec rae_compact --output ./data/rae-compact-cache
 
 uv run torchrun --standalone --nproc-per-node=8 .venv/bin/rae-cache \
-  --config configs/canonical.yaml --codec both --output /data/imagenet-rae-both
+  --config configs/canonical.yaml --codec both --output ./data/imagenet-rae-both
 
 uv run rae-cache --config configs/canonical.yaml \
-  --output /data/imagenet-rae-both --verify-only
+  --output ./data/imagenet-rae-both --verify-only
 ```
 
 Raw fp16 tensors are written as atomic, resumable safetensors shards. Each shard stores
@@ -64,23 +65,12 @@ or 782 GiB for the combined cache, plus filesystem overhead.
 
 ## Train
 
-Training, sampling, and evaluation are independent Python scripts. A single-device launch is:
-
-```bash
-uv run python scripts/train.py \
-  --config configs/canonical.yaml --codec rae \
-  --cache-dir /data/imagenet-rae-both --output runs/rae \
-  --reference-npz /data/VIRTUAL_imagenet256_labeled.npz \
-  --validation-interval 5 --checkpoint-interval 1 --wandb
-```
-
-For distributed training, replace `python` with `torchrun --standalone --nproc-per-node=8`:
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --codec rae_compact --cache-dir /data/imagenet-rae-both \
-  --output runs/compact \
-  --reference-npz /data/VIRTUAL_imagenet256_labeled.npz --wandb
+  --config configs/canonical.yaml --codec rae_compact \
+  --cache-dir ./data/rae-compact-cache --output runs/rae_compact \
+  --reference-npz ./data/VIRTUAL_imagenet256_labeled.npz --wandb
 ```
 
 Structured config changes use repeatable `--override KEY=VALUE` arguments. Sampling algorithm
@@ -92,8 +82,8 @@ select it with one override:
 
 ```bash
 uv run python scripts/train.py \
-  --codec rae --cache-dir /data/imagenet-rae-both --output runs/rae-ddt-ig \
-  --reference-npz /data/VIRTUAL_imagenet256_labeled.npz \
+  --codec rae --cache-dir ./data/imagenet-rae-both --output runs/rae-ddt-ig \
+  --reference-npz ./data/VIRTUAL_imagenet256_labeled.npz \
   --override model.architecture=raev2_ddt_ig
 ```
 
@@ -109,8 +99,8 @@ reverse).
 
 ```bash
 uv run python scripts/train.py \
-  --codec rae --cache-dir /data/imagenet-rae-both --output runs/rae-no-depth \
-  --reference-npz /data/VIRTUAL_imagenet256_labeled.npz \
+  --codec rae --cache-dir ./data/imagenet-rae-both --output runs/rae-no-depth \
+  --reference-npz ./data/VIRTUAL_imagenet256_labeled.npz \
   --override model.depth_attention.enabled=false \
   --override model.gradient_checkpointing=false \
   --override compile.enabled=false \
@@ -131,8 +121,8 @@ Resume and optionally force validation with:
 
 ```bash
 uv run python scripts/train.py \
-  --codec rae --cache-dir /data/imagenet-rae-both --output runs/rae \
-  --reference-npz /data/VIRTUAL_imagenet256_labeled.npz \
+  --codec rae --cache-dir ./data/imagenet-rae-both --output runs/rae \
+  --reference-npz ./data/VIRTUAL_imagenet256_labeled.npz \
   --resume runs/rae/checkpoints/last --validate-now --wandb
 ```
 
@@ -161,7 +151,7 @@ Create the default balanced 50,000-image archive (50 images per ImageNet class):
 uv run python scripts/sample.py \
   --checkpoint runs/rae/checkpoints/last/ema-export.safetensors \
   --plan runs/rae/validation-plan.pt --output-dir generated/rae \
-  --codec rae --cache-dir /data/imagenet-rae-both
+  --codec rae --cache-dir ./data/imagenet-rae-both
 ```
 
 Use `uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py ...` to distribute sample
@@ -188,9 +178,9 @@ The adjacent `samples.json` supplies the immutable plan hash.
 
 ```bash
 uv run python scripts/eval.py \
-  --samples generated/rae/samples.npz \
-  --reference /data/VIRTUAL_imagenet256_labeled.npz \
-  --output runs/rae/evaluation.json
+  --samples generated/rae_compact/samples.npz \
+  --reference ./data/VIRTUAL_imagenet256_labeled.npz \
+  --output runs/rae_compact/evaluation.json
 
 uv run rae-compare runs/rae/evaluation.json runs/compact/evaluation.json \
   --output runs/comparison.json
@@ -224,7 +214,7 @@ uv run rae-cache --codec both --output /tmp/rae-smoke --max-samples 32 \
 
 uv run python scripts/train.py \
   --codec rae --cache-dir /tmp/rae-smoke --output /tmp/rae-smoke-run --max-steps 2 \
-  --reference-npz /data/VIRTUAL_imagenet256_labeled.npz \
+  --reference-npz ./data/VIRTUAL_imagenet256_labeled.npz \
   --override model.hidden_size=128 --override model.depth=2 \
   --override model.num_heads=4 --override model.mlp_size=256 \
   --override model.early_exit_block=1 --override compile.enabled=false \
