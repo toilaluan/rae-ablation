@@ -59,8 +59,7 @@ def build_optimizer(model: nn.Module, config: OptimizerConfig) -> CompositeOptim
     ]
     if not hasattr(torch.optim, "Muon"):
         raise RuntimeError("optimizer.kind=muon requires torch.optim.Muon (PyTorch 2.12+)")
-    muon_type = torch.optim.Muon
-    muon = muon_type(muon_parameters, lr=config.lr, weight_decay=config.weight_decay)
+    muon = torch.optim.Muon(muon_parameters, lr=config.lr, weight_decay=config.weight_decay, adjust_lr_fn="match_rms_adamw")
     adam = torch.optim.AdamW(
         adam_parameters,
         lr=config.lr,
