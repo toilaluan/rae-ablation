@@ -53,7 +53,7 @@ def sample_timesteps(
         dtype=torch.float32,
     ) * maximum_per_patch
     patchwise = torch.where(patchwise < 0, replacement, patchwise)
-    return TimestepSample(maximum, patchwise)
+    return TimestepSample(patchwise, patchwise)
 
 
 def x_to_velocity(

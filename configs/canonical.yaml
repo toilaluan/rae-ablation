@@ -11,6 +11,7 @@ cache:
   verify: true
 model:
   in_channels: 1024
+  use_patch_forcing: false
   encoder_hidden_size: 768
   decoder_hidden_size: 2048
   encoder_depth: 12
@@ -37,7 +38,6 @@ train:
   grad_clip: 1.0
   ema_decay: 0.9995
   seed: 0
-  use_patch_forcing: false
   timestep_loc: 0.0
   timestep_scale: 1.0
   optimizer:

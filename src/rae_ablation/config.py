@@ -9,6 +9,7 @@ from typing import Any
 @dataclass
 class ModelConfig:
     in_channels: int = 1024
+    use_patch_forcing: bool = False
     encoder_hidden_size: int = 1440
     decoder_hidden_size: int = 2048
     encoder_depth: int = 28
@@ -66,7 +67,6 @@ class TrainConfig:
     grad_clip: float = 1.0
     ema_decay: float = 0.9995
     seed: int = 0
-    use_patch_forcing: bool = False
     timestep_loc: float = 0.0
     timestep_scale: float = 1.0
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)

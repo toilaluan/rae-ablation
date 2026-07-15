@@ -115,6 +115,9 @@ uv run python scripts/train.py \
   --validate-now --wandb
 ```
 
+When resuming a patch-forcing run, also pass `--use-patch-forcing` so the checkpoint is loaded into
+the same static model variant.
+
 Other configuration changes use repeatable `--override KEY=VALUE` arguments. DDT dimensions are
 flat `model.*` fields such as `model.encoder_depth`, `model.encoder_hidden_size`, and
 `model.base_model_depth`.
@@ -140,7 +143,7 @@ t_i = t_max for every spatial token
 ```
 
 With patch forcing, each spatial token receives a potentially noisier timestep while the DDT is
-conditioned on `t_max`:
+conditioned on its own `t_i`:
 
 ```text
 t_i = t_max - abs(N(0, (t_max/2)^2))
@@ -148,6 +151,11 @@ if t_i < 0: t_i = U(0, t_max)
 ```
 
 Patch timesteps are shared across latent channels. Lower `t_i` means more noise.
+Patch-forcing models omit encoder time tokens, so the encoder sequence contains only spatial and
+class tokens. The encoder blocks are timestep-agnostic; after the encoder, each `t_i` is embedded
+independently and modulates both the decoder path and the early prediction head. During ordinary
+Euler sampling, the scalar schedule timestep is broadcast to every patch without re-enabling
+encoder time tokens.
 
 ## Sample
 
@@ -165,6 +173,9 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
   --guidance-scale 1.78 \
   --timestep-shift 1.0
 ```
+
+When sampling a patch-forcing checkpoint, add `--use-patch-forcing`. This broadcasts each scalar
+sampling timestep across patches while preserving the time-token-free encoder architecture.
 
 Sampling integrates from `t=0` noise to `t=1` data. Internal guidance is always
 `early + guidance_scale*(full-early)`; use scale `1.0` to select the full prediction. The positive

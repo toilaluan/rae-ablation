@@ -120,7 +120,7 @@ def train(
                 tuple(clean.shape[1:]),
                 streams.timesteps,
                 device,
-                use_patch_forcing=config.train.use_patch_forcing,
+                use_patch_forcing=config.model.use_patch_forcing,
                 loc=config.train.timestep_loc,
                 scale=config.train.timestep_scale,
             )

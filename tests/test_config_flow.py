@@ -28,10 +28,13 @@ def test_structured_config_and_unknown_key() -> None:
     assert isinstance(config, ExperimentConfig)
     assert config.model.encoder_hidden_size == 64
     assert config.model.decoder_hidden_size == 2048
+    assert not config.model.use_patch_forcing
     with pytest.raises(ConfigKeyError):
         load_config("configs/canonical.yaml", ["model.typo=1"])
     with pytest.raises(ConfigKeyError):
         load_config("configs/canonical.yaml", ["model.architecture=depth_attention_dit"])
+    with pytest.raises(ConfigKeyError):
+        load_config("configs/canonical.yaml", ["train.use_patch_forcing=true"])
 
 
 def test_ddt_and_timestep_config_validation() -> None:
@@ -95,8 +98,9 @@ def test_patch_forcing_matches_sampling_mechanism() -> None:
     expected = torch.where(candidate < 0, replacement, candidate)
 
     assert torch.any(candidate < 0)
-    assert torch.equal(actual.conditioning, maximum)
+    assert torch.equal(actual.conditioning, expected)
     assert torch.equal(actual.interpolation, expected)
+    assert torch.equal(actual.conditioning, actual.interpolation)
     assert actual.interpolation.shape == (batch, 1, height, width)
     assert torch.all(actual.interpolation >= 0)
     assert torch.all(actual.interpolation <= maximum_per_patch)

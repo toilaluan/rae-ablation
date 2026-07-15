@@ -41,15 +41,28 @@ class GaussianFourierTokenEmbedding(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
         )
-        self.learnable_tokens = nn.Parameter(
-            torch.randn(num_tokens, hidden_size) / math.sqrt(hidden_size)
-        )
+        self.hidden_size = hidden_size
+        if num_tokens:
+            self.learnable_tokens = nn.Parameter(
+                torch.randn(num_tokens, hidden_size) / math.sqrt(hidden_size)
+            )
+        else:
+            self.register_parameter("learnable_tokens", None)
 
-    def forward(self, timestep: Tensor) -> tuple[Tensor, Tensor]:
+    def embed(self, timestep: Tensor) -> Tensor:
+        shape = timestep.shape
         angles = timestep.float().reshape(-1, 1) * self.frequencies.reshape(1, -1)
         angles = 2 * torch.pi * angles
         embedding = torch.cat((angles.sin(), angles.cos()), dim=-1)
-        base = self.mlp(embedding.to(dtype=self.mlp[0].weight.dtype)).unsqueeze(1)
+        embedded = self.mlp(embedding.to(dtype=self.mlp[0].weight.dtype))
+        return embedded.reshape(*shape, self.hidden_size)
+
+    def forward(self, timestep: Tensor) -> tuple[Tensor, Tensor]:
+        if timestep.ndim != 1:
+            raise ValueError("time-token timesteps must have shape [B]")
+        if self.learnable_tokens is None:
+            raise RuntimeError("time tokens are disabled for this model")
+        base = self.embed(timestep).unsqueeze(1)
         return base, base + self.learnable_tokens.unsqueeze(0)
 
 
@@ -200,7 +213,8 @@ class RAEv2DDTIG(nn.Module):
             config.in_channels, config.decoder_hidden_size
         )
         self.time_embedding = GaussianFourierTokenEmbedding(
-            config.encoder_hidden_size, config.num_time_tokens
+            config.encoder_hidden_size,
+            0 if config.use_patch_forcing else config.num_time_tokens,
         )
         self.class_embedding = LabelTokenEmbedding(
             config.num_classes, config.encoder_hidden_size, config.num_class_tokens
@@ -263,15 +277,41 @@ class RAEv2DDTIG(nn.Module):
     def _unpatchify(tokens: Tensor, channels: int, height: int, width: int) -> Tensor:
         return tokens.transpose(1, 2).reshape(tokens.shape[0], channels, height, width)
 
+    def _patch_time_embedding(
+        self,
+        timestep: Tensor,
+        batch_size: int,
+        height: int,
+        width: int,
+    ) -> Tensor:
+        spatial_tokens = height * width
+        if timestep.ndim == 1:
+            if timestep.shape[0] != batch_size:
+                raise ValueError("timestep batch dimension must match latent")
+            return self.time_embedding.embed(timestep).unsqueeze(1).expand(
+                -1, spatial_tokens, -1
+            )
+        if timestep.ndim == 4 and timestep.shape == (batch_size, 1, height, width):
+            if not self.config.use_patch_forcing:
+                raise ValueError("patchwise timesteps require model.use_patch_forcing")
+            return self.time_embedding.embed(timestep[:, 0].flatten(1))
+        raise ValueError("timestep must have shape [B] or [B, 1, H, W]")
+
     def forward(self, latent: Tensor, timestep: Tensor, labels: Tensor) -> DDTOutput:
         if latent.ndim != 4 or latent.shape[1] != self.config.in_channels:
             raise ValueError("latent must have shape [B, configured in_channels, H, W]")
-        _, _, height, width = latent.shape
+        batch_size, _, height, width = latent.shape
         spatial_tokens = height * width
-        base_timestep, time_tokens = self.time_embedding(timestep)
-        sequence = torch.cat(
-            (self.encoder_input(latent), time_tokens, self.class_embedding(labels)), dim=1
+        patch_timestep = self._patch_time_embedding(
+            timestep, batch_size, height, width
         )
+        spatial = self.encoder_input(latent)
+        label_tokens = self.class_embedding(labels)
+        if self.config.use_patch_forcing:
+            sequence = torch.cat((spatial, label_tokens), dim=1)
+        else:
+            _, time_tokens = self.time_embedding(timestep)
+            sequence = torch.cat((spatial, time_tokens, label_tokens), dim=1)
         early_tokens: Tensor | None = None
         for index, block in enumerate(self.encoder_blocks, start=1):
             if self._checkpointing():
@@ -292,7 +332,7 @@ class RAEv2DDTIG(nn.Module):
             raise RuntimeError("DDT base prediction block was not reached")
 
         encoder_spatial = sequence[:, :spatial_tokens]
-        conditioning = self.encoder_to_decoder(F.silu(base_timestep + encoder_spatial))
+        conditioning = self.encoder_to_decoder(F.silu(patch_timestep + encoder_spatial))
         decoded = self.decoder_input(latent)
         for block in self.decoder_blocks:
             if self._checkpointing():
@@ -308,7 +348,7 @@ class RAEv2DDTIG(nn.Module):
             else:
                 decoded = block(decoded, conditioning, height, width)
 
-        early_conditioning = F.silu(base_timestep + early_tokens)
+        early_conditioning = F.silu(patch_timestep + early_tokens)
         full = self.full_head(decoded, conditioning)
         early = self.early_head(early_conditioning, early_conditioning)
         return DDTOutput(

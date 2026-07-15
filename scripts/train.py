@@ -72,7 +72,7 @@ def main() -> None:
     if args.max_steps is not None:
         config.train.max_steps = args.max_steps
     if args.use_patch_forcing:
-        config.train.use_patch_forcing = True
+        config.model.use_patch_forcing = True
     config.validation.validate_now = args.validate_now
     config.wandb.enabled = config.wandb.enabled or args.wandb
     config.validate()

@@ -36,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sampling-steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=1.78)
     parser.add_argument("--timestep-shift", type=float, default=1.0)
+    parser.add_argument("--use-patch-forcing", action="store_true")
     parser.add_argument("--log-interval", type=int, default=10)
     return parser
 
@@ -47,6 +48,8 @@ def main() -> None:
         config.codec = args.codec
     if args.cache_dir:
         config.cache.directory = str(args.cache_dir)
+    if args.use_patch_forcing:
+        config.model.use_patch_forcing = True
     config.validate()
     parameters = SamplingParameters(
         batch_size=args.batch_size,
