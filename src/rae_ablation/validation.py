@@ -107,11 +107,7 @@ def should_validate(
 ) -> bool:
     if completed_epoch == last_completed_validation_epoch and not validate_now:
         return False
-    return (
-        validate_now
-        or completed_epoch == total_epochs
-        or (interval > 0 and completed_epoch % interval == 0)
-    )
+    return validate_now or completed_epoch == total_epochs or completed_epoch % interval == 0
 
 
 def run_preserving_training_state(model: torch.nn.Module, function: object) -> object:

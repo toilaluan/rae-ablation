@@ -194,6 +194,23 @@ def train(
             config.train.max_steps is not None and state.global_step >= config.train.max_steps
         )
 
+        validation_metrics: dict[str, float] = {}
+        if validation_callback is not None and should_validate(
+            state.epoch,
+            config.train.epochs if not final_epoch else state.epoch,
+            config.validation.interval,
+            state.last_completed_validation_epoch,
+            config.validation.validate_now,
+        ):
+            logger.event(f"validation started after epoch {state.epoch}")
+            validation_metrics = validation_callback(state.epoch, final_epoch)
+            state.last_completed_validation_epoch = state.epoch
+            config.validation.validate_now = False
+            logger.log(validation_metrics, step=state.global_step)
+            for name, value in validation_metrics.items():
+                if "FID" in name:
+                    logger.event(f"{name}: {value:.6f}")
+
         if rank == 0 and (
             should_checkpoint(state.epoch, config.train.epochs, config.checkpoint.interval)
             or final_epoch
@@ -220,29 +237,11 @@ def train(
             logger.event(f"checkpoint saved: {path}")
             if config.wandb.checkpoint_artifacts:
                 logger.log_checkpoint(str(path), f"checkpoint-epoch-{state.epoch:04d}")
-        validation_metrics: dict[str, float] = {}
-        if validation_callback is not None and should_validate(
-            state.epoch,
-            config.train.epochs if not final_epoch else state.epoch,
-            config.validation.interval,
-            state.last_completed_validation_epoch,
-            config.validation.validate_now,
-        ):
-            logger.event(f"validation started after epoch {state.epoch}")
-            validation_metrics = validation_callback(state.epoch, final_epoch)
-            state.last_completed_validation_epoch = state.epoch
-            config.validation.validate_now = False
-            logger.log(validation_metrics, step=state.global_step)
-            for name, value in validation_metrics.items():
-                if "FID" in name:
-                    logger.event(f"{name}: {value:.6f}")
-        
+
         logger.log(
             {"train/epoch_seconds": time.perf_counter() - epoch_started}, step=state.global_step
         )
-        logger.event(
-            f"epoch {state.epoch} finished in {time.perf_counter() - epoch_started:.1f}s"
-        )
+        logger.event(f"epoch {state.epoch} finished in {time.perf_counter() - epoch_started:.1f}s")
         if final_epoch:
             break
     return state
