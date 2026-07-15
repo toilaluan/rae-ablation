@@ -42,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-interval", type=int)
     parser.add_argument("--checkpoint-interval", type=int)
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--use-patch-forcing", action="store_true")
     parser.add_argument("--validate-now", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--log-interval", type=int, default=10)
@@ -49,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-batch-size", type=int, default=32)
     parser.add_argument("--eval-sampling-steps", type=int, default=50)
     parser.add_argument("--eval-guidance-scale", type=float, default=1.78)
-    parser.add_argument("--eval-guidance-start", type=float, default=0.1)
+    parser.add_argument("--eval-timestep-shift", type=float, default=1.0)
     parser.add_argument("--eval-log-interval", type=int, default=10)
     return parser
 
@@ -70,6 +71,8 @@ def main() -> None:
         config.checkpoint.interval = args.checkpoint_interval
     if args.max_steps is not None:
         config.train.max_steps = args.max_steps
+    if args.use_patch_forcing:
+        config.train.use_patch_forcing = True
     config.validation.validate_now = args.validate_now
     config.wandb.enabled = config.wandb.enabled or args.wandb
     config.validate()
@@ -77,7 +80,7 @@ def main() -> None:
         batch_size=args.eval_batch_size,
         sampling_steps=args.eval_sampling_steps,
         guidance_scale=args.eval_guidance_scale,
-        guidance_start=args.eval_guidance_start,
+        timestep_shift=args.eval_timestep_shift,
         log_interval=args.eval_log_interval,
     )
     sampling.validate()
@@ -138,7 +141,7 @@ def main() -> None:
         "batch_size": sampling.batch_size,
         "sampling_steps": sampling.sampling_steps,
         "guidance_scale": sampling.guidance_scale,
-        "guidance_start": sampling.guidance_start,
+        "timestep_shift": sampling.timestep_shift,
         "log_interval": sampling.log_interval,
     }
     logged_config["provenance"] = {

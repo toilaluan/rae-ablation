@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -8,8 +9,12 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from ..config import ModelConfig
-from .dit import DiTOutput
 from .rope import apply_2d_rope
+
+
+class DDTOutput(NamedTuple):
+    full: Tensor
+    early: Tensor
 
 
 def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
@@ -188,48 +193,47 @@ class RAEv2DDTIG(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
-        ddt = config.ddt_ig
         self.encoder_input = SpatialProjection(
-            config.in_channels, ddt.encoder_hidden_size
+            config.in_channels, config.encoder_hidden_size
         )
         self.decoder_input = SpatialProjection(
-            config.in_channels, ddt.decoder_hidden_size
+            config.in_channels, config.decoder_hidden_size
         )
         self.time_embedding = GaussianFourierTokenEmbedding(
-            ddt.encoder_hidden_size, ddt.num_time_tokens
+            config.encoder_hidden_size, config.num_time_tokens
         )
         self.class_embedding = LabelTokenEmbedding(
-            config.num_classes, ddt.encoder_hidden_size, ddt.num_class_tokens
+            config.num_classes, config.encoder_hidden_size, config.num_class_tokens
         )
         self.encoder_blocks = nn.ModuleList(
             [
                 DDTEncoderBlock(
-                    ddt.encoder_hidden_size,
-                    ddt.encoder_num_heads,
-                    ddt.mlp_ratio,
+                    config.encoder_hidden_size,
+                    config.encoder_num_heads,
+                    config.mlp_ratio,
                     config.dropout,
                 )
-                for _ in range(ddt.encoder_depth)
+                for _ in range(config.encoder_depth)
             ]
         )
         self.encoder_to_decoder = (
-            nn.Linear(ddt.encoder_hidden_size, ddt.decoder_hidden_size)
-            if ddt.encoder_hidden_size != ddt.decoder_hidden_size
+            nn.Linear(config.encoder_hidden_size, config.decoder_hidden_size)
+            if config.encoder_hidden_size != config.decoder_hidden_size
             else nn.Identity()
         )
         self.decoder_blocks = nn.ModuleList(
             [
                 DDTDecoderBlock(
-                    ddt.decoder_hidden_size,
-                    ddt.decoder_num_heads,
-                    ddt.mlp_ratio,
+                    config.decoder_hidden_size,
+                    config.decoder_num_heads,
+                    config.mlp_ratio,
                     config.dropout,
                 )
-                for _ in range(ddt.decoder_depth)
+                for _ in range(config.decoder_depth)
             ]
         )
-        self.full_head = DDTFinalLayer(ddt.decoder_hidden_size, config.in_channels)
-        self.early_head = DDTFinalLayer(ddt.encoder_hidden_size, config.in_channels)
+        self.full_head = DDTFinalLayer(config.decoder_hidden_size, config.in_channels)
+        self.early_head = DDTFinalLayer(config.encoder_hidden_size, config.in_channels)
         self.gradient_checkpointing = config.gradient_checkpointing
         self._initialize_weights()
 
@@ -259,7 +263,7 @@ class RAEv2DDTIG(nn.Module):
     def _unpatchify(tokens: Tensor, channels: int, height: int, width: int) -> Tensor:
         return tokens.transpose(1, 2).reshape(tokens.shape[0], channels, height, width)
 
-    def forward(self, latent: Tensor, timestep: Tensor, labels: Tensor) -> DiTOutput:
+    def forward(self, latent: Tensor, timestep: Tensor, labels: Tensor) -> DDTOutput:
         if latent.ndim != 4 or latent.shape[1] != self.config.in_channels:
             raise ValueError("latent must have shape [B, configured in_channels, H, W]")
         _, _, height, width = latent.shape
@@ -282,7 +286,7 @@ class RAEv2DDTIG(nn.Module):
                 )
             else:
                 sequence = block(sequence, height, width, spatial_tokens)
-            if index == self.config.ddt_ig.base_model_depth:
+            if index == self.config.base_model_depth:
                 early_tokens = sequence[:, :spatial_tokens]
         if early_tokens is None:
             raise RuntimeError("DDT base prediction block was not reached")
@@ -307,7 +311,7 @@ class RAEv2DDTIG(nn.Module):
         early_conditioning = F.silu(base_timestep + early_tokens)
         full = self.full_head(decoded, conditioning)
         early = self.early_head(early_conditioning, early_conditioning)
-        return DiTOutput(
+        return DDTOutput(
             full=self._unpatchify(full, self.config.in_channels, height, width),
             early=self._unpatchify(early, self.config.in_channels, height, width),
         )

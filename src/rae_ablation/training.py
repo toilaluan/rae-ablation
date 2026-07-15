@@ -115,13 +115,19 @@ def train(
             latent = latent.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             clean = statistics.normalize(latent.float())
-            timestep = sample_timesteps(
-                clean.shape[0], tuple(clean.shape[1:]), streams.timesteps, device
+            timesteps = sample_timesteps(
+                clean.shape[0],
+                tuple(clean.shape[1:]),
+                streams.timesteps,
+                device,
+                use_patch_forcing=config.train.use_patch_forcing,
+                loc=config.train.timestep_loc,
+                scale=config.train.timestep_scale,
             )
             noise = torch.randn(
                 clean.shape, device=device, dtype=torch.float32, generator=streams.noise
             )
-            x_t = noisy_interpolate(clean, noise, timestep)
+            x_t = noisy_interpolate(clean, noise, timesteps.interpolation)
             update = (batch_index + 1) % accumulation == 0
             sync_context = (
                 execution_model.no_sync()
@@ -134,8 +140,14 @@ def train(
                     dtype=torch.bfloat16,
                     enabled=device.type == "cuda",
                 ):
-                    output = execution_model(x_t, timestep, labels)
-                losses = flow_losses(clean, noise, timestep, output.full, output.early)
+                    output = execution_model(x_t, timesteps.conditioning, labels)
+                losses = flow_losses(
+                    clean,
+                    noise,
+                    timesteps.interpolation,
+                    output.full,
+                    output.early,
+                )
                 (losses.total / accumulation).backward()
             last_compute_end = time.perf_counter()
             if not update:

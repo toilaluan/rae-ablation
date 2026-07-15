@@ -19,16 +19,9 @@ from rae_ablation.cache import (
     verify_cache,
 )
 from rae_ablation.checkpoint import EMA, CheckpointManager, should_checkpoint
-from rae_ablation.config import (
-    CacheConfig,
-    DDTIGConfig,
-    DepthAttentionConfig,
-    ModelConfig,
-    WandbConfig,
-)
+from rae_ablation.config import CacheConfig, ModelConfig, WandbConfig
 from rae_ablation.latents import LatentStatistics
 from rae_ablation.model.ddt import RAEv2DDTIG
-from rae_ablation.model.dit import DiffusionTransformer
 from rae_ablation.rng import preserve_global_rng
 from rae_ablation.sampling import class_balanced_labels
 from rae_ablation.validation import (
@@ -40,43 +33,28 @@ from rae_ablation.validation import (
 from rae_ablation.wandb_utils import WandbLogger
 
 
-def _tiny_model() -> DiffusionTransformer:
-    return DiffusionTransformer(
+def _tiny_model() -> RAEv2DDTIG:
+    return RAEv2DDTIG(
         ModelConfig(
             in_channels=4,
-            hidden_size=16,
-            depth=2,
-            num_heads=4,
-            mlp_size=32,
-            base_grid_size=2,
-            early_exit_block=1,
+            encoder_hidden_size=16,
+            decoder_hidden_size=32,
+            encoder_depth=2,
+            decoder_depth=1,
+            encoder_num_heads=4,
+            decoder_num_heads=8,
+            mlp_ratio=2.0,
+            base_model_depth=1,
+            num_time_tokens=2,
+            num_class_tokens=3,
+            num_classes=10,
             gradient_checkpointing=False,
-            depth_attention=DepthAttentionConfig(True, 1),
         )
     )
 
 
 def _tiny_ddt_model() -> RAEv2DDTIG:
-    return RAEv2DDTIG(
-        ModelConfig(
-            architecture="raev2_ddt_ig",
-            in_channels=4,
-            num_classes=10,
-            gradient_checkpointing=False,
-            ddt_ig=DDTIGConfig(
-                encoder_hidden_size=16,
-                decoder_hidden_size=32,
-                encoder_depth=2,
-                decoder_depth=1,
-                encoder_num_heads=4,
-                decoder_num_heads=8,
-                mlp_ratio=2.0,
-                base_model_depth=1,
-                num_time_tokens=2,
-                num_class_tokens=3,
-            ),
-        )
-    )
+    return _tiny_model()
 
 
 def test_manifest_resume_rejection_and_exact_fp16_statistics(tmp_path: Path) -> None:
@@ -222,7 +200,7 @@ def test_ddt_checkpoint_and_ema_round_trip(tmp_path: Path) -> None:
         validation_plan_hash="plan",
         last_completed_validation_epoch=None,
         wandb_run_id=None,
-        resolved_config={"model": {"architecture": "raev2_ddt_ig"}},
+        resolved_config={"model": {"encoder_depth": 2}},
     )
     restored = _tiny_ddt_model()
     restored_ema = EMA(restored)

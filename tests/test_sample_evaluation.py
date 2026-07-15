@@ -90,6 +90,9 @@ def test_sample_archive_is_atomic_balanced_and_resumable(tmp_path: Path) -> None
         assert info.extract_version >= 45
     manifest = json.loads((tmp_path / "samples.json").read_text())
     assert manifest["complete"] and manifest["class_counts"] == [2, 2]
+    assert manifest["schema_version"] == 3
+    assert manifest["sampling"]["timestep_shift"] == 1.0
+    assert "guidance_start" not in manifest["sampling"]
     assert (tmp_path / "preview.png").exists()
     preview = np.asarray(Image.open(tmp_path / "preview.png"))
     assert preview[0, [0, 256, 512, 768], 0].tolist() == [0, 1, 2, 3]
@@ -104,6 +107,19 @@ def test_sample_archive_is_atomic_balanced_and_resumable(tmp_path: Path) -> None
             codec="rae",
             checkpoint_hash="different",
             parameters=parameters,
+            generate_batch=resumed,
+        )
+    with pytest.raises(ValueError, match="does not match"):
+        sample_to_archive(
+            output_dir=tmp_path,
+            plan=plan,
+            sample_count=4,
+            num_classes=2,
+            codec="rae",
+            checkpoint_hash="abc",
+            parameters=SamplingParameters(
+                batch_size=2, sampling_steps=3, timestep_shift=2.0, log_interval=1
+            ),
             generate_batch=resumed,
         )
 
@@ -160,7 +176,9 @@ def test_evaluate_npz_with_streamed_features(tmp_path: Path) -> None:
     assert any(message.startswith("feature extraction:") for message in messages)
 
 
-@pytest.mark.parametrize("script", ["train.py", "sample.py", "eval.py"])
+@pytest.mark.parametrize(
+    "script", ["train.py", "sample.py", "eval.py", "cache.py", "compare.py"]
+)
 def test_standalone_script_help(script: str) -> None:
     root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
@@ -177,7 +195,7 @@ def test_standalone_script_help(script: str) -> None:
 def test_combined_entry_points_are_removed() -> None:
     root = Path(__file__).resolve().parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text())
-    assert project["project"]["scripts"].keys() == {"rae-cache", "rae-compare"}
+    assert "scripts" not in project["project"]
 
 
 def test_console_training_throttle_and_non_main_silence(capsys: pytest.CaptureFixture[str]) -> None:
@@ -220,7 +238,9 @@ def test_online_validation_writes_shared_artifacts(
     monkeypatch.setattr(runtime, "build_diffusion_model", lambda _config: TinyModel())
     monkeypatch.setattr(runtime, "compile_model_regions", lambda model, _config: model)
     monkeypatch.setattr(runtime, "load_codecs", lambda _codec, _device: TinyCodec())
-    monkeypatch.setattr(runtime, "euler_sample", lambda _model, noise, *_args: noise)
+    monkeypatch.setattr(
+        runtime, "euler_sample", lambda _model, noise, *_args, **_kwargs: noise
+    )
     monkeypatch.setattr(runtime, "evaluate_npz", lambda *_args, **_kwargs: {"FID": 12.5})
     config = ExperimentConfig()
     config.model.num_classes = 2

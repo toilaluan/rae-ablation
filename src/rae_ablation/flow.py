@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import NamedTuple
 
 import torch
@@ -14,9 +13,9 @@ class FlowLoss(NamedTuple):
     early: Tensor
 
 
-def timestep_shift_alpha(latent_shape: tuple[int, int, int]) -> float:
-    """Resolution-aware shift ``sqrt(C*H*W / 4096)`` (8 for RAE, 4 compact)."""
-    return math.sqrt(math.prod(latent_shape) / (4096 // 4))
+class TimestepSample(NamedTuple):
+    conditioning: Tensor
+    interpolation: Tensor
 
 
 def shift_timestep(u: Tensor, alpha: float) -> Tensor:
@@ -28,18 +27,42 @@ def sample_timesteps(
     latent_shape: tuple[int, int, int],
     generator: torch.Generator,
     device: torch.device | str,
-) -> Tensor:
+    *,
+    use_patch_forcing: bool = False,
+    loc: float = 0.0,
+    scale: float = 1.0,
+) -> TimestepSample:
     normal = torch.randn(batch_size, generator=generator, device=device, dtype=torch.float32)
-    return shift_timestep(normal.sigmoid(), timestep_shift_alpha(latent_shape))
+    maximum = (loc + scale * normal).sigmoid()
+    if not use_patch_forcing:
+        return TimestepSample(maximum, maximum)
+
+    height, width = latent_shape[-2:]
+    maximum_per_patch = maximum.reshape(batch_size, 1, 1, 1)
+    deviation = torch.randn(
+        (batch_size, 1, height, width),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    ) * (maximum_per_patch / 2)
+    patchwise = maximum_per_patch - deviation.abs()
+    replacement = torch.rand(
+        patchwise.shape,
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    ) * maximum_per_patch
+    patchwise = torch.where(patchwise < 0, replacement, patchwise)
+    return TimestepSample(maximum, patchwise)
 
 
 def x_to_velocity(
     x_t: Tensor, x_prediction: Tensor, timestep: Tensor, floor: float = 0.05
 ) -> Tensor:
-    denominator = timestep.float().clamp_min(floor)
+    denominator = (1 - timestep.float()).clamp_min(floor)
     while denominator.ndim < x_t.ndim:
         denominator = denominator.unsqueeze(-1)
-    return (x_t.float() - x_prediction.float()) / denominator
+    return (x_prediction.float() - x_t.float()) / denominator
 
 
 def flow_losses(
@@ -49,14 +72,14 @@ def flow_losses(
     full_prediction: Tensor,
     early_prediction: Tensor,
 ) -> FlowLoss:
-    target = noise.float() - clean.float()
+    target = clean.float() - noise.float()
     full_velocity = x_to_velocity(
-        (1 - _expand(timestep, clean)) * clean.float() + _expand(timestep, clean) * noise.float(),
+        noisy_interpolate(clean, noise, timestep),
         full_prediction,
         timestep,
     )
     early_velocity = x_to_velocity(
-        (1 - _expand(timestep, clean)) * clean.float() + _expand(timestep, clean) * noise.float(),
+        noisy_interpolate(clean, noise, timestep),
         early_prediction,
         timestep,
     )
@@ -74,21 +97,12 @@ def _expand(timestep: Tensor, like: Tensor) -> Tensor:
 
 def noisy_interpolate(clean: Tensor, noise: Tensor, timestep: Tensor) -> Tensor:
     t = _expand(timestep, clean)
-    return (1 - t) * clean.float() + t * noise.float()
+    return t * clean.float() + (1 - t) * noise.float()
 
 
 def internal_guidance(
     early: Tensor,
     full: Tensor,
-    timestep: Tensor | float,
     scale: float = 1.78,
-    start: float = 0.1,
 ) -> Tensor:
-    if isinstance(timestep, Tensor):
-        active = (timestep >= start).to(full.dtype)
-        while active.ndim < full.ndim:
-            active = active.unsqueeze(-1)
-        effective = 1 + active * (scale - 1)
-    else:
-        effective = scale if timestep >= start else 1.0
-    return early + effective * (full - early)
+    return early + scale * (full - early)

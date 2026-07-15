@@ -10,32 +10,20 @@ cache:
   output_buffers: 3
   verify: true
 model:
-  architecture: raev2_ddt_ig
   in_channels: 1024
-  hidden_size: 1024
-  depth: 16
-  num_heads: 16
-  mlp_size: 4096
-  patch_size: 1
-  base_grid_size: 8
-  early_exit_block: 4
+  encoder_hidden_size: 768
+  decoder_hidden_size: 2048
+  encoder_depth: 12
+  decoder_depth: 2
+  encoder_num_heads: 12
+  decoder_num_heads: 16
+  mlp_ratio: 4.0
+  base_model_depth: 4
+  num_time_tokens: 4
+  num_class_tokens: 8
   num_classes: 1000
   dropout: 0.0
   gradient_checkpointing: false
-  depth_attention:
-    enabled: true
-    stride: 4
-  ddt_ig:
-    encoder_hidden_size: 768
-    decoder_hidden_size: 2048
-    encoder_depth: 12
-    decoder_depth: 2
-    encoder_num_heads: 12
-    decoder_num_heads: 16
-    mlp_ratio: 4.0
-    base_model_depth: 4
-    num_time_tokens: 4
-    num_class_tokens: 8
 compile:
   enabled: true
   backend: inductor
@@ -49,6 +37,9 @@ train:
   grad_clip: 1.0
   ema_decay: 0.9995
   seed: 0
+  use_patch_forcing: false
+  timestep_loc: 0.0
+  timestep_scale: 1.0
   optimizer:
     kind: muon
     lr: 0.0002

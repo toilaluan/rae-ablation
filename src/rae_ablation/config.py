@@ -1,18 +1,14 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 
 @dataclass
-class DepthAttentionConfig:
-    enabled: bool = True
-    stride: int = 4
-
-
-@dataclass
-class DDTIGConfig:
+class ModelConfig:
+    in_channels: int = 1024
     encoder_hidden_size: int = 1440
     decoder_hidden_size: int = 2048
     encoder_depth: int = 28
@@ -23,24 +19,9 @@ class DDTIGConfig:
     base_model_depth: int = 8
     num_time_tokens: int = 4
     num_class_tokens: int = 8
-
-
-@dataclass
-class ModelConfig:
-    architecture: str = "depth_attention_dit"
-    in_channels: int = 1024
-    hidden_size: int = 1024
-    depth: int = 16
-    num_heads: int = 16
-    mlp_size: int = 4096
-    patch_size: int = 1
-    base_grid_size: int = 16
-    early_exit_block: int = 8
     num_classes: int = 1000
     dropout: float = 0.0
     gradient_checkpointing: bool = True
-    depth_attention: DepthAttentionConfig = field(default_factory=DepthAttentionConfig)
-    ddt_ig: DDTIGConfig = field(default_factory=DDTIGConfig)
 
 
 @dataclass
@@ -85,6 +66,9 @@ class TrainConfig:
     grad_clip: float = 1.0
     ema_decay: float = 0.9995
     seed: int = 0
+    use_patch_forcing: bool = False
+    timestep_loc: float = 0.0
+    timestep_scale: float = 1.0
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
 
@@ -144,61 +128,34 @@ class ExperimentConfig:
             raise ValueError("optimizer.kind must be adamw or muon")
         if self.wandb.mode not in {"online", "offline", "disabled"}:
             raise ValueError("wandb.mode must be online, offline, or disabled")
-        if m.architecture not in {"depth_attention_dit", "raev2_ddt_ig"}:
-            raise ValueError(
-                "model.architecture must be depth_attention_dit or raev2_ddt_ig"
-            )
-        if m.patch_size != 1:
-            raise ValueError("V1 requires latent patch size 1")
         if not 0 <= m.dropout < 1:
             raise ValueError("model.dropout must be in [0, 1)")
-        if m.architecture == "depth_attention_dit":
-            if m.hidden_size % m.num_heads:
-                raise ValueError("model.hidden_size must be divisible by model.num_heads")
-            if (m.hidden_size // m.num_heads) % 4:
-                raise ValueError("attention head size must be divisible by 4 for 2D RoPE")
-            if not 1 <= m.early_exit_block <= m.depth:
-                raise ValueError("model.early_exit_block must be in [1, model.depth]")
-            if m.depth_attention.stride < 1:
-                raise ValueError("depth_attention.stride must be positive")
-            if m.depth < 1 or m.hidden_size < 1 or m.num_heads < 1 or m.mlp_size < 1:
-                raise ValueError("model dimensions must be positive")
-        else:
-            ddt = m.ddt_ig
-            dimensions = (
-                ddt.encoder_hidden_size,
-                ddt.decoder_hidden_size,
-                ddt.encoder_depth,
-                ddt.decoder_depth,
-                ddt.encoder_num_heads,
-                ddt.decoder_num_heads,
-                ddt.num_time_tokens,
-                ddt.num_class_tokens,
-            )
-            if any(value < 1 for value in dimensions) or ddt.mlp_ratio <= 0:
-                raise ValueError("model.ddt_ig dimensions and token counts must be positive")
-            if not 1 <= ddt.base_model_depth <= ddt.encoder_depth:
+        dimensions = (
+            m.in_channels,
+            m.encoder_hidden_size,
+            m.decoder_hidden_size,
+            m.encoder_depth,
+            m.decoder_depth,
+            m.encoder_num_heads,
+            m.decoder_num_heads,
+            m.num_time_tokens,
+            m.num_class_tokens,
+            m.num_classes,
+        )
+        if any(value < 1 for value in dimensions) or m.mlp_ratio <= 0:
+            raise ValueError("model dimensions and token counts must be positive")
+        if not 1 <= m.base_model_depth <= m.encoder_depth:
+            raise ValueError("model.base_model_depth must be in [1, encoder_depth]")
+        for hidden, heads, name in (
+            (m.encoder_hidden_size, m.encoder_num_heads, "model.encoder_hidden_size"),
+            (m.decoder_hidden_size, m.decoder_num_heads, "model.decoder_hidden_size"),
+        ):
+            if hidden % heads:
+                raise ValueError(f"{name} must be divisible by its number of heads")
+            if (hidden // heads) % 4:
                 raise ValueError(
-                    "model.ddt_ig.base_model_depth must be in [1, encoder_depth]"
+                    f"{name} attention head size must be divisible by 4 for 2D RoPE"
                 )
-            for hidden, heads, name in (
-                (
-                    ddt.encoder_hidden_size,
-                    ddt.encoder_num_heads,
-                    "model.ddt_ig.encoder_hidden_size",
-                ),
-                (
-                    ddt.decoder_hidden_size,
-                    ddt.decoder_num_heads,
-                    "model.ddt_ig.decoder_hidden_size",
-                ),
-            ):
-                if hidden % heads:
-                    raise ValueError(f"{name} must be divisible by its number of heads")
-                if (hidden // heads) % 4:
-                    raise ValueError(
-                        f"{name} attention head size must be divisible by 4 for 2D RoPE"
-                    )
         if (
             self.cache.batch_size < 1
             or self.cache.shard_size < 1
@@ -226,6 +183,10 @@ class ExperimentConfig:
             raise ValueError("training epochs and batch sizes must be positive")
         if not 0 < self.train.ema_decay < 1:
             raise ValueError("train.ema_decay must be in (0, 1)")
+        if not math.isfinite(self.train.timestep_loc):
+            raise ValueError("train.timestep_loc must be finite")
+        if not math.isfinite(self.train.timestep_scale) or self.train.timestep_scale <= 0:
+            raise ValueError("train.timestep_scale must be finite and positive")
         if self.checkpoint.keep_last_n < 0:
             raise ValueError("checkpoint.keep_last_n cannot be negative")
 

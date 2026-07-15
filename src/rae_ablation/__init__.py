@@ -1,12 +1,10 @@
-"""RAE versus compact-RAE diffusion ablation."""
+"""RAE versus compact-RAE DDT ablation."""
 
-from .config import DDTIGConfig, ExperimentConfig, load_config
-from .model import DiffusionTransformer, DiTOutput, RAEv2DDTIG, build_diffusion_model
+from .config import ExperimentConfig, load_config
+from .model import DDTOutput, RAEv2DDTIG, build_diffusion_model
 
 __all__ = [
-    "DDTIGConfig",
-    "DiTOutput",
-    "DiffusionTransformer",
+    "DDTOutput",
     "ExperimentConfig",
     "RAEv2DDTIG",
     "build_diffusion_model",

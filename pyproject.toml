@@ -28,10 +28,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=9,<10", "pytest-cov>=7,<8", "ruff>=0.14,<1"]
 
-[project.scripts]
-rae-cache = "rae_ablation.cli:cache_main"
-rae-compare = "rae_ablation.cli:compare_main"
-
 [tool.hatch.build.targets.wheel]
 packages = ["src/rae_ablation"]
 

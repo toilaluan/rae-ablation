@@ -1,13 +1,8 @@
-from .ddt import RAEv2DDTIG
-from .depth_attention import DepthAttention, depth_source_layers
-from .dit import DiffusionTransformer, DiTOutput
+from .ddt import DDTOutput, RAEv2DDTIG
 from .factory import build_diffusion_model
 
 __all__ = [
-    "DepthAttention",
-    "DiTOutput",
-    "DiffusionTransformer",
+    "DDTOutput",
     "RAEv2DDTIG",
     "build_diffusion_model",
-    "depth_source_layers",
 ]

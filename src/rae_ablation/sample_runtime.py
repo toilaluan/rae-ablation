@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import time
@@ -24,14 +25,14 @@ class SamplingParameters:
     batch_size: int = 32
     sampling_steps: int = 50
     guidance_scale: float = 1.78
-    guidance_start: float = 0.1
+    timestep_shift: float = 1.0
     log_interval: int = 10
 
     def validate(self) -> None:
         if self.batch_size < 1 or self.sampling_steps < 1 or self.log_interval < 1:
             raise ValueError("sampling batch size, steps, and log interval must be positive")
-        if not 0 <= self.guidance_start <= 1:
-            raise ValueError("guidance start must be in [0, 1]")
+        if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
+            raise ValueError("timestep shift must be finite and positive")
 
 
 GenerateBatch = Callable[[Tensor, Tensor, Tensor], Tensor]
@@ -123,7 +124,7 @@ def _manifest_base(
     counts = torch.bincount(labels, minlength=num_classes)
     ids_digest = hashlib.sha256(sample_ids.numpy().tobytes()).hexdigest()
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "checkpoint_sha256": checkpoint_hash,
         "validation_plan_hash": plan.plan_hash,
         "sample_ids_sha256": ids_digest,
@@ -136,7 +137,7 @@ def _manifest_base(
         "sampling": {
             "sampling_steps": parameters.sampling_steps,
             "guidance_scale": parameters.guidance_scale,
-            "guidance_start": parameters.guidance_start,
+            "timestep_shift": parameters.timestep_shift,
         },
     }
 
@@ -319,7 +320,7 @@ def sample_to_archive(
         print(
             f"sampling configuration: samples={sample_count} classes={num_classes} "
             f"batch_size={parameters.batch_size} steps={parameters.sampling_steps} "
-            f"guidance={parameters.guidance_scale:g} guidance_start={parameters.guidance_start:g}"
+            f"guidance={parameters.guidance_scale:g} shift={parameters.timestep_shift:g}"
         )
         print(f"sampling state: {status}, completed={state[1]}/{sample_count}")
     if state[0]:

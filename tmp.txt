@@ -1,0 +1,90 @@
+# DDT-Only Architecture and Patch-Forcing Training
+
+  ## Summary
+
+  Remove the legacy DiT, flatten DDT configuration, add heterogeneous patchwise interpolation, simplify guidance, relocate package CLIs to scripts, and consistently use:
+
+  x_t = t·data + (1-t)·noise
+
+  Thus, t=0 is noise and t=1 is clean data.
+
+  ## Key Changes
+
+  - Delete the legacy depth-attention DiT implementation, configuration, exports, tests, and documentation.
+  - Make build_diffusion_model construct RAEv2DDTIG directly.
+  - Replace DiTOutput with DDTOutput.
+  - Flatten DDT dimensions, depths, heads, MLP ratio, base depth, and condition-token counts into model.*.
+  - Remove the architecture selector, DDTIGConfig, and all legacy DiT fields.
+
+  ## Timestep and Patch Forcing
+
+  - Add train config:
+      - use_patch_forcing: false
+      - timestep_loc: 0.0
+      - timestep_scale: 1.0
+
+  - Add scripts/train.py --use-patch-forcing; loc and scale remain configurable through --override.
+  - Sample t_max = sigmoid(N(loc, scale²)) independently per example.
+  - Without patch forcing, use t_max for every spatial token.
+  - With patch forcing, independently sample:
+      - t_i = t_max - abs(N(0, (t_max/2)²))
+      - Replace negative t_i values with independent U(0, t_max) draws.
+
+  - Use patch timesteps shaped [batch, 1, height, width], shared across channels.
+  - Interpolate as x_t = t_i·data + (1-t_i)·noise.
+  - Condition the DDT with t_max.
+  - Train toward data - noise, deriving velocity as (x_prediction - x_t) / max(1-t_i, 0.05).
+  - Preserve deterministic generation through the checkpointed timestep RNG stream.
+
+  ## Sampling and Guidance
+
+  - Integrate Euler sampling from t=0 noise to t=1 data.
+  - Derive sampling velocity as (x_prediction - x_t) / max(1-t, 0.05).
+  - Retain explicit positive schedule shifts:
+      - scripts/sample.py --timestep-shift, default 1.0.
+      - scripts/train.py --eval-timestep-shift, default 1.0.
+
+  - Remove guidance-start thresholds completely:
+      - Delete guidance_start from APIs, sampling parameters, manifests, logs, flags, tests, and documentation.
+      - Always compute internal guidance as early + guidance_scale·(full-early).
+      - A guidance scale of 1.0 selects the full prediction.
+
+  ## CLI and README
+
+  - Add scripts/cache.py and scripts/compare.py.
+  - Delete src/rae_ablation/cli.py and remove package console entry points.
+  - Update all instructions to invoke the five standalone scripts directly.
+  - Reorganize README workflows around reusable shell variables, for example:
+      - CODEC=rae or CODEC=rae_compact
+      - CACHE_DIR=./data/imagenet-rae-both
+      - RUN_DIR=./runs/${CODEC}
+      - SAMPLE_DIR=./generated/${CODEC}
+      - REFERENCE_NPZ=./data/VIRTUAL_imagenet256_labeled.npz
+
+  - Use those variables consistently across cache, train, resume, sample, evaluation, and comparison commands so switching codecs requires changing only CODEC.
+  - Clearly distinguish shell convenience variables from application-level environment configuration.
+
+  ## Test Plan
+
+  - Assert t=0 produces noise and t=1 produces clean data.
+  - Verify bounded, deterministic logit-normal sampling.
+  - Verify patch timesteps satisfy 0 ≤ t_i ≤ t_max, vary spatially, and condition the model with t_max.
+  - Verify interpolation and velocity losses use each token’s t_i.
+  - Verify sampling progresses from noise to data with unit and non-unit shifts.
+  - Verify guidance is applied at every step and scale 1.0 returns the full prediction.
+  - Retain DDT forward/backward, compilation, EMA, checkpoint, and both-grid tests.
+  - Test all five script help commands and verify package console entry points are absent.
+  - Run the complete pytest suite and Ruff checks.
+
+  ## Assumptions
+
+  - Patch forcing applies only to spatial latent tokens.
+  - Lower t_i means a noisier patch; t_max is the cleanest timestep in the example.
+  - Existing DDT weights remain loadable, but old YAML files and legacy overrides require migration.
+
+
+    Implement this plan?
+ 
+  1. Yes, implement this plan          Switch to Default and start coding.
+› 2. Yes, clear context and implement  Fresh thread. Context: 29% used.
+  3. No, stay in Plan mode             Continue planning with the model.

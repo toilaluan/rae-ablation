@@ -79,9 +79,9 @@ def validate_ema(
                 execution_model,
                 noise,
                 batch_labels,
-                sampling.sampling_steps,
-                sampling.guidance_scale,
-                sampling.guidance_start,
+                steps=sampling.sampling_steps,
+                guidance_scale=sampling.guidance_scale,
+                timestep_shift=sampling.timestep_shift,
             )
             return codec.decode(statistics.denormalize(normalized))
 

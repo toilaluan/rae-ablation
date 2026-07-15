@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--sampling-steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=1.78)
-    parser.add_argument("--guidance-start", type=float, default=0.1)
+    parser.add_argument("--timestep-shift", type=float, default=1.0)
     parser.add_argument("--log-interval", type=int, default=10)
     return parser
 
@@ -52,7 +52,7 @@ def main() -> None:
         batch_size=args.batch_size,
         sampling_steps=args.sampling_steps,
         guidance_scale=args.guidance_scale,
-        guidance_start=args.guidance_start,
+        timestep_shift=args.timestep_shift,
         log_interval=args.log_interval,
     )
     parameters.validate()
@@ -92,9 +92,9 @@ def main() -> None:
                 execution_model,
                 noise,
                 batch_labels,
-                parameters.sampling_steps,
-                parameters.guidance_scale,
-                parameters.guidance_start,
+                steps=parameters.sampling_steps,
+                guidance_scale=parameters.guidance_scale,
+                timestep_shift=parameters.timestep_shift,
             )
             return codec.decode(statistics.denormalize(normalized))
 
