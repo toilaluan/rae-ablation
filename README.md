@@ -208,6 +208,21 @@ uv run python scripts/compare.py \
 Evaluation streams stored or compressed NPZ inputs and reports FID. Comparison requires matching
 validation-plan hashes.
 
+## Evaluate codec reconstruction
+
+Measure the pinned RAE and compact RAE codecs on the full ImageNet-256 validation split:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/reconstruction_metrics.py \
+  --output ./runs/reconstruction-metrics.json
+```
+
+The script encodes each image with RAE once, reuses those features for the compact adapter, and
+streams aggregate LPIPS, PSNR, SSIM, and reconstruction FID (rFID). It runs with either ordinary
+Python or `torchrun`; use `--max-samples 32 --workers 0` for a small smoke run. The JSON output
+records the pinned dataset and codec revisions, metric conventions, per-codec results, and compact
+minus full deltas.
+
 ## Validation and checkpoints
 
 The first training launch creates one immutable balanced validation plan. Periodic and final EMA

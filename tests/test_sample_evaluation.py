@@ -177,7 +177,15 @@ def test_evaluate_npz_with_streamed_features(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "script", ["train.py", "sample.py", "eval.py", "cache.py", "compare.py"]
+    "script",
+    [
+        "train.py",
+        "sample.py",
+        "eval.py",
+        "cache.py",
+        "compare.py",
+        "reconstruction_metrics.py",
+    ],
 )
 def test_standalone_script_help(script: str) -> None:
     root = Path(__file__).resolve().parents[1]
