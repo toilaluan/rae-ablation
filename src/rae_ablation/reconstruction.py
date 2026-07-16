@@ -318,7 +318,7 @@ def evaluate_reconstructions(
             )
     return metrics.compute(), sample_count
 
-
+@torch.autocast("cuda", dtype=torch.bfloat16, enabled=True)
 def load_and_evaluate_reconstructions(
     parameters: ReconstructionParameters,
     *,
@@ -336,6 +336,7 @@ def load_and_evaluate_reconstructions(
     dataset = load_dataset(
         IMAGENET_REPO,
         split="validation",
+        num_proc=8,
         revision=IMAGENET_REVISION,
     )
     loaded = load_codecs("both", str(device))
