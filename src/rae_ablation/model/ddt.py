@@ -400,6 +400,7 @@ class RAEv2DDTIG(nn.Module):
             projected = self.input_residuals_proj(latent_tokens).chunk(
                 self.config.num_input_residuals, dim=-1
             )
+            condition_tokens = condition_tokens.to(dtype=projected[0].dtype)
             initial_residuals = tuple(
                 torch.cat((spatial_source, condition_tokens), dim=1) for spatial_source in projected
             )

@@ -103,6 +103,18 @@ def _fused_attnres_eager(
     rms_eps: float,
     return_weights: bool,
 ) -> Tensor | tuple[Tensor, ...]:
+    reference = residuals[0]
+    for index, residual in enumerate(residuals[1:], start=1):
+        if residual.dtype != reference.dtype:
+            raise TypeError(
+                "FLA AttnRes residual sources must share one dtype; "
+                f"source 0 is {reference.dtype} but source {index} is {residual.dtype}"
+            )
+        if residual.device != reference.device:
+            raise TypeError(
+                "FLA AttnRes residual sources must share one device; "
+                f"source 0 is on {reference.device} but source {index} is on {residual.device}"
+            )
     return fused_attnres(
         query=query,
         residuals=residuals,

@@ -258,6 +258,37 @@ def test_attnres_multiple_input_views_forward_backward_and_encoder_only(
     assert torch.count_nonzero(model.input_residuals_proj.weight.grad)
 
 
+@pytest.mark.parametrize("patch_forcing", [False, True])
+def test_attnres_autocast_keeps_every_residual_source_bfloat16(
+    patch_forcing: bool,
+) -> None:
+    model = RAEv2DDTIG(
+        tiny_config(
+            patch_forcing=patch_forcing,
+            attnres_block_size=4,
+        )
+    )
+    observed: list[tuple[torch.dtype, ...]] = []
+    handles = [
+        router.register_forward_pre_hook(
+            lambda _module, args: observed.append(tuple(residual.dtype for residual in args[0]))
+        )
+        for router in (
+            model.encoder_blocks[0].attn_router,
+            model.encoder_blocks[0].mlp_router,
+        )
+        if router is not None
+    ]
+    timestep = torch.rand(2, 1, 2, 2) if patch_forcing else torch.rand(2)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        model(torch.randn(2, 4, 2, 2), timestep, torch.tensor([1, 2]))
+    for handle in handles:
+        handle.remove()
+
+    assert observed
+    assert all(set(dtypes) == {torch.bfloat16} for dtypes in observed)
+
+
 def test_checkpointed_attnres_matches_plain_outputs_and_gradients() -> None:
     plain = RAEv2DDTIG(tiny_config(attnres_block_size=4))
     checked = copy.deepcopy(plain)
