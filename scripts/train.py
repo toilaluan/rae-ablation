@@ -157,17 +157,13 @@ def main() -> None:
             parameter.numel() for parameter in model.parameters() if parameter.requires_grad
         ),
     }
-    logger = RunLogger(
-        config.wandb, logged_config, rank == 0, resume_run_id, args.log_interval
-    )
+    logger = RunLogger(config.wandb, logged_config, rank == 0, resume_run_id, args.log_interval)
     logger.event(
         f"training initialized: codec={config.codec}, parameters="
         f"{logged_config['model_parameters']['total']:,}"
     )
     if args.resume:
-        logger.event(
-            f"resumed from {args.resume}: epoch={state.epoch}, step={state.global_step}"
-        )
+        logger.event(f"resumed from {args.resume}: epoch={state.epoch}, step={state.global_step}")
     output_root = Path(config.checkpoint.directory).parent / "validation"
 
     def validate_callback(epoch: int, final: bool) -> dict[str, float]:
@@ -191,6 +187,14 @@ def main() -> None:
                 f"First 16 evaluated ImageNet class IDs: {labels}",
                 state.global_step,
             )
+            attnres_visualization = validation_output / "attnres-weights.png"
+            if attnres_visualization.exists():
+                logger.log_image(
+                    "validation/attnres_weights",
+                    str(attnres_visualization),
+                    "Mean spatial AttnRes probabilities by Euler step and routing site",
+                    state.global_step,
+                )
         return metrics
 
     try:

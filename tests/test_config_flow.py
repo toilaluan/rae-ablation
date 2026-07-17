@@ -29,6 +29,8 @@ def test_structured_config_and_unknown_key() -> None:
     assert config.model.encoder_hidden_size == 64
     assert config.model.decoder_hidden_size == 2048
     assert not config.model.use_patch_forcing
+    assert config.model.attnres_block_size == 4
+    assert config.model.num_input_residuals == 4
     with pytest.raises(ConfigKeyError):
         load_config("configs/canonical.yaml", ["model.typo=1"])
     with pytest.raises(ConfigKeyError):
@@ -51,6 +53,17 @@ def test_ddt_and_timestep_config_validation() -> None:
     config = ExperimentConfig()
     config.train.timestep_scale = 0
     with pytest.raises(ValueError, match="timestep_scale"):
+        config.validate()
+
+    config = ExperimentConfig()
+    config.model.attnres_block_size = 3
+    with pytest.raises(ValueError, match="attnres_block_size"):
+        config.validate()
+
+    config = ExperimentConfig()
+    config.model.attnres_block_size = 4
+    config.model.num_input_residuals = 1
+    with pytest.raises(ValueError, match="num_input_residuals"):
         config.validate()
 
 
@@ -90,9 +103,9 @@ def test_patch_forcing_matches_sampling_mechanism() -> None:
     generator = torch.Generator().manual_seed(seed)
     maximum = torch.randn(batch, generator=generator).sigmoid()
     maximum_per_patch = maximum.reshape(batch, 1, 1, 1)
-    deviation = torch.randn(
-        (batch, 1, height, width), generator=generator
-    ) * (maximum_per_patch / 2)
+    deviation = torch.randn((batch, 1, height, width), generator=generator) * (
+        maximum_per_patch / 2
+    )
     candidate = maximum_per_patch - deviation.abs()
     replacement = torch.rand(candidate.shape, generator=generator) * maximum_per_patch
     expected = torch.where(candidate < 0, replacement, candidate)

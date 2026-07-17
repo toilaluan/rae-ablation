@@ -64,13 +64,14 @@ class RunLogger:
             f"peak_memory={metrics['system/peak_memory_gib']:.2f} GiB"
         )
 
-    def log_grid(self, path: str, caption: str, step: int) -> None:
+    def log_image(self, key: str, path: str, caption: str, step: int) -> None:
         if self.run is not None:
             import wandb
 
-            self.run.log(
-                {"validation/sample_preview": wandb.Image(path, caption=caption)}, step=step
-            )
+            self.run.log({key: wandb.Image(path, caption=caption)}, step=step)
+
+    def log_grid(self, path: str, caption: str, step: int) -> None:
+        self.log_image("validation/sample_preview", path, caption, step)
 
     def log_checkpoint(self, path: str, name: str) -> None:
         if self.run is not None:

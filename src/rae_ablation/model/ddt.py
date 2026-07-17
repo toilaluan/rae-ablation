@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from typing import NamedTuple
 
 import torch
@@ -9,6 +10,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from ..config import ModelConfig
+from .attnres import AttnResCapture, AttnResRouter
 from .rope import apply_2d_rope
 
 
@@ -31,9 +33,7 @@ class SpatialProjection(nn.Module):
 
 
 class GaussianFourierTokenEmbedding(nn.Module):
-    def __init__(
-        self, hidden_size: int, num_tokens: int, embedding_size: int = 256
-    ) -> None:
+    def __init__(self, hidden_size: int, num_tokens: int, embedding_size: int = 256) -> None:
         super().__init__()
         self.register_buffer("frequencies", torch.randn(embedding_size))
         self.mlp = nn.Sequential(
@@ -141,58 +141,95 @@ class DDTFeedForward(nn.Module):
 
 class DDTEncoderBlock(nn.Module):
     def __init__(
-        self, hidden_size: int, num_heads: int, mlp_ratio: float, dropout: float
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float,
+        dropout: float,
+        layer_index: int,
+        attnres_block_size: int | None,
     ) -> None:
         super().__init__()
+        self.layer_index = layer_index
         self.norm1 = nn.RMSNorm(hidden_size, eps=1e-6)
         self.attention = DDTAttention(hidden_size, num_heads, dropout)
         self.norm2 = nn.RMSNorm(hidden_size, eps=1e-6)
         self.feed_forward = DDTFeedForward(hidden_size, mlp_ratio, dropout)
+        self.use_attnres = attnres_block_size is not None
+        if attnres_block_size is None:
+            self.attnres_is_attn_boundary = False
+            self.attnres_is_mlp_boundary = False
+            self.attn_router = None
+            self.mlp_router = None
+        else:
+            self.attnres_is_attn_boundary = (2 * layer_index) % attnres_block_size == 0
+            self.attnres_is_mlp_boundary = (2 * layer_index + 1) % attnres_block_size == 0
+            self.attn_router = AttnResRouter(
+                hidden_size, f"encoder.block_{layer_index + 1}.attention"
+            )
+            self.mlp_router = AttnResRouter(hidden_size, f"encoder.block_{layer_index + 1}.mlp")
 
     def forward(
-        self, x: Tensor, height: int, width: int, spatial_tokens: int
-    ) -> Tensor:
-        x = x + self.attention(self.norm1(x), height, width, spatial_tokens)
-        return x + self.feed_forward(self.norm2(x))
+        self,
+        x: Tensor,
+        height: int,
+        width: int,
+        spatial_tokens: int,
+        *attnres_states: Tensor,
+    ) -> tuple[Tensor, ...]:
+        if not self.use_attnres:
+            x = x + self.attention(self.norm1(x), height, width, spatial_tokens)
+            return (x + self.feed_forward(self.norm2(x)),)
+
+        if self.attn_router is None or self.mlp_router is None:
+            raise RuntimeError("AttnRes encoder block is missing its routers")
+        states = attnres_states
+        prefix_sum: Tensor | None = x
+        residuals = (*states, prefix_sum)
+        if self.attnres_is_attn_boundary:
+            states = residuals
+            prefix_sum = None
+        attention_input = self.attn_router(residuals, self.norm1.weight)
+        attention_output = self.attention(attention_input, height, width, spatial_tokens)
+        prefix_sum = attention_output if prefix_sum is None else prefix_sum + attention_output
+
+        residuals = (*states, prefix_sum)
+        if self.attnres_is_mlp_boundary:
+            states = residuals
+            prefix_sum = None
+        mlp_input = self.mlp_router(residuals, self.norm2.weight)
+        mlp_output = self.feed_forward(mlp_input)
+        hidden_states = mlp_output if prefix_sum is None else prefix_sum + mlp_output
+        return (hidden_states, *states)
 
 
 class DDTDecoderBlock(nn.Module):
-    def __init__(
-        self, hidden_size: int, num_heads: int, mlp_ratio: float, dropout: float
-    ) -> None:
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, dropout: float) -> None:
         super().__init__()
         self.norm1 = nn.RMSNorm(hidden_size, eps=1e-6)
         self.attention = DDTAttention(hidden_size, num_heads, dropout)
         self.norm2 = nn.RMSNorm(hidden_size, eps=1e-6)
         self.feed_forward = DDTFeedForward(hidden_size, mlp_ratio, dropout)
-        self.modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size)
-        )
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size))
 
-    def forward(
-        self, x: Tensor, conditioning: Tensor, height: int, width: int
-    ) -> Tensor:
-        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = self.modulation(
-            conditioning
-        ).chunk(6, dim=-1)
+    def forward(self, x: Tensor, conditioning: Tensor, height: int, width: int) -> Tensor:
+        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = self.modulation(conditioning).chunk(
+            6, dim=-1
+        )
         x = x + gate_a * self.attention(
             _modulate(self.norm1(x), shift_a, scale_a),
             height,
             width,
             height * width,
         )
-        return x + gate_m * self.feed_forward(
-            _modulate(self.norm2(x), shift_m, scale_m)
-        )
+        return x + gate_m * self.feed_forward(_modulate(self.norm2(x), shift_m, scale_m))
 
 
 class DDTFinalLayer(nn.Module):
     def __init__(self, hidden_size: int, out_channels: int) -> None:
         super().__init__()
         self.norm = nn.RMSNorm(hidden_size, eps=1e-6)
-        self.modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size)
-        )
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
         self.projection = nn.Linear(hidden_size, out_channels)
 
     def forward(self, x: Tensor, conditioning: Tensor) -> Tensor:
@@ -206,12 +243,16 @@ class RAEv2DDTIG(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
-        self.encoder_input = SpatialProjection(
-            config.in_channels, config.encoder_hidden_size
-        )
-        self.decoder_input = SpatialProjection(
-            config.in_channels, config.decoder_hidden_size
-        )
+        if config.attnres_block_size is None:
+            self.encoder_input = SpatialProjection(config.in_channels, config.encoder_hidden_size)
+            self.input_residuals_proj = None
+        else:
+            self.encoder_input = None
+            self.input_residuals_proj = nn.Linear(
+                config.in_channels,
+                config.num_input_residuals * config.encoder_hidden_size,
+            )
+        self.decoder_input = SpatialProjection(config.in_channels, config.decoder_hidden_size)
         self.time_embedding = GaussianFourierTokenEmbedding(
             config.encoder_hidden_size,
             0 if config.use_patch_forcing else config.num_time_tokens,
@@ -226,10 +267,18 @@ class RAEv2DDTIG(nn.Module):
                     config.encoder_num_heads,
                     config.mlp_ratio,
                     config.dropout,
+                    layer_index,
+                    config.attnres_block_size,
                 )
-                for _ in range(config.encoder_depth)
+                for layer_index in range(config.encoder_depth)
             ]
         )
+        if config.attnres_block_size is None:
+            self.early_attnres = None
+            self.final_attnres = None
+        else:
+            self.early_attnres = AttnResRouter(config.encoder_hidden_size, "encoder.early_output")
+            self.final_attnres = AttnResRouter(config.encoder_hidden_size, "encoder.final_output")
         self.encoder_to_decoder = (
             nn.Linear(config.encoder_hidden_size, config.decoder_hidden_size)
             if config.encoder_hidden_size != config.decoder_hidden_size
@@ -252,9 +301,18 @@ class RAEv2DDTIG(nn.Module):
         self._initialize_weights()
 
     def _initialize_weights(self) -> None:
-        for embedder in (self.encoder_input, self.decoder_input):
+        embedders = [self.decoder_input]
+        if self.encoder_input is not None:
+            embedders.append(self.encoder_input)
+        for embedder in embedders:
             nn.init.xavier_uniform_(embedder.projection.weight.flatten(1))
             nn.init.zeros_(embedder.projection.bias)
+        if self.input_residuals_proj is not None:
+            for weight in self.input_residuals_proj.weight.chunk(
+                self.config.num_input_residuals, dim=0
+            ):
+                nn.init.xavier_uniform_(weight)
+            nn.init.zeros_(self.input_residuals_proj.bias)
         nn.init.normal_(self.class_embedding.embedding.weight, std=0.02)
         for layer in (self.time_embedding.mlp[0], self.time_embedding.mlp[2]):
             nn.init.normal_(layer.weight, std=0.02)
@@ -266,6 +324,30 @@ class RAEv2DDTIG(nn.Module):
             nn.init.zeros_(head.modulation[-1].bias)
             nn.init.zeros_(head.projection.weight)
             nn.init.zeros_(head.projection.bias)
+        for module in self.modules():
+            if isinstance(module, AttnResRouter):
+                nn.init.zeros_(module.query_projection.weight)
+
+    @contextmanager
+    def capture_attnres_weights(self, height: int, width: int) -> AttnResCapture:
+        if self.config.attnres_block_size is None:
+            raise RuntimeError("cannot capture AttnRes weights when AttnRes is disabled")
+        capture = AttnResCapture(
+            spatial_tokens=height * width,
+            time_tokens=0 if self.config.use_patch_forcing else self.config.num_time_tokens,
+            class_tokens=self.config.num_class_tokens,
+            num_input_residuals=self.config.num_input_residuals,
+        )
+        routers = [module for module in self.modules() if isinstance(module, AttnResRouter)]
+        if any(router.capture is not None for router in routers):
+            raise RuntimeError("AttnRes weight capture is already active")
+        for router in routers:
+            router.capture = capture
+        try:
+            yield capture
+        finally:
+            for router in routers:
+                router.capture = None
 
     def set_gradient_checkpointing(self, enabled: bool = True) -> None:
         self.gradient_checkpointing = enabled
@@ -288,9 +370,7 @@ class RAEv2DDTIG(nn.Module):
         if timestep.ndim == 1:
             if timestep.shape[0] != batch_size:
                 raise ValueError("timestep batch dimension must match latent")
-            return self.time_embedding.embed(timestep).unsqueeze(1).expand(
-                -1, spatial_tokens, -1
-            )
+            return self.time_embedding.embed(timestep).unsqueeze(1).expand(-1, spatial_tokens, -1)
         if timestep.ndim == 4 and timestep.shape == (batch_size, 1, height, width):
             if not self.config.use_patch_forcing:
                 raise ValueError("patchwise timesteps require model.use_patch_forcing")
@@ -302,35 +382,63 @@ class RAEv2DDTIG(nn.Module):
             raise ValueError("latent must have shape [B, configured in_channels, H, W]")
         batch_size, _, height, width = latent.shape
         spatial_tokens = height * width
-        patch_timestep = self._patch_time_embedding(
-            timestep, batch_size, height, width
-        )
-        spatial = self.encoder_input(latent)
+        patch_timestep = self._patch_time_embedding(timestep, batch_size, height, width)
         label_tokens = self.class_embedding(labels)
         if self.config.use_patch_forcing:
-            sequence = torch.cat((spatial, label_tokens), dim=1)
+            condition_tokens = label_tokens
         else:
             _, time_tokens = self.time_embedding(timestep)
-            sequence = torch.cat((spatial, time_tokens, label_tokens), dim=1)
+            condition_tokens = torch.cat((time_tokens, label_tokens), dim=1)
+        if self.input_residuals_proj is None:
+            if self.encoder_input is None:
+                raise RuntimeError("legacy encoder input projection is missing")
+            spatial = self.encoder_input(latent)
+            sequence = torch.cat((spatial, condition_tokens), dim=1)
+            attnres_states: tuple[Tensor, ...] = ()
+        else:
+            latent_tokens = latent.flatten(2).transpose(1, 2)
+            projected = self.input_residuals_proj(latent_tokens).chunk(
+                self.config.num_input_residuals, dim=-1
+            )
+            initial_residuals = tuple(
+                torch.cat((spatial_source, condition_tokens), dim=1) for spatial_source in projected
+            )
+            sequence = initial_residuals[-1]
+            attnres_states = initial_residuals[:-1]
         early_tokens: Tensor | None = None
         for index, block in enumerate(self.encoder_blocks, start=1):
             if self._checkpointing():
-                sequence = checkpoint(
+                block_output = checkpoint(
                     block,
                     sequence,
                     height,
                     width,
                     spatial_tokens,
+                    *attnres_states,
                     use_reentrant=False,
                     preserve_rng_state=self.config.dropout > 0,
                 )
             else:
-                sequence = block(sequence, height, width, spatial_tokens)
+                block_output = block(
+                    sequence,
+                    height,
+                    width,
+                    spatial_tokens,
+                    *attnres_states,
+                )
+            sequence = block_output[0]
+            attnres_states = block_output[1:]
             if index == self.config.base_model_depth:
-                early_tokens = sequence[:, :spatial_tokens]
+                if self.early_attnres is None:
+                    early_sequence = sequence
+                else:
+                    early_sequence = self.early_attnres((*attnres_states, sequence))
+                early_tokens = early_sequence[:, :spatial_tokens]
         if early_tokens is None:
             raise RuntimeError("DDT base prediction block was not reached")
 
+        if self.final_attnres is not None:
+            sequence = self.final_attnres((*attnres_states, sequence))
         encoder_spatial = sequence[:, :spatial_tokens]
         conditioning = self.encoder_to_decoder(F.silu(patch_timestep + encoder_spatial))
         decoded = self.decoder_input(latent)

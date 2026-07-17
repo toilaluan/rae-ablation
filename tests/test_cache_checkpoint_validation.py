@@ -258,5 +258,12 @@ def test_wandb_is_rank_zero_only_and_resumes(
         step=3,
     )
     logger.log_grid(str(tmp_path / "grid.png"), "classes", 2)
+    logger.log_image(
+        "validation/attnres_weights",
+        str(tmp_path / "attnres.png"),
+        "weights",
+        2,
+    )
     assert any("values" in call for call in calls)
     assert any(call.get("step") == 3 for call in calls)
+    assert any("validation/attnres_weights" in call.get("values", {}) for call in calls)

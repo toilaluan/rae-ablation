@@ -10,7 +10,15 @@ from .config import OptimizerConfig
 
 
 def _muon_eligible(name: str, parameter: nn.Parameter) -> bool:
-    excluded = ("embedding", "norm", "bias", "projection", "head", "input_projection")
+    excluded = (
+        "embedding",
+        "norm",
+        "bias",
+        "projection",
+        "head",
+        "input_projection",
+        "input_residuals_proj",
+    )
     return parameter.ndim == 2 and not any(part in name for part in excluded)
 
 
@@ -59,7 +67,12 @@ def build_optimizer(model: nn.Module, config: OptimizerConfig) -> CompositeOptim
     ]
     if not hasattr(torch.optim, "Muon"):
         raise RuntimeError("optimizer.kind=muon requires torch.optim.Muon (PyTorch 2.12+)")
-    muon = torch.optim.Muon(muon_parameters, lr=config.lr, weight_decay=config.weight_decay, adjust_lr_fn="match_rms_adamw")
+    muon = torch.optim.Muon(
+        muon_parameters,
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+        adjust_lr_fn="match_rms_adamw",
+    )
     adam = torch.optim.AdamW(
         adam_parameters,
         lr=config.lr,

@@ -5,11 +5,13 @@ from pathlib import Path
 
 import torch
 
+from .attnres_visualization import save_attnres_visualization
 from .checkpoint import EMA
 from .codecs import load_codecs
 from .config import ExperimentConfig
 from .distributed import broadcast_string
 from .evaluation import evaluate_npz, save_evaluation
+from .flow import shift_timestep
 from .latents import LatentStatistics
 from .model.compile import compile_model_regions
 from .model.factory import build_diffusion_model
@@ -28,6 +30,56 @@ def _distributed() -> tuple[int, int]:
 def _barrier() -> None:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.barrier()
+
+
+def _capture_attnres_probe(
+    *,
+    model: torch.nn.Module,
+    config: ExperimentConfig,
+    plan: ValidationPlan,
+    sampling: SamplingParameters,
+    device: torch.device,
+    output: Path,
+) -> None:
+    block_size = config.model.attnres_block_size
+    if block_size is None:
+        return
+    capture_context = getattr(model, "capture_attnres_weights", None)
+    if capture_context is None:
+        raise TypeError("AttnRes model does not expose weight capture")
+    channels, height, width = config.latent_shape
+    planned_noise = (
+        plan.visualization_noise_16 if (height, width) == (16, 16) else plan.visualization_noise_8
+    )
+    if planned_noise.shape != (16, channels, height, width):
+        raise ValueError("validation visualization noise does not match latent shape")
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    noise = planned_noise.to(device=device, dtype=dtype)
+    labels = plan.visualization_labels.to(device)
+    with (
+        capture_context(height, width) as capture,
+        torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"),
+    ):
+        euler_sample(
+            model,
+            noise,
+            labels,
+            steps=sampling.sampling_steps,
+            guidance_scale=sampling.guidance_scale,
+            timestep_shift=sampling.timestep_shift,
+        )
+    schedule = shift_timestep(
+        torch.linspace(0, 1, sampling.sampling_steps + 1),
+        sampling.timestep_shift,
+    )[:-1]
+    save_attnres_visualization(
+        capture=capture,
+        sampling_timesteps=schedule.numpy(),
+        labels=plan.visualization_labels.numpy(),
+        plan_hash=plan.plan_hash,
+        block_size=block_size,
+        output_dir=output,
+    )
 
 
 @torch.inference_mode()
@@ -98,6 +150,15 @@ def validate_ema(
         parameters=sampling,
         generate_batch=generate_batch,
     )
+    if rank == 0:
+        _capture_attnres_probe(
+            model=model,
+            config=config,
+            plan=plan,
+            sampling=sampling,
+            device=device,
+            output=output,
+        )
     del generate_batch
     execution_model = None
     model = None
@@ -116,9 +177,7 @@ def validate_ema(
         save_evaluation(output / "evaluation.json", raw, plan.plan_hash)
         suffix = "50K" if final else "5K"
         metrics[f"validation/FID-{suffix}"] = raw["FID"]
-        metrics["validation/images_per_second"] = count / max(
-            time.perf_counter() - started, 1e-9
-        )
+        metrics["validation/images_per_second"] = count / max(time.perf_counter() - started, 1e-9)
         metrics["validation/sampling_nfe"] = float(sampling.sampling_steps)
         metrics["validation/peak_memory_gib"] = (
             torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0

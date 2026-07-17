@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tomllib
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,9 +22,11 @@ from rae_ablation.evaluation import (
     fid_from_statistics,
     validate_reference_statistics,
 )
+from rae_ablation.model.attnres import AttnResCapture
+from rae_ablation.model.ddt import DDTOutput
 from rae_ablation.sample_runtime import SamplingParameters, sample_to_archive
 from rae_ablation.validation import create_validation_plan
-from rae_ablation.validation_runtime import validate_ema
+from rae_ablation.validation_runtime import _capture_attnres_probe, validate_ema
 from rae_ablation.wandb_utils import RunLogger
 
 
@@ -154,9 +157,7 @@ class _TinyFeatures(nn.Module):
 
 
 def test_evaluate_npz_with_streamed_features(tmp_path: Path) -> None:
-    images = np.stack(
-        [np.full((256, 256, 3), value, dtype=np.uint8) for value in (1, 2, 3, 4)]
-    )
+    images = np.stack([np.full((256, 256, 3), value, dtype=np.uint8) for value in (1, 2, 3, 4)])
     samples = tmp_path / "samples.npz"
     np.savez_compressed(samples, images)
     features = np.stack((np.array([1, 2, 3, 4]), np.array([1, 4, 9, 16])), axis=1)
@@ -246,9 +247,7 @@ def test_online_validation_writes_shared_artifacts(
     monkeypatch.setattr(runtime, "build_diffusion_model", lambda _config: TinyModel())
     monkeypatch.setattr(runtime, "compile_model_regions", lambda model, _config: model)
     monkeypatch.setattr(runtime, "load_codecs", lambda _codec, _device: TinyCodec())
-    monkeypatch.setattr(
-        runtime, "euler_sample", lambda _model, noise, *_args, **_kwargs: noise
-    )
+    monkeypatch.setattr(runtime, "euler_sample", lambda _model, noise, *_args, **_kwargs: noise)
     monkeypatch.setattr(runtime, "evaluate_npz", lambda *_args, **_kwargs: {"FID": 12.5})
     config = ExperimentConfig()
     config.model.num_classes = 2
@@ -277,3 +276,77 @@ def test_online_validation_writes_shared_artifacts(
     assert (output / "preview.png").exists()
     evaluation = json.loads((output / "evaluation.json").read_text())
     assert evaluation["validation_plan_hash"] == plan.plan_hash
+
+
+def test_attnres_validation_probe_writes_deterministic_npz_and_png(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from rae_ablation.constants import LATENT_SPECS
+
+    monkeypatch.setitem(LATENT_SPECS, "rae", (1, 8, 8))
+    config = ExperimentConfig()
+    config.model.in_channels = 1
+    config.model.attnres_block_size = 4
+    config.model.num_input_residuals = 2
+    plan = create_validation_plan(16, 16, 16, seed=9, channels=1)
+
+    class CapturingModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.capture: AttnResCapture | None = None
+
+        @contextmanager
+        def capture_attnres_weights(self, height: int, width: int) -> AttnResCapture:
+            capture = AttnResCapture(
+                spatial_tokens=height * width,
+                time_tokens=config.model.num_time_tokens,
+                class_tokens=config.model.num_class_tokens,
+                num_input_residuals=config.model.num_input_residuals,
+            )
+            self.capture = capture
+            try:
+                yield capture
+            finally:
+                self.capture = None
+
+        def forward(
+            self, latent: torch.Tensor, _timestep: torch.Tensor, _labels: torch.Tensor
+        ) -> DDTOutput:
+            if self.capture is None:
+                raise RuntimeError("capture is not active")
+            tokens = (
+                self.capture.spatial_tokens + self.capture.time_tokens + self.capture.class_tokens
+            )
+            weights = torch.full(
+                (2, latent.shape[0], tokens),
+                0.5,
+                device=latent.device,
+            )
+            self.capture.record("encoder.block_1.attention", weights)
+            return DDTOutput(latent, latent)
+
+    output = tmp_path / "probe"
+    output.mkdir()
+    _capture_attnres_probe(
+        model=CapturingModel(),
+        config=config,
+        plan=plan,
+        sampling=SamplingParameters(
+            batch_size=16,
+            sampling_steps=2,
+            guidance_scale=1,
+            log_interval=1,
+        ),
+        device=torch.device("cpu"),
+        output=output,
+    )
+
+    with np.load(output / "attnres-weights.npz", allow_pickle=False) as values:
+        assert values["spatial_weights"].shape == (2, 1, 2)
+        assert values["time_token_weights"].shape == (2, 1, 2)
+        assert values["class_token_weights"].shape == (2, 1, 2)
+        assert values["site_labels"].tolist() == ["encoder.block_1.attention"]
+        assert values["source_labels"].tolist() == [["input_projection_0", "input_projection_1"]]
+        assert values["validation_plan_hash"].item() == plan.plan_hash
+        np.testing.assert_allclose(values["spatial_weights"].sum(axis=-1), 1)
+    assert (output / "attnres-weights.png").exists()

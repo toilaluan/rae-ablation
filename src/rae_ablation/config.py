@@ -10,6 +10,8 @@ from typing import Any
 class ModelConfig:
     in_channels: int = 1024
     use_patch_forcing: bool = False
+    attnres_block_size: int | None = None
+    num_input_residuals: int = 4
     encoder_hidden_size: int = 1440
     decoder_hidden_size: int = 2048
     encoder_depth: int = 28
@@ -132,6 +134,7 @@ class ExperimentConfig:
             raise ValueError("model.dropout must be in [0, 1)")
         dimensions = (
             m.in_channels,
+            m.num_input_residuals,
             m.encoder_hidden_size,
             m.decoder_hidden_size,
             m.encoder_depth,
@@ -144,6 +147,13 @@ class ExperimentConfig:
         )
         if any(value < 1 for value in dimensions) or m.mlp_ratio <= 0:
             raise ValueError("model dimensions and token counts must be positive")
+        if m.attnres_block_size is not None:
+            if m.num_input_residuals < 2:
+                raise ValueError(
+                    "model.num_input_residuals must be at least 2 when AttnRes is enabled"
+                )
+            if m.attnres_block_size != 1 and (m.attnres_block_size < 2 or m.attnres_block_size % 2):
+                raise ValueError("model.attnres_block_size must be None, 1, or an even integer")
         if not 1 <= m.base_model_depth <= m.encoder_depth:
             raise ValueError("model.base_model_depth must be in [1, encoder_depth]")
         for hidden, heads, name in (
@@ -153,9 +163,7 @@ class ExperimentConfig:
             if hidden % heads:
                 raise ValueError(f"{name} must be divisible by its number of heads")
             if (hidden // heads) % 4:
-                raise ValueError(
-                    f"{name} attention head size must be divisible by 4 for 2D RoPE"
-                )
+                raise ValueError(f"{name} attention head size must be divisible by 4 for 2D RoPE")
         if (
             self.cache.batch_size < 1
             or self.cache.shard_size < 1
