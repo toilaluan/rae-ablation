@@ -74,14 +74,13 @@ def _attnres(
     return_weights: bool,
 ) -> Tensor | tuple[Tensor, Tensor]:
     if residuals[0].is_cuda:
-        return fused_attnres(
-            query=query,
-            residuals=residuals,
-            rms_weight=rms_weight,
-            output_rms_weight=output_rms_weight,
-            rms_eps=rms_eps,
-            return_weights=return_weights,
-            checkpoint_level=1,
+        return _fused_attnres_eager(
+            query,
+            residuals,
+            rms_weight,
+            output_rms_weight,
+            rms_eps,
+            return_weights,
         )
     return naive_attnres(
         query=query,
@@ -90,6 +89,28 @@ def _attnres(
         output_rms_weight=output_rms_weight,
         rms_eps=rms_eps,
         return_weights=return_weights,
+    )
+
+
+@torch.compiler.disable(
+    reason="FLA fused AttnRes uses a CachedAutotuner Triton object unsupported by Dynamo"
+)
+def _fused_attnres_eager(
+    query: Tensor,
+    residuals: Sequence[Tensor],
+    rms_weight: Tensor,
+    output_rms_weight: Tensor | None,
+    rms_eps: float,
+    return_weights: bool,
+) -> Tensor | tuple[Tensor, ...]:
+    return fused_attnres(
+        query=query,
+        residuals=residuals,
+        rms_weight=rms_weight,
+        output_rms_weight=output_rms_weight,
+        rms_eps=rms_eps,
+        return_weights=return_weights,
+        checkpoint_level=1,
     )
 
 

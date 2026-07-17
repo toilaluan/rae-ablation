@@ -66,6 +66,12 @@ def test_ddt_and_timestep_config_validation() -> None:
     with pytest.raises(ValueError, match="num_input_residuals"):
         config.validate()
 
+    config = ExperimentConfig()
+    config.model.attnres_block_size = 4
+    config.compile.fullgraph = True
+    with pytest.raises(ValueError, match="fullgraph"):
+        config.validate()
+
 
 def test_uniform_logit_normal_timesteps_are_bounded_and_deterministic() -> None:
     first = sample_timesteps(

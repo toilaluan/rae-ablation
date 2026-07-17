@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+import rae_ablation.model.attnres as attnres_module
 from rae_ablation.config import CompileConfig, ModelConfig
 from rae_ablation.model.attnres import AttnResRouter
 from rae_ablation.model.compile import clean_state_dict, compile_model_regions
@@ -285,3 +286,47 @@ def test_attnres_tiny_regional_compile() -> None:
     view = compile_model_regions(model, CompileConfig(True, "eager", "default", False, False))
     output = view(torch.randn(1, 4, 2, 2), torch.rand(1), torch.tensor([1]))
     assert output.full.shape == (1, 4, 2, 2)
+
+
+def test_fused_attnres_dispatch_runs_outside_dynamo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[bool] = []
+
+    def fake_fused_attnres(
+        *,
+        query: torch.Tensor,
+        residuals: tuple[torch.Tensor, ...],
+        rms_weight: torch.Tensor,
+        output_rms_weight: torch.Tensor | None,
+        rms_eps: float,
+        return_weights: bool,
+        checkpoint_level: int,
+    ) -> torch.Tensor:
+        del query, rms_weight, output_rms_weight, rms_eps, return_weights, checkpoint_level
+        calls.append(torch.compiler.is_dynamo_compiling())
+        return residuals[0]
+
+    monkeypatch.setattr(attnres_module, "fused_attnres", fake_fused_attnres)
+
+    @torch.compile(backend="eager", fullgraph=False)
+    def compiled_call(
+        query: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        output = attnres_module._fused_attnres_eager(
+            query,
+            (residual,),
+            weight,
+            None,
+            1e-6,
+            False,
+        )
+        assert isinstance(output, torch.Tensor)
+        return output + 1
+
+    residual = torch.randn(2, 3, 4)
+    output = compiled_call(torch.randn(4), residual, torch.ones(4))
+    assert torch.equal(output, residual + 1)
+    assert calls == [False]

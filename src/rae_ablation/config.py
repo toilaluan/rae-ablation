@@ -154,6 +154,11 @@ class ExperimentConfig:
                 )
             if m.attnres_block_size != 1 and (m.attnres_block_size < 2 or m.attnres_block_size % 2):
                 raise ValueError("model.attnres_block_size must be None, 1, or an even integer")
+            if self.compile.enabled and self.compile.fullgraph:
+                raise ValueError(
+                    "AttnRes requires compile.fullgraph=false because fused FLA kernels run "
+                    "across an explicit Dynamo graph break"
+                )
         if not 1 <= m.base_model_depth <= m.encoder_depth:
             raise ValueError("model.base_model_depth must be in [1, encoder_depth]")
         for hidden, heads, name in (
