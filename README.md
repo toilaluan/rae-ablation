@@ -122,20 +122,6 @@ Other configuration changes use repeatable `--override KEY=VALUE` arguments. DDT
 flat `model.*` fields such as `model.encoder_depth`, `model.encoder_hidden_size`, and
 `model.base_model_depth`.
 
-The canonical model enables encoder-only Block AttnRes with four independent projections of the
-complete latent channel vector:
-
-```text
-model.attnres_block_size=4       # one persistent source per two encoder blocks
-model.num_input_residuals=4      # four latent_dim -> encoder_hidden_size views
-```
-
-AttnRes mixes the full encoder sequence before each attention and feed-forward sublayer. Time and
-class tokens are shared across the four initial residual sources. Set
-`model.attnres_block_size=null` to recover the legacy single-projection residual path; use `1` for
-full AttnRes or another even value to change the Block AttnRes grouping. AttnRes settings are part
-of the checkpoint architecture and must match when resuming.
-
 ## Objective and patch forcing
 
 Time runs from noise to data:
@@ -243,11 +229,6 @@ The first training launch creates one immutable balanced validation plan. Period
 validation use the same artifact layout as standalone sampling. Checkpoints include raw model and
 EMA weights, optimizer state, RNG streams, cache and validation fingerprints, resolved config,
 and W&B run identity. The `last` and `best-fid` pointers remain directly resumable.
-
-Each AttnRes validation also runs the plan's fixed 16-example probe and writes
-`attnres-weights.npz` plus `attnres-weights.png`. The NPZ stores spatial, time-token, and
-class-token source probabilities for every Euler step and encoder routing site. The PNG contact
-sheet visualizes mean spatial routing dynamics and is logged to W&B with the sample preview.
 
 The online sampler is configured with training-script flags. For example, use
 `--eval-timestep-shift 2.0` to validate with a shifted schedule.

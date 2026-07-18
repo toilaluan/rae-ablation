@@ -6,9 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-import rae_ablation.model.attnres as attnres_module
 from rae_ablation.config import CompileConfig, ModelConfig
-from rae_ablation.model.attnres import AttnResRouter
 from rae_ablation.model.compile import clean_state_dict, compile_model_regions
 from rae_ablation.model.ddt import DDTOutput, RAEv2DDTIG
 from rae_ablation.model.factory import build_diffusion_model
@@ -16,26 +14,19 @@ from rae_ablation.model.rope import apply_2d_rope
 
 
 def tiny_config(
-    *,
-    checkpointing: bool = False,
-    patch_forcing: bool = False,
-    attnres_block_size: int | None = None,
-    encoder_depth: int = 3,
-    base_model_depth: int = 2,
+    *, checkpointing: bool = False, patch_forcing: bool = False
 ) -> ModelConfig:
     return ModelConfig(
         in_channels=4,
         use_patch_forcing=patch_forcing,
-        attnres_block_size=attnres_block_size,
-        num_input_residuals=4,
         encoder_hidden_size=16,
         decoder_hidden_size=32,
-        encoder_depth=encoder_depth,
+        encoder_depth=3,
         decoder_depth=2,
         encoder_num_heads=4,
         decoder_num_heads=8,
         mlp_ratio=2.0,
-        base_model_depth=base_model_depth,
+        base_model_depth=2,
         num_time_tokens=2,
         num_class_tokens=3,
         num_classes=10,
@@ -60,7 +51,9 @@ def test_model_factory_builds_ddt() -> None:
 @pytest.mark.parametrize("grid", [4, 2])
 @pytest.mark.parametrize("patch_forcing", [False, True])
 def test_ddt_forward_backward_both_grids(grid: int, patch_forcing: bool) -> None:
-    model = RAEv2DDTIG(tiny_config(checkpointing=True, patch_forcing=patch_forcing))
+    model = RAEv2DDTIG(
+        tiny_config(checkpointing=True, patch_forcing=patch_forcing)
+    )
     latent = torch.randn(2, 4, grid, grid, requires_grad=True)
     timestep = torch.rand(2, 1, grid, grid) if patch_forcing else torch.rand(2)
     output = model(latent, timestep, torch.tensor([1, 2]))
@@ -74,11 +67,8 @@ def test_ddt_forward_backward_both_grids(grid: int, patch_forcing: bool) -> None
     assert model.early_head.projection.weight.grad is not None
 
 
-@pytest.mark.parametrize("attnres_block_size", [None, 4])
-def test_ddt_condition_token_shapes_and_base_depth_isolation(
-    attnres_block_size: int | None,
-) -> None:
-    model = RAEv2DDTIG(tiny_config(attnres_block_size=attnres_block_size))
+def test_ddt_condition_token_shapes_and_base_depth_isolation() -> None:
+    model = RAEv2DDTIG(tiny_config())
     timestep_base, timestep_tokens = model.time_embedding(torch.rand(2))
     label_tokens = model.class_embedding(torch.tensor([1, 2]))
     assert timestep_base.shape == (2, 1, 16)
@@ -130,7 +120,9 @@ def test_patch_forcing_omits_time_tokens_and_conditions_outputs_per_patch() -> N
     assert torch.equal(encoder_inputs[0], encoder_inputs[1])
     assert not torch.equal(decoder_conditioning[0], decoder_conditioning[1])
     assert not torch.equal(early_conditioning[0], early_conditioning[1])
-    assert torch.equal(decoder_conditioning[0][:, 1:], decoder_conditioning[1][:, 1:])
+    assert torch.equal(
+        decoder_conditioning[0][:, 1:], decoder_conditioning[1][:, 1:]
+    )
     assert torch.equal(early_conditioning[0][:, 1:], early_conditioning[1][:, 1:])
 
 
@@ -168,7 +160,9 @@ def test_timestep_shape_validation() -> None:
 def test_checkpointed_ddt_matches_plain_outputs_and_gradients(
     patch_forcing: bool,
 ) -> None:
-    plain = RAEv2DDTIG(tiny_config(checkpointing=False, patch_forcing=patch_forcing))
+    plain = RAEv2DDTIG(
+        tiny_config(checkpointing=False, patch_forcing=patch_forcing)
+    )
     checked = copy.deepcopy(plain)
     checked.set_gradient_checkpointing(True)
     nn.init.normal_(plain.full_head.projection.weight)
@@ -198,166 +192,3 @@ def test_tiny_ddt_regional_compile_has_clean_raw_keys() -> None:
     state = clean_state_dict(model)
     assert state
     assert not any("_orig_mod" in key for key in state)
-
-
-@pytest.mark.parametrize(
-    ("block_size", "expected_final_sources"),
-    [(2, 10), (4, 7), (6, 6)],
-)
-def test_attnres_block_boundaries_and_uniform_initial_weights(
-    block_size: int, expected_final_sources: int
-) -> None:
-    model = RAEv2DDTIG(
-        tiny_config(
-            attnres_block_size=block_size,
-            encoder_depth=6,
-            base_model_depth=3,
-        )
-    )
-    latent = torch.randn(2, 4, 2, 2)
-    with model.capture_attnres_weights(2, 2) as capture:
-        model(latent, torch.rand(2), torch.tensor([1, 2]))
-
-    final = capture.records[-1]
-    assert final.site == "encoder.final_output"
-    assert len(final.source_labels) == expected_final_sources
-    for record in capture.records:
-        expected = torch.full_like(record.spatial, 1 / len(record.source_labels))
-        torch.testing.assert_close(record.spatial, expected)
-        torch.testing.assert_close(record.time, expected)
-        torch.testing.assert_close(record.classes, expected)
-
-
-@pytest.mark.parametrize("patch_forcing", [False, True])
-def test_attnres_multiple_input_views_forward_backward_and_encoder_only(
-    patch_forcing: bool,
-) -> None:
-    model = RAEv2DDTIG(
-        tiny_config(
-            checkpointing=True,
-            patch_forcing=patch_forcing,
-            attnres_block_size=4,
-        )
-    )
-    assert model.encoder_input is None
-    assert model.input_residuals_proj is not None
-    assert model.input_residuals_proj.weight.shape == (4 * 16, 4)
-    chunks = model.input_residuals_proj.weight.chunk(4, dim=0)
-    assert all(chunk.shape == (16, 4) for chunk in chunks)
-    assert not torch.equal(chunks[0], chunks[1])
-    assert not any(isinstance(module, AttnResRouter) for module in model.decoder_blocks.modules())
-
-    nn.init.normal_(model.full_head.projection.weight)
-    nn.init.normal_(model.early_head.projection.weight)
-    latent = torch.randn(2, 4, 2, 2, requires_grad=True)
-    timestep = torch.rand(2, 1, 2, 2) if patch_forcing else torch.rand(2)
-    output = model(latent, timestep, torch.tensor([1, 2]))
-    (output.full.sum() + output.early.sum()).backward()
-    assert latent.grad is not None and torch.count_nonzero(latent.grad)
-    assert model.input_residuals_proj.weight.grad is not None
-    assert torch.count_nonzero(model.input_residuals_proj.weight.grad)
-
-
-@pytest.mark.parametrize("patch_forcing", [False, True])
-def test_attnres_autocast_keeps_every_residual_source_bfloat16(
-    patch_forcing: bool,
-) -> None:
-    model = RAEv2DDTIG(
-        tiny_config(
-            patch_forcing=patch_forcing,
-            attnres_block_size=4,
-        )
-    )
-    observed: list[tuple[torch.dtype, ...]] = []
-    handles = [
-        router.register_forward_pre_hook(
-            lambda _module, args: observed.append(tuple(residual.dtype for residual in args[0]))
-        )
-        for router in (
-            model.encoder_blocks[0].attn_router,
-            model.encoder_blocks[0].mlp_router,
-        )
-        if router is not None
-    ]
-    timestep = torch.rand(2, 1, 2, 2) if patch_forcing else torch.rand(2)
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        model(torch.randn(2, 4, 2, 2), timestep, torch.tensor([1, 2]))
-    for handle in handles:
-        handle.remove()
-
-    assert observed
-    assert all(set(dtypes) == {torch.bfloat16} for dtypes in observed)
-
-
-def test_checkpointed_attnres_matches_plain_outputs_and_gradients() -> None:
-    plain = RAEv2DDTIG(tiny_config(attnres_block_size=4))
-    checked = copy.deepcopy(plain)
-    checked.set_gradient_checkpointing(True)
-    nn.init.normal_(plain.full_head.projection.weight)
-    nn.init.normal_(plain.early_head.projection.weight)
-    checked.load_state_dict(plain.state_dict())
-    latent1 = torch.randn(2, 4, 2, 2, requires_grad=True)
-    latent2 = latent1.detach().clone().requires_grad_(True)
-    timestep = torch.rand(2)
-    labels = torch.tensor([3, 5])
-    out1 = plain(latent1, timestep, labels)
-    out2 = checked(latent2, timestep, labels)
-    torch.testing.assert_close(out1.full, out2.full)
-    torch.testing.assert_close(out1.early, out2.early)
-    (out1.full.sum() + out1.early.sum()).backward()
-    (out2.full.sum() + out2.early.sum()).backward()
-    torch.testing.assert_close(latent1.grad, latent2.grad)
-    for first, second in zip(plain.parameters(), checked.parameters(), strict=True):
-        if first.grad is not None:
-            torch.testing.assert_close(first.grad, second.grad)
-
-
-def test_attnres_tiny_regional_compile() -> None:
-    model = RAEv2DDTIG(tiny_config(attnres_block_size=4))
-    view = compile_model_regions(model, CompileConfig(True, "eager", "default", False, False))
-    output = view(torch.randn(1, 4, 2, 2), torch.rand(1), torch.tensor([1]))
-    assert output.full.shape == (1, 4, 2, 2)
-
-
-def test_fused_attnres_dispatch_runs_outside_dynamo(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[bool] = []
-
-    def fake_fused_attnres(
-        *,
-        query: torch.Tensor,
-        residuals: tuple[torch.Tensor, ...],
-        rms_weight: torch.Tensor,
-        output_rms_weight: torch.Tensor | None,
-        rms_eps: float,
-        return_weights: bool,
-        checkpoint_level: int,
-    ) -> torch.Tensor:
-        del query, rms_weight, output_rms_weight, rms_eps, return_weights, checkpoint_level
-        calls.append(torch.compiler.is_dynamo_compiling())
-        return residuals[0]
-
-    monkeypatch.setattr(attnres_module, "fused_attnres", fake_fused_attnres)
-
-    @torch.compile(backend="eager", fullgraph=False)
-    def compiled_call(
-        query: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-    ) -> torch.Tensor:
-        output = attnres_module._fused_attnres_eager(
-            query,
-            (residual,),
-            weight,
-            None,
-            1e-6,
-            False,
-        )
-        assert isinstance(output, torch.Tensor)
-        return output + 1
-
-    residual = torch.randn(2, 3, 4)
-    output = compiled_call(torch.randn(4), residual, torch.ones(4))
-    assert torch.equal(output, residual + 1)
-    assert calls == [False]
