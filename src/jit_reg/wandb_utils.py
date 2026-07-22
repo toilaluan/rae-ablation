@@ -54,9 +54,10 @@ class RunLogger:
         self.event(
             "train: "
             f"step={step} epoch={metrics['train/epoch']:.3f} "
-            f"loss={metrics['train/loss_velocity_combined']:.6f} "
-            f"full={metrics['train/loss_velocity_full']:.6f} "
-            f"early={metrics['train/loss_velocity_early']:.6f} "
+            f"loss={metrics['train/loss']:.6f} "
+            f"image={metrics['train/image_velocity_loss']:.6f} "
+            f"cls={metrics['train/cls_velocity_loss']:.6f} "
+            f"repa={metrics['train/repa_loss']:.6f} "
             f"lr={metrics['train/lr']:.3e} "
             f"grad_norm={metrics['train/gradient_norm']:.4f} "
             f"throughput={metrics['throughput/images_per_second']:.2f} images/s "

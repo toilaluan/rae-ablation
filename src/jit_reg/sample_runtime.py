@@ -26,6 +26,8 @@ class SamplingParameters:
     sampling_steps: int = 50
     guidance_scale: float = 1.78
     timestep_shift: float = 1.0
+    cfg_start: float = 0.0
+    cfg_end: float = 1.0
     log_interval: int = 10
 
     def validate(self) -> None:
@@ -33,6 +35,10 @@ class SamplingParameters:
             raise ValueError("sampling batch size, steps, and log interval must be positive")
         if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
             raise ValueError("timestep shift must be finite and positive")
+        if not math.isfinite(self.guidance_scale):
+            raise ValueError("guidance scale must be finite")
+        if not 0 <= self.cfg_start <= self.cfg_end <= 1:
+            raise ValueError("CFG interval must satisfy 0 <= start <= end <= 1")
 
 
 GenerateBatch = Callable[[Tensor, Tensor, Tensor], Tensor]
@@ -118,26 +124,34 @@ def _manifest_base(
     sample_ids: Tensor,
     sample_count: int,
     num_classes: int,
-    codec: str,
+    image_size: int,
+    patch_size: int,
+    model_variant: str,
+    reg_enabled: bool,
     parameters: SamplingParameters,
 ) -> dict[str, Any]:
     counts = torch.bincount(labels, minlength=num_classes)
     ids_digest = hashlib.sha256(sample_ids.numpy().tobytes()).hexdigest()
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "checkpoint_sha256": checkpoint_hash,
         "validation_plan_hash": plan.plan_hash,
         "sample_ids_sha256": ids_digest,
-        "codec": codec,
+        "image_size": image_size,
+        "patch_size": patch_size,
+        "jit_grid_size": image_size // patch_size,
+        "model_variant": model_variant,
+        "reg_enabled": reg_enabled,
         "sample_count": sample_count,
         "num_classes": num_classes,
         "class_counts": counts.tolist(),
-        "image_shape": [256, 256, 3],
+        "image_shape": [image_size, image_size, 3],
         "image_dtype": "uint8",
         "sampling": {
             "sampling_steps": parameters.sampling_steps,
             "guidance_scale": parameters.guidance_scale,
             "timestep_shift": parameters.timestep_shift,
+            "cfg_interval": [parameters.cfg_start, parameters.cfg_end],
         },
     }
 
@@ -172,7 +186,8 @@ def _initialize_or_resume(
         if not all(paths[key].exists() for key in ("images", "labels", "completion")):
             raise ValueError("interrupted sampling run is missing temporary storage")
         images_mm, labels_mm, completion_mm = _load_memmaps(paths)
-        expected_images = (base["sample_count"], 256, 256, 3)
+        image_size = int(base["image_size"])
+        expected_images = (base["sample_count"], image_size, image_size, 3)
         if images_mm.shape != expected_images or images_mm.dtype != np.uint8:
             raise ValueError("temporary image array does not match the sampling manifest")
         if labels_mm.shape != (base["sample_count"],) or labels_mm.dtype != np.int64:
@@ -207,7 +222,10 @@ def _initialize_or_resume(
         raise ValueError("refusing to sample into untracked existing artifacts")
     count = int(base["sample_count"])
     images_mm = np.lib.format.open_memmap(
-        paths["images"], mode="w+", dtype=np.uint8, shape=(count, 256, 256, 3)
+        paths["images"],
+        mode="w+",
+        dtype=np.uint8,
+        shape=(count, int(base["image_size"]), int(base["image_size"]), 3),
     )
     labels_mm = np.lib.format.open_memmap(
         paths["labels"], mode="w+", dtype=np.int64, shape=(count,)
@@ -226,13 +244,14 @@ def _initialize_or_resume(
     return False, 0
 
 
-def _as_uint8_nhwc(images: Tensor, expected: int) -> np.ndarray:
-    if images.ndim != 4 or images.shape != (expected, 3, 256, 256):
+def _as_uint8_nhwc(images: Tensor, expected: int, image_size: int) -> np.ndarray:
+    if images.ndim != 4 or images.shape != (expected, 3, image_size, image_size):
         raise ValueError(
-            f"decoder must return {expected}x3x256x256 images, received {tuple(images.shape)}"
+            f"generator must return {expected}x3x{image_size}x{image_size} images, "
+            f"received {tuple(images.shape)}"
         )
     if not images.is_floating_point():
-        raise ValueError("decoder output must be floating point in [0, 1]")
+        raise ValueError("generator output must be floating point in [0, 1]")
     pixels = images.detach().float().clamp(0, 1).mul(255).round().byte().cpu()
     return pixels.permute(0, 2, 3, 1).contiguous().numpy()
 
@@ -281,13 +300,20 @@ def sample_to_archive(
     plan: ValidationPlan,
     sample_count: int,
     num_classes: int,
-    codec: str,
+    image_size: int,
+    patch_size: int,
+    model_variant: str,
+    reg_enabled: bool,
     checkpoint_hash: str,
     parameters: SamplingParameters,
     generate_batch: GenerateBatch,
 ) -> Path:
     """Generate a resumable, class-balanced ADM-compatible sample archive."""
     parameters.validate()
+    if image_size < 1 or patch_size < 1 or image_size % patch_size:
+        raise ValueError("image size must be positive and divisible by patch size")
+    if not model_variant:
+        raise ValueError("model variant cannot be empty")
     labels, sample_ids, noise_seeds = validate_sampling_plan(plan, sample_count, num_classes)
     output_dir = Path(output_dir)
     paths = _paths(output_dir)
@@ -298,7 +324,10 @@ def sample_to_archive(
         sample_ids=sample_ids,
         sample_count=sample_count,
         num_classes=num_classes,
-        codec=codec,
+        image_size=image_size,
+        patch_size=patch_size,
+        model_variant=model_variant,
+        reg_enabled=reg_enabled,
         parameters=parameters,
     )
     rank, world_size = _distributed()
@@ -340,7 +369,9 @@ def sample_to_archive(
     for batch_index, begin in enumerate(range(0, pending.numel(), parameters.batch_size), start=1):
         positions = pending[begin : begin + parameters.batch_size]
         decoded = generate_batch(positions, labels[positions], noise_seeds[positions])
-        images_mm[positions.numpy()] = _as_uint8_nhwc(decoded, positions.numel())
+        images_mm[positions.numpy()] = _as_uint8_nhwc(
+            decoded, positions.numel(), image_size
+        )
         images_mm.flush()
         completion_mm[positions.numpy()] = 1
         completion_mm.flush()

@@ -4,34 +4,35 @@ import copy
 
 import pytest
 import torch
-from torch import nn
 
-from rae_ablation.config import CompileConfig, ModelConfig
-from rae_ablation.model.compile import clean_state_dict, compile_model_regions
-from rae_ablation.model.ddt import DDTOutput, RAEv2DDTIG
-from rae_ablation.model.factory import build_diffusion_model
-from rae_ablation.model.rope import apply_2d_rope
+from jit_reg.config import CompileConfig, ModelConfig, REGConfig
+from jit_reg.model.compile import clean_state_dict, compile_model_regions
+from jit_reg.model.rope import apply_2d_rope
+from jit_reg.model.sit import SiT, SiTOutput
 
 
 def tiny_config(
-    *, checkpointing: bool = False, patch_forcing: bool = False
+    patch_size: int = 8,
+    *,
+    checkpointing: bool = False,
+    reg: bool = False,
 ) -> ModelConfig:
     return ModelConfig(
-        in_channels=4,
-        use_patch_forcing=patch_forcing,
-        encoder_hidden_size=16,
-        decoder_hidden_size=32,
-        encoder_depth=3,
-        decoder_depth=2,
-        encoder_num_heads=4,
-        decoder_num_heads=8,
-        mlp_ratio=2.0,
-        base_model_depth=2,
-        num_time_tokens=2,
-        num_class_tokens=3,
+        image_size=32,
+        patch_size=patch_size,
+        hidden_size=16,
+        depth=4,
+        num_heads=4,
+        mlp_ratio=2,
         num_classes=10,
-        dropout=0.0,
         gradient_checkpointing=checkpointing,
+        variant="SiT-Tiny",
+        reg=REGConfig(
+            enabled=reg,
+            feature_dim=8,
+            repa_block=4,
+            repa_hidden_size=16,
+        ),
     )
 
 
@@ -39,156 +40,86 @@ def test_rope_preserves_norm_and_changes_positions() -> None:
     q = torch.randn(2, 4, 6, 8)
     k = torch.randn_like(q)
     qr, kr = apply_2d_rope(q, k, 2, 3)
-    assert torch.allclose(q.norm(dim=-1), qr.norm(dim=-1), atol=1e-5)
-    assert torch.allclose(k.norm(dim=-1), kr.norm(dim=-1), atol=1e-5)
+    torch.testing.assert_close(q.norm(dim=-1), qr.norm(dim=-1))
+    torch.testing.assert_close(k.norm(dim=-1), kr.norm(dim=-1))
     assert not torch.equal(q[..., -1, :], qr[..., -1, :])
 
 
-def test_model_factory_builds_ddt() -> None:
-    assert isinstance(build_diffusion_model(tiny_config()), RAEv2DDTIG)
-
-
-@pytest.mark.parametrize("grid", [4, 2])
-@pytest.mark.parametrize("patch_forcing", [False, True])
-def test_ddt_forward_backward_both_grids(grid: int, patch_forcing: bool) -> None:
-    model = RAEv2DDTIG(
-        tiny_config(checkpointing=True, patch_forcing=patch_forcing)
-    )
-    latent = torch.randn(2, 4, grid, grid, requires_grad=True)
-    timestep = torch.rand(2, 1, grid, grid) if patch_forcing else torch.rand(2)
-    output = model(latent, timestep, torch.tensor([1, 2]))
-    assert isinstance(output, DDTOutput)
-    assert output.full.shape == latent.shape
-    assert output.early.shape == latent.shape
-    assert torch.count_nonzero(output.full) == 0
-    assert torch.count_nonzero(output.early) == 0
-    (output.full.sum() + output.early.sum()).backward()
-    assert model.full_head.projection.weight.grad is not None
-    assert model.early_head.projection.weight.grad is not None
-
-
-def test_ddt_condition_token_shapes_and_base_depth_isolation() -> None:
-    model = RAEv2DDTIG(tiny_config())
-    timestep_base, timestep_tokens = model.time_embedding(torch.rand(2))
-    label_tokens = model.class_embedding(torch.tensor([1, 2]))
-    assert timestep_base.shape == (2, 1, 16)
-    assert timestep_tokens.shape == (2, 2, 16)
-    assert label_tokens.shape == (2, 3, 16)
-
-    nn.init.normal_(model.early_head.projection.weight)
-    latent = torch.randn(2, 4, 2, 2)
-    timestep = torch.rand(2)
-    labels = torch.tensor([1, 2])
-    before = model(latent, timestep, labels).early
-    with torch.no_grad():
-        for parameter in model.encoder_blocks[-1].parameters():
-            parameter.add_(torch.randn_like(parameter))
-    after = model(latent, timestep, labels).early
-    assert torch.equal(before, after)
-
-
-def test_patch_forcing_omits_time_tokens_and_conditions_outputs_per_patch() -> None:
-    model = RAEv2DDTIG(tiny_config(patch_forcing=True))
-    assert model.time_embedding.learnable_tokens is None
-
-    encoder_inputs: list[torch.Tensor] = []
-    decoder_conditioning: list[torch.Tensor] = []
-    early_conditioning: list[torch.Tensor] = []
-    handles = [
-        model.encoder_blocks[0].register_forward_pre_hook(
-            lambda _module, args: encoder_inputs.append(args[0].detach().clone())
-        ),
-        model.decoder_blocks[0].register_forward_pre_hook(
-            lambda _module, args: decoder_conditioning.append(args[1].detach().clone())
-        ),
-        model.early_head.register_forward_pre_hook(
-            lambda _module, args: early_conditioning.append(args[1].detach().clone())
-        ),
-    ]
-    latent = torch.randn(2, 4, 2, 2)
-    labels = torch.tensor([1, 2])
-    first = torch.full((2, 1, 2, 2), 0.2)
-    second = first.clone()
-    second[:, :, 0, 0] = 0.8
-    model(latent, first, labels)
-    model(latent, second, labels)
-    for handle in handles:
-        handle.remove()
-
-    expected_tokens = 2 * 2 + model.config.num_class_tokens
-    assert encoder_inputs[0].shape == (2, expected_tokens, 16)
-    assert torch.equal(encoder_inputs[0], encoder_inputs[1])
-    assert not torch.equal(decoder_conditioning[0], decoder_conditioning[1])
-    assert not torch.equal(early_conditioning[0], early_conditioning[1])
-    assert torch.equal(
-        decoder_conditioning[0][:, 1:], decoder_conditioning[1][:, 1:]
-    )
-    assert torch.equal(early_conditioning[0][:, 1:], early_conditioning[1][:, 1:])
-
-
-def test_patch_forcing_scalar_timestep_matches_constant_map() -> None:
-    model = RAEv2DDTIG(tiny_config(patch_forcing=True))
-    nn.init.normal_(model.full_head.projection.weight)
-    nn.init.normal_(model.early_head.projection.weight)
-    latent = torch.randn(2, 4, 2, 2)
-    timestep = torch.rand(2)
-    labels = torch.tensor([1, 2])
-    scalar = model(latent, timestep, labels)
-    patchwise = model(
-        latent,
-        timestep.reshape(2, 1, 1, 1).expand(-1, -1, 2, 2),
-        labels,
-    )
-    torch.testing.assert_close(scalar.full, patchwise.full)
-    torch.testing.assert_close(scalar.early, patchwise.early)
-
-
-def test_timestep_shape_validation() -> None:
-    latent = torch.randn(2, 4, 2, 2)
-    labels = torch.tensor([1, 2])
-    patch_model = RAEv2DDTIG(tiny_config(patch_forcing=True))
-    with pytest.raises(ValueError, match="timestep"):
-        patch_model(latent, torch.rand(2, 2, 2), labels)
-    with pytest.raises(ValueError, match="timestep"):
-        patch_model(latent, torch.rand(2, 1, 3, 3), labels)
-    baseline = RAEv2DDTIG(tiny_config())
-    with pytest.raises(ValueError, match="patchwise"):
-        baseline(latent, torch.rand(2, 1, 2, 2), labels)
-
-
-@pytest.mark.parametrize("patch_forcing", [False, True])
-def test_checkpointed_ddt_matches_plain_outputs_and_gradients(
-    patch_forcing: bool,
+@pytest.mark.parametrize(
+    ("image_size", "patch_size", "tokens"),
+    [(256, 16, 256), (256, 32, 64), (256, 64, 16)],
+)
+def test_configurable_patch_counts_and_reconstructed_shapes(
+    image_size: int, patch_size: int, tokens: int
 ) -> None:
-    plain = RAEv2DDTIG(
-        tiny_config(checkpointing=False, patch_forcing=patch_forcing)
+    config = tiny_config()
+    config.image_size = image_size
+    config.patch_size = patch_size
+    config.depth = 1
+    model = SiT(config)
+    assert model.num_patches == tokens
+    image = torch.randn(1, 3, image_size, image_size, requires_grad=True)
+    output = model(image, torch.rand(1), torch.tensor([1]))
+    assert isinstance(output, SiTOutput)
+    assert output.image.shape == image.shape
+    assert torch.count_nonzero(output.image) == 0
+    output.image.sum().backward()
+    assert model.final_layer.projection.weight.grad is not None
+
+
+def test_baseline_has_no_reg_allocations_or_state() -> None:
+    model = SiT(tiny_config())
+    assert model.cls_input is None
+    assert model.cls_final_layer is None
+    assert model.repa_projection is None
+    assert not any("cls_input" in key or "repa_projection" in key for key in model.state_dict())
+
+
+def test_reg_prepends_one_unrotated_token_and_projects_block_four() -> None:
+    model = SiT(tiny_config(reg=True))
+    output = model(
+        torch.randn(2, 3, 32, 32),
+        torch.rand(2),
+        torch.tensor([1, 2]),
+        noisy_cls=torch.randn(2, 8),
+        return_repa=True,
     )
+    assert output.image.shape == (2, 3, 32, 32)
+    assert output.cls is not None and output.cls.shape == (2, 8)
+    assert output.repa is not None and output.repa.shape == (2, 17, 8)
+    assert torch.count_nonzero(output.image) == 0
+    assert torch.count_nonzero(output.cls) == 0
+
+
+def test_checkpointing_matches_plain_outputs_and_gradients() -> None:
+    plain = SiT(tiny_config())
     checked = copy.deepcopy(plain)
     checked.set_gradient_checkpointing(True)
-    nn.init.normal_(plain.full_head.projection.weight)
-    nn.init.normal_(plain.early_head.projection.weight)
+    torch.nn.init.normal_(plain.final_layer.projection.weight)
     checked.load_state_dict(plain.state_dict())
-    latent1 = torch.randn(2, 4, 2, 2, requires_grad=True)
-    latent2 = latent1.detach().clone().requires_grad_(True)
-    timestep = torch.rand(2, 1, 2, 2) if patch_forcing else torch.rand(2)
+    image1 = torch.randn(2, 3, 32, 32, requires_grad=True)
+    image2 = image1.detach().clone().requires_grad_(True)
+    timestep = torch.rand(2)
     labels = torch.tensor([3, 5])
-    out1 = plain(latent1, timestep, labels)
-    out2 = checked(latent2, timestep, labels)
-    assert torch.equal(out1.full, out2.full)
-    assert torch.equal(out1.early, out2.early)
-    (out1.full.sum() + out1.early.sum()).backward()
-    (out2.full.sum() + out2.early.sum()).backward()
-    assert torch.equal(latent1.grad, latent2.grad)
+    out1 = plain(image1, timestep, labels).image
+    out2 = checked(image2, timestep, labels).image
+    torch.testing.assert_close(out1, out2, rtol=0, atol=0)
+    out1.sum().backward()
+    out2.sum().backward()
+    torch.testing.assert_close(image1.grad, image2.grad, rtol=0, atol=0)
     for first, second in zip(plain.parameters(), checked.parameters(), strict=True):
         if first.grad is not None:
-            assert torch.equal(first.grad, second.grad)
+            torch.testing.assert_close(first.grad, second.grad, rtol=0, atol=0)
 
 
-def test_tiny_ddt_regional_compile_has_clean_raw_keys() -> None:
-    model = RAEv2DDTIG(tiny_config(checkpointing=True))
-    view = compile_model_regions(model, CompileConfig(True, "eager", "default", False, False))
-    output = view(torch.randn(1, 4, 2, 2), torch.rand(1), torch.tensor([1]))
-    (output.full.sum() + output.early.sum()).backward()
+def test_tiny_sit_regional_compile_has_clean_raw_keys() -> None:
+    model = SiT(tiny_config(checkpointing=True))
+    view = compile_model_regions(
+        model, CompileConfig(True, "eager", "default", False, False)
+    )
+    output = view(
+        torch.randn(1, 3, 32, 32), torch.rand(1), torch.tensor([1])
+    )
+    output.image.sum().backward()
     state = clean_state_dict(model)
-    assert state
-    assert not any("_orig_mod" in key for key in state)
+    assert state and not any("_orig_mod" in key for key in state)

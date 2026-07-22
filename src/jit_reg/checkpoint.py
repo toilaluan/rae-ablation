@@ -28,10 +28,9 @@ class ResumeState:
     global_step: int
     last_completed_validation_epoch: int | None
     wandb_run_id: str | None
-    cache_fingerprint: str
+    data_fingerprint: str
     validation_plan_hash: str
     optimizer: dict[str, Any]
-    scheduler: dict[str, Any]
     rng_streams: dict[str, Tensor]
 
 
@@ -80,9 +79,8 @@ class CheckpointManager:
         model: nn.Module,
         ema: EMA,
         optimizer_state: dict[str, Any],
-        scheduler_state: dict[str, Any],
         rng_streams: dict[str, Tensor],
-        cache_fingerprint: str,
+        data_fingerprint: str,
         validation_plan_hash: str,
         last_completed_validation_epoch: int | None,
         wandb_run_id: str | None,
@@ -103,10 +101,9 @@ class CheckpointManager:
             "global_step": global_step,
             "last_completed_validation_epoch": last_completed_validation_epoch,
             "wandb_run_id": wandb_run_id,
-            "cache_fingerprint": cache_fingerprint,
+            "data_fingerprint": data_fingerprint,
             "validation_plan_hash": validation_plan_hash,
             "optimizer": optimizer_state,
-            "scheduler": scheduler_state,
             "rng_streams": rng_streams,
         }
         torch.save(training, temporary / "training.pt")
@@ -153,7 +150,7 @@ class CheckpointManager:
         checkpoint: str | Path,
         model: nn.Module,
         ema: EMA,
-        expected_cache_fingerprint: str | None = None,
+        expected_data_fingerprint: str | None = None,
         expected_validation_plan_hash: str | None = None,
     ) -> ResumeState:
         path = Path(checkpoint)
@@ -162,8 +159,8 @@ class CheckpointManager:
         model.load_state_dict(load_file(str(path / "model.safetensors")))
         ema.load_state_dict(load_file(str(path / "ema.safetensors")))
         state = torch.load(path / "training.pt", map_location="cpu", weights_only=False)
-        if expected_cache_fingerprint and state["cache_fingerprint"] != expected_cache_fingerprint:
-            raise ValueError("checkpoint cache fingerprint mismatch")
+        if expected_data_fingerprint and state["data_fingerprint"] != expected_data_fingerprint:
+            raise ValueError("checkpoint dataset/preprocessing fingerprint mismatch")
         if (
             expected_validation_plan_hash
             and state["validation_plan_hash"] != expected_validation_plan_hash

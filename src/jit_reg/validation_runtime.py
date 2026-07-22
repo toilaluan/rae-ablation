@@ -6,16 +6,14 @@ from pathlib import Path
 import torch
 
 from .checkpoint import EMA
-from .codecs import load_codecs
 from .config import ExperimentConfig
 from .distributed import broadcast_string
 from .evaluation import evaluate_npz, save_evaluation
-from .latents import LatentStatistics
 from .model.compile import compile_model_regions
-from .model.factory import build_diffusion_model
+from .model.sit import SiT
 from .rng import preserving_global_rng
 from .sample_runtime import SamplingParameters, sample_to_archive, state_dict_sha256
-from .sampling import euler_sample
+from .sampling import EulerSample, euler_sample
 from .validation import ValidationPlan, noise_for_samples
 
 
@@ -36,7 +34,6 @@ def validate_ema(
     *,
     ema: EMA,
     config: ExperimentConfig,
-    statistics: LatentStatistics,
     plan: ValidationPlan,
     completed_epoch: int,
     final: bool,
@@ -55,35 +52,50 @@ def validate_ema(
     output = Path(output_root) / f"epoch-{completed_epoch:04d}-{name}"
     output.mkdir(parents=True, exist_ok=True)
 
-    model = build_diffusion_model(config.model).to(device)
+    model = SiT(config.model).to(device)
     model.load_state_dict(ema.state_dict())
     model.eval()
     execution_model = compile_model_regions(model, config.compile)
-    codec = load_codecs(config.codec, str(device))
-    if isinstance(codec, tuple):
-        codec = codec[0] if config.codec == "rae" else codec[1]
 
     @torch.inference_mode()
     def generate_batch(
         _positions: torch.Tensor, labels: torch.Tensor, noise_seeds: torch.Tensor
     ) -> torch.Tensor:
         batch_labels = labels.to(device)
+        dtype = torch.float16 if device.type == "cuda" else torch.float32
         noise = noise_for_samples(
             noise_seeds,
-            config.latent_shape,
+            (3, config.model.image_size, config.model.image_size),
             device,
-            dtype=torch.float16 if device.type == "cuda" else torch.float32,
+            dtype=dtype,
         )
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            normalized = euler_sample(
+        cls_noise = (
+            noise_for_samples(
+                noise_seeds,
+                (config.model.reg.feature_dim,),
+                device,
+                dtype=dtype,
+                seed_offset=1_000_003,
+            )
+            if config.model.reg.enabled
+            else None
+        )
+        with torch.autocast(
+            device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+        ):
+            generated = euler_sample(
                 execution_model,
                 noise,
                 batch_labels,
+                cls_noise=cls_noise,
                 steps=sampling.sampling_steps,
                 guidance_scale=sampling.guidance_scale,
                 timestep_shift=sampling.timestep_shift,
+                cfg_interval=(sampling.cfg_start, sampling.cfg_end),
+                num_classes=config.model.num_classes,
             )
-            return codec.decode(statistics.denormalize(normalized))
+        image = generated.image if isinstance(generated, EulerSample) else generated
+        return image.float().add(1).div(2)
 
     digest = state_dict_sha256(ema.state_dict()) if rank == 0 else None
     digest = broadcast_string(digest, rank)
@@ -93,7 +105,10 @@ def validate_ema(
         plan=plan,
         sample_count=count,
         num_classes=config.model.num_classes,
-        codec=config.codec,
+        image_size=config.model.image_size,
+        patch_size=config.model.patch_size,
+        model_variant=config.model.model_variant,
+        reg_enabled=config.model.reg.enabled,
         checkpoint_hash=digest,
         parameters=sampling,
         generate_batch=generate_batch,
@@ -101,7 +116,6 @@ def validate_ema(
     del generate_batch
     execution_model = None
     model = None
-    codec = None
     if device.type == "cuda":
         torch.cuda.empty_cache()
     metrics: dict[str, float] = {}

@@ -1,264 +1,163 @@
-# RAE latent-grid ablation
+# JiT + REG
 
-This project compares ImageNet-256 diffusion training with the pretrained
-`1024x16x16` [RAEv2 DINOv3-L K7](https://huggingface.co/toilaluan/raev2-dinov3l-k7)
-and its `1024x8x8` [compact adapter](https://huggingface.co/toilaluan/raev2-compressor).
-Both codecs use the same DDT-IG architecture, training recipe, validation plan, and sampling
-implementation.
+`jit-reg` trains a class-conditional SiT directly on ImageNet-256 RGB pixels with the JiT
+clean-image objective. The canonical baseline is SiT-B/32: 256×256 images are projected into an
+8×8 patch grid, processed by a 12-block adaLN-Zero transformer, and predicted directly back into
+pixels. Patch size is configurable whenever it divides the image size exactly.
 
-V1 is class-conditional. It has no text conditioning or classifier-free guidance. The full and
-early DDT predictions provide internal guidance at every sampling step.
+Optional REG adds one noisy DINOv3 CLS token and block-4 REPA alignment. The frozen
+`vit_base_patch16_dinov3.lvd1689m` target is loaded only for REG training. Its four register tokens
+are discarded and its 16×16 spatial features are bicubically resized to the configured JiT grid.
+Sampling a REG checkpoint does not load DINOv3.
 
 ## Environment
 
-The project requires Python 3.12.
+Python 3.12 is required.
 
 ```bash
 uv sync --extra dev
-uv run huggingface-cli login
-uv run wandb login                    # only needed when training with --wandb
+uv run hf auth login
+uv run wandb login       # only for --wandb runs
 uv run pytest -q
 uv run ruff check .
 ```
 
-Codec and dataset revisions are pinned in code and recorded in caches and checkpoints.
+The ImageNet repository and revision are pinned in `configs/canonical.yaml`. Training reads it
+directly through Hugging Face Datasets; there is no feature-cache preparation step.
 
-Download the official OpenAI ImageNet-256 ADM reference archive once:
+Download the ImageNet-256 ADM reference statistics once:
 
 ```bash
-mkdir -p ./data
+mkdir -p data
 curl -L \
   https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz \
-  -o ./data/VIRTUAL_imagenet256_labeled.npz
+  -o data/VIRTUAL_imagenet256_labeled.npz
 ```
-
-## Choose a codec
-
-Define the shared paths once. Switch between full and compact latents by changing only `CODEC`.
-All later commands derive their run and sample directories from it.
-
-```bash
-CONFIG=./configs/canonical.yaml
-CACHE_DIR=./data/imagenet-rae-both
-REFERENCE_NPZ=./data/VIRTUAL_imagenet256_labeled.npz
-
-CODEC=rae                           # full 16x16 latent grid
-# CODEC=rae_compact                 # compact 8x8 latent grid
-```
-
-To switch later, run either `CODEC=rae` or `CODEC=rae_compact` before the next command.
-
-## Cache latents
-
-Create one shared cache containing both codecs so experiments can switch with `CODEC` alone:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/cache.py \
-  --config "$CONFIG" --codec both --output "$CACHE_DIR"
-```
-
-Verify an existing cache without loading the dataset:
-
-```bash
-uv run python scripts/cache.py \
-  --config "$CONFIG" --output "$CACHE_DIR" --verify-only
-```
-
-The cache contains resumable fp16 safetensors shards, labels, source indices, a pinned manifest,
-and per-codec statistics. For 1,281,167 examples, budget approximately 625.6 GiB for RAE,
-156.4 GiB for compact, or 782 GiB for both.
 
 ## Train
 
-Train the selected codec:
+Baseline:
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config "$CONFIG" \
-  --codec "$CODEC" \
-  --cache-dir "$CACHE_DIR" \
-  --output "./runs/${CODEC}" \
-  --reference-npz "$REFERENCE_NPZ" \
+  --config configs/canonical.yaml \
+  --output runs/baseline-p32 \
+  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
   --wandb
 ```
 
-Enable heterogeneous patch forcing by adding `--use-patch-forcing`:
+REG + REPA:
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config "$CONFIG" \
-  --codec "$CODEC" \
-  --cache-dir "$CACHE_DIR" \
-  --output "./runs/${CODEC}-patch-forcing" \
-  --reference-npz "$REFERENCE_NPZ" \
-  --use-patch-forcing \
+  --config configs/canonical.yaml \
+  --reg \
+  --output runs/reg-p32 \
+  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
   --wandb
 ```
 
-The logit-normal timestep distribution defaults to location 0 and scale 1. Change it through
-structured overrides when needed:
+Change patch size with a structured override, for example
+`--override model.patch_size=16`. The canonical recipe is 80 epochs, global batch 1024, Muon,
+learning rate `2e-4` for 25 epochs followed by a 25-epoch linear decay to `2e-5`, EMA `0.9995`,
+10% classifier-free label dropout, and logit-normal timesteps with location 0 and scale 1.
+
+Images are randomly flipped on the training device through a checkpointed RNG stream. The same
+flipped `[0,1]` image is normalized for DINOv3 in REG runs and scaled to `[-1,1]` for JiT.
+
+Resume either variant with the same model overrides and `--reg` status:
 
 ```bash
---override train.timestep_loc=-0.25 --override train.timestep_scale=1.5
-```
-
-Resume training and optionally validate immediately:
-
-```bash
-uv run python scripts/train.py \
-  --config "$CONFIG" \
-  --codec "$CODEC" \
-  --cache-dir "$CACHE_DIR" \
-  --output "./runs/${CODEC}" \
-  --reference-npz "$REFERENCE_NPZ" \
-  --resume "./runs/${CODEC}/checkpoints/last" \
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/canonical.yaml \
+  --reg \
+  --output runs/reg-p32 \
+  --resume runs/reg-p32/checkpoints/last \
+  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
   --validate-now --wandb
 ```
 
-When resuming a patch-forcing run, also pass `--use-patch-forcing` so the checkpoint is loaded into
-the same static model variant.
+Checkpoints contain raw model and EMA weights, optimizer state, all explicit RNG streams, the
+pinned dataset/preprocessing fingerprint, validation-plan hash, resolved configuration, and W&B
+identity. DINOv3 is outside model/EMA state. `last` and `best-fid` are resumable pointers.
 
-Other configuration changes use repeatable `--override KEY=VALUE` arguments. DDT dimensions are
-flat `model.*` fields such as `model.encoder_depth`, `model.encoder_hidden_size`, and
-`model.base_model_depth`.
-
-## Objective and patch forcing
+## Objective and sampling
 
 Time runs from noise to data:
 
 ```text
-t = 0: pure noise
-t = 1: clean data
-x_t = t*x + (1-t)*epsilon
-target velocity = x - epsilon
-v_hat = (x_hat - x_t) / max(1-t, 0.05)
-loss = MSE(v_hat_full, target) + MSE(v_hat_early, target)
+x_t = t*x + (1-t)*noise
+v_target = (x - x_t) / max(1-t, 0.05)
+v_pred   = (x_pred - x_t) / max(1-t, 0.05)
 ```
 
-Uniform training samples one timestep per example:
+The baseline minimizes image velocity MSE. REG adds `0.03 × CLS velocity MSE` and
+`0.5 × negative cosine REPA loss` over `[DINO CLS, resized DINO patches]`.
 
-```text
-t_max = sigmoid(N(loc, scale^2))
-t_i = t_max for every spatial token
-```
-
-With patch forcing, each spatial token receives a potentially noisier timestep while the DDT is
-conditioned on its own `t_i`:
-
-```text
-t_i = t_max - abs(N(0, (t_max/2)^2))
-if t_i < 0: t_i = U(0, t_max)
-```
-
-Patch timesteps are shared across latent channels. Lower `t_i` means more noise.
-Patch-forcing models omit encoder time tokens, so the encoder sequence contains only spatial and
-class tokens. The encoder blocks are timestep-agnostic; after the encoder, each `t_i` is embedded
-independently and modulates both the decoder path and the early prediction head. During ordinary
-Euler sampling, the scalar schedule timestep is broadcast to every patch without re-enabling
-encoder time tokens.
-
-## Sample
-
-Generate the balanced 50,000-image archive for the selected codec:
+Sampling uses 50-step Euler integration and batched conditional/null-label CFG. Scale `1` selects
+the conditional prediction. CFG defaults to the full trajectory and can be restricted with
+`--cfg-start` and `--cfg-end`. REG sampling deterministically initializes and jointly integrates
+the image and CLS states.
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --config "$CONFIG" \
-  --codec "$CODEC" \
-  --cache-dir "$CACHE_DIR" \
-  --checkpoint "./runs/${CODEC}/checkpoints/last/ema-export.safetensors" \
-  --plan "./runs/${CODEC}/validation-plan.pt" \
-  --output-dir "./generated/${CODEC}" \
-  --sampling-steps 50 \
-  --guidance-scale 1.78 \
-  --timestep-shift 1.0
+  --config configs/canonical.yaml \
+  --checkpoint runs/baseline-p32/checkpoints/last/ema-export.safetensors \
+  --plan runs/baseline-p32/validation-plan.pt \
+  --output-dir generated/baseline-p32
+
+uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
+  --config configs/canonical.yaml \
+  --reg \
+  --checkpoint runs/reg-p32/checkpoints/last/ema-export.safetensors \
+  --plan runs/reg-p32/validation-plan.pt \
+  --output-dir generated/reg-p32
 ```
 
-When sampling a patch-forcing checkpoint, add `--use-patch-forcing`. This broadcasts each scalar
-sampling timestep across patches while preserving the time-token-free encoder architecture.
+Generation is rank-partitioned and resumable. It writes an ADM-compatible `samples.npz`, a
+preview, and a manifest containing image size, patch size, JiT grid, model variant, REG status,
+checkpoint hash, validation-plan hash, and sampler parameters.
 
-Sampling integrates from `t=0` noise to `t=1` data. Internal guidance is always
-`early + guidance_scale*(full-early)`; use scale `1.0` to select the full prediction. The positive
-timestep shift controls the rational integration schedule, and `1.0` gives a linear schedule.
+## Validate, evaluate, and compare
 
-The output contains `samples.npz`, `samples.json`, and `preview.png`. Generation is resumable and
-rejects incompatible checkpoints, plans, codecs, sample counts, guidance scales, or timestep
-shifts.
-
-## Evaluate and compare
-
-Evaluate the selected codec:
+Periodic and final validation are configured under `validation.*` and use the EMA model plus the
+same immutable labels, sample IDs, and noise seeds as standalone sampling. To evaluate an archive:
 
 ```bash
 uv run python scripts/eval.py \
-  --samples "./generated/${CODEC}/samples.npz" \
-  --reference "$REFERENCE_NPZ" \
-  --output "./runs/${CODEC}/evaluation.json"
-```
+  --samples generated/baseline-p32/samples.npz \
+  --reference data/VIRTUAL_imagenet256_labeled.npz \
+  --output runs/baseline-p32/evaluation.json
 
-After evaluating both codec values, compare them:
+uv run python scripts/eval.py \
+  --samples generated/reg-p32/samples.npz \
+  --reference data/VIRTUAL_imagenet256_labeled.npz \
+  --output runs/reg-p32/evaluation.json
 
-```bash
 uv run python scripts/compare.py \
-  ./runs/rae/evaluation.json \
-  ./runs/rae_compact/evaluation.json \
-  --output ./runs/comparison.json
+  runs/baseline-p32/evaluation.json \
+  runs/reg-p32/evaluation.json \
+  --output runs/comparison.json
 ```
 
-Evaluation streams stored or compressed NPZ inputs and reports FID. Comparison requires matching
-validation-plan hashes.
+Comparison is model-agnostic and requires matching validation-plan hashes.
 
-## Evaluate codec reconstruction
+## Smoke workflow
 
-Measure the pinned RAE and compact RAE codecs on the full ImageNet-256 validation split:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/reconstruction_metrics.py \
-  --output ./runs/reconstruction-metrics.json
-```
-
-The script encodes each image with RAE once, reuses those features for the compact adapter, and
-streams aggregate LPIPS, PSNR, SSIM, and reconstruction FID (rFID). It runs with either ordinary
-Python or `torchrun`; use `--max-samples 32 --workers 0` for a small smoke run. The JSON output
-records the pinned dataset and codec revisions, metric conventions, per-codec results, and compact
-minus full deltas.
-
-## Validation and checkpoints
-
-The first training launch creates one immutable balanced validation plan. Periodic and final EMA
-validation use the same artifact layout as standalone sampling. Checkpoints include raw model and
-EMA weights, optimizer state, RNG streams, cache and validation fingerprints, resolved config,
-and W&B run identity. The `last` and `best-fid` pointers remain directly resumable.
-
-The online sampler is configured with training-script flags. For example, use
-`--eval-timestep-shift 2.0` to validate with a shifted schedule.
-
-## Tiny smoke workflow
+This checks the direct data path and a tiny baseline without compilation:
 
 ```bash
-SMOKE_CACHE=/tmp/rae-smoke-cache
-SMOKE_RUN=/tmp/rae-smoke-${CODEC}
-
-uv run python scripts/cache.py \
-  --codec both --output "$SMOKE_CACHE" --max-samples 32 \
-  cache.batch_size=16 cache.shard_size=32 cache.workers=0
-
 uv run python scripts/train.py \
-  --config "$CONFIG" \
-  --codec "$CODEC" \
-  --cache-dir "$SMOKE_CACHE" \
-  --output "$SMOKE_RUN" \
-  --reference-npz "$REFERENCE_NPZ" \
+  --config configs/canonical.yaml \
+  --output /tmp/jit-reg-smoke \
+  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
   --max-steps 2 \
-  --override model.encoder_hidden_size=128 \
-  --override model.decoder_hidden_size=128 \
-  --override model.encoder_depth=2 \
-  --override model.decoder_depth=1 \
-  --override model.encoder_num_heads=4 \
-  --override model.decoder_num_heads=4 \
-  --override model.base_model_depth=1 \
+  --override data.max_samples=32 \
+  --override data.workers=0 \
+  --override model.hidden_size=64 \
+  --override model.depth=2 \
+  --override model.num_heads=4 \
   --override compile.enabled=false \
-  --override cache.workers=0 \
   --override train.global_batch_size=8 \
   --override train.micro_batch_size=4 \
   --override validation.interval=0 \
@@ -267,9 +166,4 @@ uv run python scripts/train.py \
   --eval-sampling-steps 2
 ```
 
-The codec reconstruction integration test remains opt-in:
-
-```bash
-RAE_RUN_CODEC_INTEGRATION=1 uv run pytest -q \
-  tests/test_codec_reconstruction_integration.py
-```
+Add `--reg --override model.reg.repa_block=2` to smoke-test REG with the two-block model.

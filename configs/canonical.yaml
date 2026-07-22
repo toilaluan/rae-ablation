@@ -1,30 +1,31 @@
-codec: rae
-cache:
-  codec: both
-  directory: cache/imagenet-train
+data:
+  repository: benjamin-paine/imagenet-1k-256x256
+  revision: 1bd0400450249a7fe90c0aece37d0d03e7ea956a
   split: train
-  shard_size: 8192
-  batch_size: 1024
   workers: 16
   prefetch_factor: 4
-  output_buffers: 3
-  verify: true
+  max_samples: null
 model:
-  in_channels: 1024
-  use_patch_forcing: false
-  encoder_hidden_size: 768
-  decoder_hidden_size: 2048
-  encoder_depth: 12
-  decoder_depth: 2
-  encoder_num_heads: 12
-  decoder_num_heads: 16
+  image_size: 256
+  patch_size: 32
+  in_channels: 3
+  hidden_size: 768
+  depth: 12
+  num_heads: 12
   mlp_ratio: 4.0
-  base_model_depth: 4
-  num_time_tokens: 4
-  num_class_tokens: 8
   num_classes: 1000
-  dropout: 0.0
+  class_dropout_prob: 0.1
   gradient_checkpointing: false
+  variant: SiT-B
+  reg:
+    enabled: false
+    model_name: vit_base_patch16_dinov3.lvd1689m
+    feature_dim: 768
+    register_tokens: 4
+    repa_block: 4
+    repa_hidden_size: 2048
+    cls_loss_weight: 0.03
+    repa_loss_weight: 0.5
 compile:
   enabled: true
   backend: inductor
@@ -35,11 +36,13 @@ train:
   epochs: 80
   global_batch_size: 1024
   micro_batch_size: 256
+  max_steps: null
   grad_clip: 1.0
   ema_decay: 0.9995
   seed: 0
   timestep_loc: 0.0
   timestep_scale: 1.0
+  horizontal_flip_probability: 0.5
   optimizer:
     kind: muon
     lr: 0.0002
@@ -52,6 +55,7 @@ validation:
   periodic_samples: 5000
   final_samples: 50000
   plan_path: validation-plan.pt
+  validate_now: false
 checkpoint:
   directory: checkpoints
   interval: 5
@@ -59,6 +63,10 @@ checkpoint:
   save_best_fid: true
 wandb:
   enabled: false
-  project: rae-ablation
+  entity: null
+  project: jit-reg
+  name: null
+  group: null
+  tags: []
   mode: online
   checkpoint_artifacts: false

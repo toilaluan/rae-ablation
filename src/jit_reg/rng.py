@@ -15,15 +15,29 @@ class RNGStreams:
     initialization: torch.Generator
     timesteps: torch.Generator
     noise: torch.Generator
+    augmentations: torch.Generator
+    label_dropout: torch.Generator
+    cls_noise: torch.Generator
 
     @classmethod
     def create(cls, seed: int, device: str | torch.device = "cpu") -> RNGStreams:
-        offsets = (0, 10_000, 20_000, 30_000)
+        offsets = (0, 10_000, 20_000, 30_000, 40_000, 50_000, 60_000)
         shuffle = torch.Generator(device="cpu").manual_seed(seed + offsets[0])
         initialization = torch.Generator(device="cpu").manual_seed(seed + offsets[1])
         timesteps = torch.Generator(device=device).manual_seed(seed + offsets[2])
         noise = torch.Generator(device=device).manual_seed(seed + offsets[3])
-        return cls(shuffle, initialization, timesteps, noise)
+        augmentations = torch.Generator(device=device).manual_seed(seed + offsets[4])
+        label_dropout = torch.Generator(device=device).manual_seed(seed + offsets[5])
+        cls_noise = torch.Generator(device=device).manual_seed(seed + offsets[6])
+        return cls(
+            shuffle,
+            initialization,
+            timesteps,
+            noise,
+            augmentations,
+            label_dropout,
+            cls_noise,
+        )
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         return {
@@ -31,6 +45,9 @@ class RNGStreams:
             "initialization": self.initialization.get_state(),
             "timesteps": self.timesteps.get_state(),
             "noise": self.noise.get_state(),
+            "augmentations": self.augmentations.get_state(),
+            "label_dropout": self.label_dropout.get_state(),
+            "cls_noise": self.cls_noise.get_state(),
         }
 
     def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:

@@ -5,44 +5,38 @@ from pathlib import Path
 
 import torch
 
-from rae_ablation.cache import ShardedLatentDataset, read_manifest
-from rae_ablation.checkpoint import EMA, CheckpointManager
-from rae_ablation.config import load_config
-from rae_ablation.constants import (
-    COMPACT_REPO,
-    COMPACT_REVISION,
-    IMAGENET_REPO,
-    IMAGENET_REVISION,
-    RAE_REPO,
-    RAE_REVISION,
+from jit_reg.checkpoint import EMA, CheckpointManager
+from jit_reg.config import load_config
+from jit_reg.data import (
+    data_fingerprint,
+    load_imagenet,
+    preprocessing_metadata,
 )
-from rae_ablation.distributed import initialize_distributed
-from rae_ablation.latents import LatentStatistics
-from rae_ablation.model.compile import compile_model_regions
-from rae_ablation.model.factory import build_diffusion_model
-from rae_ablation.optim import build_optimizer
-from rae_ablation.rng import RNGStreams
-from rae_ablation.sample_runtime import SamplingParameters
-from rae_ablation.training import TrainState, make_train_loader, train
-from rae_ablation.validation import ValidationPlan, create_validation_plan
-from rae_ablation.validation_runtime import validate_ema
-from rae_ablation.wandb_utils import RunLogger
+from jit_reg.distributed import initialize_distributed
+from jit_reg.model.compile import compile_model_regions
+from jit_reg.model.sit import SiT
+from jit_reg.optim import build_optimizer
+from jit_reg.reg import DINOv3FeatureExtractor
+from jit_reg.rng import RNGStreams
+from jit_reg.sample_runtime import SamplingParameters
+from jit_reg.training import TrainState, make_train_loader, train
+from jit_reg.validation import ValidationPlan, create_validation_plan
+from jit_reg.validation_runtime import validate_ema
+from jit_reg.wandb_utils import RunLogger
 
 torch._dynamo.config.cache_size_limit = 1000
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train the matched latent diffusion model")
+    parser = argparse.ArgumentParser(description="Train pixel-space JiT on ImageNet-256")
     parser.add_argument("--config", type=Path, default=Path("configs/canonical.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
-    parser.add_argument("--codec", choices=("rae", "rae_compact"))
-    parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument("--reg", action="store_true", help="enable DINOv3 REG and REPA")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--validation-interval", type=int)
     parser.add_argument("--checkpoint-interval", type=int)
     parser.add_argument("--max-steps", type=int)
-    parser.add_argument("--use-patch-forcing", action="store_true")
     parser.add_argument("--validate-now", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--log-interval", type=int, default=10)
@@ -51,6 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-sampling-steps", type=int, default=50)
     parser.add_argument("--eval-guidance-scale", type=float, default=1.78)
     parser.add_argument("--eval-timestep-shift", type=float, default=1.0)
+    parser.add_argument("--eval-cfg-start", type=float, default=0.0)
+    parser.add_argument("--eval-cfg-end", type=float, default=1.0)
     parser.add_argument("--eval-log-interval", type=int, default=10)
     return parser
 
@@ -58,10 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     config = load_config(args.config, args.override)
-    if args.codec:
-        config.codec = args.codec
-    if args.cache_dir:
-        config.cache.directory = str(args.cache_dir)
+    config.model.reg.enabled = config.model.reg.enabled or args.reg
     if args.output:
         config.checkpoint.directory = str(args.output / "checkpoints")
         config.validation.plan_path = str(args.output / "validation-plan.pt")
@@ -71,8 +64,6 @@ def main() -> None:
         config.checkpoint.interval = args.checkpoint_interval
     if args.max_steps is not None:
         config.train.max_steps = args.max_steps
-    if args.use_patch_forcing:
-        config.model.use_patch_forcing = True
     config.validation.validate_now = args.validate_now
     config.wandb.enabled = config.wandb.enabled or args.wandb
     config.validate()
@@ -81,6 +72,8 @@ def main() -> None:
         sampling_steps=args.eval_sampling_steps,
         guidance_scale=args.eval_guidance_scale,
         timestep_shift=args.eval_timestep_shift,
+        cfg_start=args.eval_cfg_start,
+        cfg_end=args.eval_cfg_end,
         log_interval=args.eval_log_interval,
     )
     sampling.validate()
@@ -93,12 +86,9 @@ def main() -> None:
     streams = RNGStreams.create(config.train.seed, device)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(streams.initialization.initial_seed())
-        model = build_diffusion_model(config.model).to(device)
-    dataset = ShardedLatentDataset(config.cache.directory, config.codec)
-    manifest = read_manifest(Path(config.cache.directory) / "manifest.json")
-    statistics = LatentStatistics.load(
-        Path(config.cache.directory) / f"stats-{config.codec}.safetensors"
-    )
+        model = SiT(config.model).to(device)
+    dataset = load_imagenet(config.data, config.model.image_size)
+    fingerprint = data_fingerprint(config.data, config.model.image_size)
     plan_path = Path(config.validation.plan_path)
     if rank == 0 and not plan_path.exists():
         create_validation_plan(
@@ -106,7 +96,6 @@ def main() -> None:
             config.validation.periodic_samples,
             config.model.num_classes,
             config.train.seed + 7,
-            channels=config.model.in_channels,
         ).save(plan_path)
     if world_size > 1:
         torch.distributed.barrier()
@@ -114,17 +103,21 @@ def main() -> None:
 
     ema = EMA(model, config.train.ema_decay)
     optimizer = build_optimizer(model, config.train.optimizer)
-    manager = CheckpointManager(config.checkpoint.directory, config.checkpoint.keep_last_n)
+    manager = CheckpointManager(
+        config.checkpoint.directory, config.checkpoint.keep_last_n
+    )
     state = TrainState()
     resume_run_id: str | None = None
     if args.resume:
         resumed = manager.load(
-            args.resume.resolve(), model, ema, manifest.fingerprint, plan.plan_hash
+            args.resume.resolve(), model, ema, fingerprint, plan.plan_hash
         )
         optimizer.load_state_dict(resumed.optimizer)
         streams.load_state_dict(resumed.rng_streams)
         state = TrainState(
-            resumed.epoch, resumed.global_step, resumed.last_completed_validation_epoch
+            resumed.epoch,
+            resumed.global_step,
+            resumed.last_completed_validation_epoch,
         )
         resume_run_id = resumed.wandb_run_id
 
@@ -134,6 +127,11 @@ def main() -> None:
             execution_model,
             device_ids=[device.index] if device.type == "cuda" else None,
         )
+    reg_encoder = (
+        DINOv3FeatureExtractor(config.model.reg).to(device)
+        if config.model.reg.enabled
+        else None
+    )
     loader, sampler = make_train_loader(dataset, config, streams)
     logged_config = config.as_dict()
     logged_config["online_validation"] = {
@@ -142,26 +140,37 @@ def main() -> None:
         "sampling_steps": sampling.sampling_steps,
         "guidance_scale": sampling.guidance_scale,
         "timestep_shift": sampling.timestep_shift,
+        "cfg_interval": [sampling.cfg_start, sampling.cfg_end],
         "log_interval": sampling.log_interval,
     }
     logged_config["provenance"] = {
-        "rae": {"repository": RAE_REPO, "revision": RAE_REVISION},
-        "compact": {"repository": COMPACT_REPO, "revision": COMPACT_REVISION},
-        "dataset": {"repository": IMAGENET_REPO, "revision": IMAGENET_REVISION},
-        "cache_fingerprint": manifest.fingerprint,
+        "dataset_and_preprocessing": preprocessing_metadata(
+            config.data, config.model.image_size
+        ),
+        "data_fingerprint": fingerprint,
         "validation_plan_hash": plan.plan_hash,
+        "reg_target": config.model.reg.model_name
+        if config.model.reg.enabled
+        else None,
     }
     logged_config["model_parameters"] = {
         "total": sum(parameter.numel() for parameter in model.parameters()),
         "trainable": sum(
-            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
         ),
     }
     logger = RunLogger(
-        config.wandb, logged_config, rank == 0, resume_run_id, args.log_interval
+        config.wandb,
+        logged_config,
+        rank == 0,
+        resume_run_id,
+        args.log_interval,
     )
     logger.event(
-        f"training initialized: codec={config.codec}, parameters="
+        f"training initialized: variant={config.model.model_variant}, "
+        f"reg={config.model.reg.enabled}, parameters="
         f"{logged_config['model_parameters']['total']:,}"
     )
     if args.resume:
@@ -174,7 +183,6 @@ def main() -> None:
         metrics, validation_output = validate_ema(
             ema=ema,
             config=config,
-            statistics=statistics,
             plan=plan,
             completed_epoch=epoch,
             final=final,
@@ -196,28 +204,26 @@ def main() -> None:
     try:
         if config.validation.validate_now and state.epoch > 0:
             logger.event(f"forced validation started after epoch {state.epoch}")
-            forced_metrics = validate_callback(state.epoch, state.epoch >= config.train.epochs)
+            forced_metrics = validate_callback(
+                state.epoch, state.epoch >= config.train.epochs
+            )
             state.last_completed_validation_epoch = state.epoch
             config.validation.validate_now = False
             logger.log(forced_metrics, step=state.global_step)
-            for name, value in forced_metrics.items():
-                if "FID" in name:
-                    logger.event(f"{name}: {value:.6f}")
-
         train(
             canonical_model=model,
             execution_model=execution_model,
             loader=loader,
             sampler=sampler,
-            statistics=statistics,
             optimizer=optimizer,
             ema=ema,
             streams=streams,
             config=config,
             checkpoint_manager=manager,
-            cache_fingerprint=manifest.fingerprint,
+            data_fingerprint=fingerprint,
             validation_plan_hash=plan.plan_hash,
             logger=logger,
+            reg_encoder=reg_encoder,
             state=state,
             validation_callback=validate_callback,
         )

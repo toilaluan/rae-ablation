@@ -14,9 +14,11 @@ from torch.utils.data.distributed import DistributedSampler
 
 from .checkpoint import EMA, CheckpointManager, should_checkpoint
 from .config import ExperimentConfig
-from .flow import flow_losses, noisy_interpolate, sample_timesteps
-from .latents import LatentStatistics
+from .data import random_horizontal_flip
+from .model.sit import classifier_free_labels
+from .objective import jit_losses, noisy_interpolate, sample_timesteps
 from .optim import CompositeOptimizer, learning_rate_at_epoch, set_learning_rate
+from .reg import DINOv3FeatureExtractor
 from .rng import RNGStreams
 from .validation import should_validate
 from .wandb_utils import RunLogger
@@ -63,9 +65,10 @@ def make_train_loader(
             sampler=sampler,
             shuffle=sampler is None,
             generator=streams.shuffle,
-            num_workers=config.cache.workers,
+            num_workers=config.data.workers,
             pin_memory=torch.cuda.is_available(),
-            persistent_workers=config.cache.workers > 0,
+            persistent_workers=config.data.workers > 0,
+            prefetch_factor=config.data.prefetch_factor if config.data.workers > 0 else None,
             drop_last=True,
         ),
         sampler,
@@ -78,26 +81,30 @@ def train(
     execution_model: nn.Module,
     loader: DataLoader[Any],
     sampler: DistributedSampler[Any] | None,
-    statistics: LatentStatistics,
     optimizer: CompositeOptimizer,
     ema: EMA,
     streams: RNGStreams,
     config: ExperimentConfig,
     checkpoint_manager: CheckpointManager,
-    cache_fingerprint: str,
+    data_fingerprint: str,
     validation_plan_hash: str,
     logger: RunLogger,
+    reg_encoder: DINOv3FeatureExtractor | None = None,
     state: TrainState | None = None,
     validation_callback: ValidationCallback | None = None,
 ) -> TrainState:
     state = state or TrainState()
     rank, world_size = distributed_info()
     device = next(canonical_model.parameters()).device
-    accumulation = config.train.global_batch_size // (config.train.micro_batch_size * world_size)
+    accumulation = config.train.global_batch_size // (
+        config.train.micro_batch_size * world_size
+    )
     if accumulation < 1 or config.train.global_batch_size % (
         config.train.micro_batch_size * world_size
     ):
         raise ValueError("global batch size must divide micro batch size * world size exactly")
+    if config.model.reg.enabled != (reg_encoder is not None):
+        raise ValueError("REG configuration and DINOv3 feature extractor must agree")
     optimizer.zero_grad()
 
     for epoch_index in range(state.epoch, config.train.epochs):
@@ -105,29 +112,62 @@ def train(
         if sampler is not None:
             sampler.set_epoch(epoch_index)
         execution_model.train()
+        if reg_encoder is not None:
+            reg_encoder.eval()
         epoch_started = time.perf_counter()
         step_started = epoch_started
         last_compute_end = epoch_started
         accumulated_data_wait = 0.0
-        for batch_index, (latent, labels, _indices) in enumerate(loader):
+        for batch_index, (pixels, labels, _indices) in enumerate(loader):
             batch_ready = time.perf_counter()
             accumulated_data_wait += batch_ready - last_compute_end
-            latent = latent.to(device, non_blocking=True)
+            pixels = pixels.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            clean = statistics.normalize(latent.float())
+            pixels = random_horizontal_flip(
+                pixels,
+                streams.augmentations,
+                config.train.horizontal_flip_probability,
+            )
+            clean = pixels.mul(2).sub(1)
             timesteps = sample_timesteps(
                 clean.shape[0],
-                tuple(clean.shape[1:]),
                 streams.timesteps,
                 device,
-                use_patch_forcing=config.model.use_patch_forcing,
                 loc=config.train.timestep_loc,
                 scale=config.train.timestep_scale,
             )
-            noise = torch.randn(
-                clean.shape, device=device, dtype=torch.float32, generator=streams.noise
+            image_noise = torch.randn(
+                clean.shape,
+                device=device,
+                dtype=torch.float32,
+                generator=streams.noise,
             )
-            x_t = noisy_interpolate(clean, noise, timesteps.interpolation)
+            noisy_image = noisy_interpolate(clean, image_noise, timesteps)
+            model_labels = classifier_free_labels(
+                labels,
+                config.model.num_classes,
+                config.model.class_dropout_prob,
+                streams.label_dropout,
+            )
+
+            targets = None
+            cls_noise = None
+            noisy_cls = None
+            if reg_encoder is not None:
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=device.type == "cuda",
+                ):
+                    targets = reg_encoder.targets(pixels, config.model.grid_size)
+                cls_noise = torch.randn(
+                    targets.cls.shape,
+                    device=device,
+                    dtype=torch.float32,
+                    generator=streams.cls_noise,
+                )
+                noisy_cls = noisy_interpolate(targets.cls, cls_noise, timesteps)
+
             update = (batch_index + 1) % accumulation == 0
             sync_context = (
                 execution_model.no_sync()
@@ -140,13 +180,25 @@ def train(
                     dtype=torch.bfloat16,
                     enabled=device.type == "cuda",
                 ):
-                    output = execution_model(x_t, timesteps.conditioning, labels)
-                losses = flow_losses(
+                    output = execution_model(
+                        noisy_image,
+                        timesteps,
+                        model_labels,
+                        noisy_cls=noisy_cls,
+                        return_repa=targets is not None,
+                    )
+                losses = jit_losses(
                     clean,
-                    noise,
-                    timesteps.interpolation,
-                    output.full,
-                    output.early,
+                    image_noise,
+                    timesteps,
+                    output.image,
+                    clean_cls=targets.cls if targets is not None else None,
+                    cls_noise=cls_noise,
+                    cls_prediction=output.cls,
+                    repa_prediction=output.repa,
+                    repa_target=targets.sequence if targets is not None else None,
+                    cls_weight=config.model.reg.cls_loss_weight,
+                    repa_weight=config.model.reg.repa_loss_weight,
                 )
                 (losses.total / accumulation).backward()
             last_compute_end = time.perf_counter()
@@ -172,18 +224,20 @@ def train(
             images = config.train.global_batch_size
             logger.log_training(
                 {
-                    "train/loss_velocity_combined": losses.total.item(),
-                    "train/loss_velocity_full": losses.full.item(),
-                    "train/loss_velocity_early": losses.early.item(),
+                    "train/loss": losses.total.item(),
+                    "train/image_velocity_loss": losses.image_velocity.item(),
+                    "train/cls_velocity_loss": losses.cls_velocity.item(),
+                    "train/repa_loss": losses.repa.item(),
                     "train/lr": lr,
                     "train/lr_adamw": lr,
-                    "train/lr_muon": lr if config.train.optimizer.kind == "muon" else 0.0,
+                    "train/lr_muon": lr
+                    if config.train.optimizer.kind == "muon"
+                    else 0.0,
                     "train/gradient_norm": float(grad_norm),
                     "train/ema_decay": ema.decay,
                     "throughput/images_per_second": images / elapsed,
-                    "throughput/latent_tokens_per_second": images
-                    * clean.shape[-2]
-                    * clean.shape[-1]
+                    "throughput/jit_tokens_per_second": images
+                    * config.model.grid_size**2
                     / elapsed,
                     "throughput/step_seconds": elapsed,
                     "throughput/data_wait_seconds": accumulated_data_wait,
@@ -203,9 +257,9 @@ def train(
 
         state.epoch = epoch_index + 1
         final_epoch = state.epoch == config.train.epochs or (
-            config.train.max_steps is not None and state.global_step >= config.train.max_steps
+            config.train.max_steps is not None
+            and state.global_step >= config.train.max_steps
         )
-
         validation_metrics: dict[str, float] = {}
         if validation_callback is not None and should_validate(
             state.epoch,
@@ -224,7 +278,9 @@ def train(
                     logger.event(f"{name}: {value:.6f}")
 
         if rank == 0 and (
-            should_checkpoint(state.epoch, config.train.epochs, config.checkpoint.interval)
+            should_checkpoint(
+                state.epoch, config.train.epochs, config.checkpoint.interval
+            )
             or final_epoch
         ):
             fid = validation_metrics.get("validation/FID-50K")
@@ -236,9 +292,8 @@ def train(
                 model=canonical_model,
                 ema=ema,
                 optimizer_state=optimizer.state_dict(),
-                scheduler_state={"epoch": state.epoch},
                 rng_streams=streams.state_dict(),
-                cache_fingerprint=cache_fingerprint,
+                data_fingerprint=data_fingerprint,
                 validation_plan_hash=validation_plan_hash,
                 last_completed_validation_epoch=state.last_completed_validation_epoch,
                 wandb_run_id=logger.run_id,
@@ -251,9 +306,12 @@ def train(
                 logger.log_checkpoint(str(path), f"checkpoint-epoch-{state.epoch:04d}")
 
         logger.log(
-            {"train/epoch_seconds": time.perf_counter() - epoch_started}, step=state.global_step
+            {"train/epoch_seconds": time.perf_counter() - epoch_started},
+            step=state.global_step,
         )
-        logger.event(f"epoch {state.epoch} finished in {time.perf_counter() - epoch_started:.1f}s")
+        logger.event(
+            f"epoch {state.epoch} finished in {time.perf_counter() - epoch_started:.1f}s"
+        )
         if final_epoch:
             break
     return state
