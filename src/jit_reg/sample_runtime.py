@@ -129,12 +129,14 @@ def _manifest_base(
     model_variant: str,
     reg_enabled: bool,
     reg_variant: str,
+    reg_token_mode: str,
+    reg_pool_size: int,
     parameters: SamplingParameters,
 ) -> dict[str, Any]:
     counts = torch.bincount(labels, minlength=num_classes)
     ids_digest = hashlib.sha256(sample_ids.numpy().tobytes()).hexdigest()
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "checkpoint_sha256": checkpoint_hash,
         "validation_plan_hash": plan.plan_hash,
         "sample_ids_sha256": ids_digest,
@@ -144,6 +146,8 @@ def _manifest_base(
         "model_variant": model_variant,
         "reg_enabled": reg_enabled,
         "reg_variant": reg_variant,
+        "reg_token_mode": reg_token_mode,
+        "reg_pool_size": reg_pool_size,
         "sample_count": sample_count,
         "num_classes": num_classes,
         "class_counts": counts.tolist(),
@@ -307,6 +311,8 @@ def sample_to_archive(
     model_variant: str,
     reg_enabled: bool,
     reg_variant: str,
+    reg_token_mode: str,
+    reg_pool_size: int,
     checkpoint_hash: str,
     parameters: SamplingParameters,
     generate_batch: GenerateBatch,
@@ -322,6 +328,13 @@ def sample_to_archive(
         raise ValueError("REG variant must be disabled, standard, or wide_intermediate")
     if reg_enabled != (reg_variant != "disabled"):
         raise ValueError("REG enabled status and variant do not agree")
+    expected_token_modes = {"disabled", "cls", "cls_spatial"}
+    if reg_token_mode not in expected_token_modes:
+        raise ValueError("REG token mode must be disabled, cls, or cls_spatial")
+    if reg_enabled != (reg_token_mode != "disabled"):
+        raise ValueError("REG enabled status and token mode do not agree")
+    if not 1 <= reg_pool_size <= 16:
+        raise ValueError("REG pool size must be within the native 16x16 feature grid")
     labels, sample_ids, noise_seeds = validate_sampling_plan(plan, sample_count, num_classes)
     output_dir = Path(output_dir)
     paths = _paths(output_dir)
@@ -337,6 +350,8 @@ def sample_to_archive(
         model_variant=model_variant,
         reg_enabled=reg_enabled,
         reg_variant=reg_variant,
+        reg_token_mode=reg_token_mode,
+        reg_pool_size=reg_pool_size,
         parameters=parameters,
     )
     rank, world_size = _distributed()

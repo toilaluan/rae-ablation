@@ -12,6 +12,8 @@ class REGConfig:
     model_name: str = "vit_base_patch16_dinov3.lvd1689m"
     feature_dim: int = 768
     register_tokens: int = 4
+    token_mode: str = "cls"
+    pool_size: int = 4
     repa_block: int = 4
     repa_hidden_size: int = 2048
     cls_predictor: str = "standard"
@@ -21,6 +23,14 @@ class REGConfig:
     cls_head_mlp_ratio: float = 4.0
     cls_loss_weight: float = 0.03
     repa_loss_weight: float = 0.5
+
+    @property
+    def num_tokens(self) -> int:
+        if self.token_mode == "cls":
+            return 1
+        if self.token_mode == "cls_spatial":
+            return 1 + self.pool_size**2
+        raise ValueError(f"unknown REG token mode: {self.token_mode}")
 
 
 @dataclass
@@ -154,12 +164,17 @@ class ExperimentConfig:
         if min(
             reg.feature_dim,
             reg.register_tokens,
+            reg.pool_size,
             reg.repa_block,
             reg.repa_hidden_size,
             reg.cls_head_hidden_size,
             reg.cls_head_depth,
         ) < 1:
             raise ValueError("model.reg dimensions must be positive")
+        if reg.token_mode not in {"cls", "cls_spatial"}:
+            raise ValueError("model.reg.token_mode must be cls or cls_spatial")
+        if reg.pool_size > 16:
+            raise ValueError("model.reg.pool_size cannot exceed the native 16x16 feature grid")
         if reg.cls_head_block < 1:
             raise ValueError("model.reg.cls_head_block must be positive")
         if reg.cls_head_mlp_ratio <= 0:

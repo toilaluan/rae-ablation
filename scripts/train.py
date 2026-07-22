@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     reg.add_argument(
         "--reg-widehead",
         action="store_true",
-        help="enable REG with the wide intermediate clean-CLS predictor",
+        help="enable REG with the wide intermediate clean-token predictor",
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", type=Path)

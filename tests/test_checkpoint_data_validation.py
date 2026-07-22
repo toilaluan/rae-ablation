@@ -91,6 +91,10 @@ def test_validation_plan_noise_and_rng_stream_resume(tmp_path: Path) -> None:
     torch.rand(3, generator=streams.augmentations)
     streams.load_state_dict(saved)
     assert torch.equal(streams.augmentations.get_state(), saved["augmentations"])
+    legacy = {**saved, "cls_noise": saved["reg_noise"]}
+    del legacy["reg_noise"]
+    streams.load_state_dict(legacy)
+    assert torch.equal(streams.reg_noise.get_state(), saved["reg_noise"])
     state = torch.random.get_rng_state()
     with preserve_global_rng():
         torch.randn(100)
@@ -146,15 +150,32 @@ def test_checkpoint_resume_retention_best_and_no_scheduler(tmp_path: Path) -> No
 
 
 class _TinyTarget(nn.Module):
+    def __init__(self, token_mode: str) -> None:
+        super().__init__()
+        self.token_mode = token_mode
+
     def targets(self, images: torch.Tensor, target_grid: int) -> REGTargets:
         cls = images.mean(dim=(2, 3)).repeat(1, 3)[:, :8]
         spatial = torch.ones(images.shape[0], target_grid**2, 8)
         spatial = torch.nn.functional.normalize(spatial, dim=-1)
-        return REGTargets(cls, spatial, torch.cat((cls[:, None], spatial), dim=1))
+        reg_tokens = cls[:, None]
+        if self.token_mode == "cls_spatial":
+            reg_tokens = torch.cat((reg_tokens, torch.zeros_like(spatial)), dim=1)
+        return REGTargets(reg_tokens, spatial)
 
 
-@pytest.mark.parametrize("reg_variant", ["disabled", "standard", "wide_intermediate"])
-def test_one_step_pixel_training_smoke(tmp_path: Path, reg_variant: str) -> None:
+@pytest.mark.parametrize(
+    ("reg_variant", "token_mode"),
+    [
+        ("disabled", "cls"),
+        ("standard", "cls"),
+        ("standard", "cls_spatial"),
+        ("wide_intermediate", "cls_spatial"),
+    ],
+)
+def test_one_step_pixel_training_smoke(
+    tmp_path: Path, reg_variant: str, token_mode: str
+) -> None:
     reg_enabled = reg_variant != "disabled"
     wide = reg_variant == "wide_intermediate"
     config = ExperimentConfig()
@@ -169,6 +190,8 @@ def test_one_step_pixel_training_smoke(tmp_path: Path, reg_variant: str) -> None
         reg=REGConfig(
             enabled=reg_enabled,
             feature_dim=8,
+            token_mode=token_mode,
+            pool_size=2,
             repa_block=1,
             repa_hidden_size=16,
             cls_predictor=reg_variant if reg_enabled else "standard",
@@ -204,7 +227,7 @@ def test_one_step_pixel_training_smoke(tmp_path: Path, reg_variant: str) -> None
         data_fingerprint="data",
         validation_plan_hash="plan",
         logger=RunLogger(WandbConfig(), {}, True, log_interval=1),
-        reg_encoder=_TinyTarget() if reg_enabled else None,  # type: ignore[arg-type]
+        reg_encoder=_TinyTarget(token_mode) if reg_enabled else None,  # type: ignore[arg-type]
     )
     assert state.global_step == 1
     assert (tmp_path / "checkpoints" / "epoch-0001" / "training.pt").is_file()
@@ -242,7 +265,7 @@ def test_wandb_is_rank_zero_only_and_resumes(
             "train/epoch": 1.0,
             "train/loss": 2.0,
             "train/image_velocity_loss": 1.0,
-            "train/cls_velocity_loss": 0.0,
+            "train/reg_velocity_loss": 0.0,
             "train/repa_loss": 0.0,
             "train/lr": 1e-4,
             "train/gradient_norm": 0.5,

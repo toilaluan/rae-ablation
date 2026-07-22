@@ -11,9 +11,8 @@ from .config import REGConfig
 
 
 class REGTargets(NamedTuple):
-    cls: Tensor
-    spatial: Tensor
-    sequence: Tensor
+    reg_tokens: Tensor
+    repa: Tensor
 
 
 def resize_spatial_features(spatial: Tensor, target_grid: int) -> Tensor:
@@ -39,13 +38,44 @@ def resize_spatial_features(spatial: Tensor, target_grid: int) -> Tensor:
     return F.normalize(features, dim=-1)
 
 
-def prepare_reg_targets(cls: Tensor, spatial: Tensor, target_grid: int) -> REGTargets:
+def pool_spatial_features(spatial: Tensor, pool_size: int) -> Tensor:
+    """Adaptively pool square spatial tokens and apply parameter-free LayerNorm."""
+    if spatial.ndim != 3 or pool_size < 1:
+        raise ValueError("spatial must have shape [B, tokens, channels] and a positive pool size")
+    source_grid = math.isqrt(spatial.shape[1])
+    if source_grid * source_grid != spatial.shape[1]:
+        raise ValueError("spatial token count must form a square grid")
+    if pool_size > source_grid:
+        raise ValueError("pool size cannot exceed the source feature grid")
+    features = spatial.float().transpose(1, 2).reshape(
+        spatial.shape[0], spatial.shape[2], source_grid, source_grid
+    )
+    pooled = F.adaptive_avg_pool2d(features, (pool_size, pool_size))
+    pooled = pooled.flatten(2).transpose(1, 2)
+    return F.layer_norm(pooled, (pooled.shape[-1],))
+
+
+def prepare_reg_targets(
+    cls: Tensor,
+    spatial: Tensor,
+    target_grid: int,
+    *,
+    token_mode: str = "cls",
+    pool_size: int = 4,
+) -> REGTargets:
     if cls.ndim != 2 or spatial.ndim != 3:
         raise ValueError("CLS and spatial features must have shapes [B, D] and [B, N, D]")
     if cls.shape[0] != spatial.shape[0] or cls.shape[1] != spatial.shape[2]:
         raise ValueError("CLS and spatial feature dimensions do not match")
-    resized = resize_spatial_features(spatial, target_grid)
-    return REGTargets(cls=cls, spatial=resized, sequence=torch.cat((cls[:, None], resized), 1))
+    if token_mode == "cls":
+        reg_tokens = cls.float().unsqueeze(1)
+    elif token_mode == "cls_spatial":
+        pooled = pool_spatial_features(spatial, pool_size)
+        reg_tokens = torch.cat((cls.float().unsqueeze(1), pooled), dim=1)
+    else:
+        raise ValueError("token_mode must be cls or cls_spatial")
+    repa = resize_spatial_features(spatial, target_grid)
+    return REGTargets(reg_tokens=reg_tokens, repa=repa)
 
 
 def negative_cosine_repa_loss(prediction: Tensor, target: Tensor) -> Tensor:
@@ -132,4 +162,10 @@ class DINOv3FeatureExtractor(nn.Module):
     @torch.no_grad()
     def targets(self, images: Tensor, target_grid: int) -> REGTargets:
         cls, spatial = self.extract(images)
-        return prepare_reg_targets(cls, spatial, target_grid)
+        return prepare_reg_targets(
+            cls,
+            spatial,
+            target_grid,
+            token_mode=self.config.token_mode,
+            pool_size=self.config.pool_size,
+        )

@@ -22,6 +22,8 @@ model:
     model_name: vit_base_patch16_dinov3.lvd1689m
     feature_dim: 768
     register_tokens: 4
+    token_mode: cls
+    pool_size: 4
     repa_block: 4
     repa_hidden_size: 2048
     cls_predictor: standard

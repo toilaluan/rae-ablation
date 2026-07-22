@@ -14,7 +14,7 @@ from .rope import apply_2d_rope
 
 class SiTOutput(NamedTuple):
     image: Tensor
-    cls: Tensor | None = None
+    reg: Tensor | None = None
     repa: Tensor | None = None
 
 
@@ -163,7 +163,7 @@ class REPAProjection(nn.Module):
         return self.layers(x)
 
 
-class WideCLSResidualLayer(nn.Module):
+class WideREGResidualLayer(nn.Module):
     """Conditioned, attention-free adaLN-Zero SwiGLU residual layer."""
 
     def __init__(self, hidden_size: int, mlp_ratio: float) -> None:
@@ -178,8 +178,8 @@ class WideCLSResidualLayer(nn.Module):
         return x + gate.unsqueeze(1) * self.feed_forward(normalized)
 
 
-class WideCLSPredictor(nn.Module):
-    """Predict clean DINO CLS features from an intermediate hidden CLS token."""
+class WideREGPredictor(nn.Module):
+    """Predict clean DINO REG tokens from an intermediate hidden REG prefix."""
 
     def __init__(
         self,
@@ -193,7 +193,7 @@ class WideCLSPredictor(nn.Module):
         self.token_projection = nn.Linear(input_size, hidden_size)
         self.conditioning_projection = nn.Linear(input_size, hidden_size)
         self.layers = nn.ModuleList(
-            [WideCLSResidualLayer(hidden_size, mlp_ratio) for _ in range(depth)]
+            [WideREGResidualLayer(hidden_size, mlp_ratio) for _ in range(depth)]
         )
         self.output = FinalLayer(hidden_size, output_size)
 
@@ -222,6 +222,10 @@ class SiT(nn.Module):
             raise ValueError("attention head dimension must be divisible by four")
         if config.reg.enabled and not 1 <= config.reg.repa_block <= config.depth:
             raise ValueError("REG REPA block must be within model depth")
+        if config.reg.token_mode not in {"cls", "cls_spatial"}:
+            raise ValueError("unknown REG token mode")
+        if not 1 <= config.reg.pool_size <= 16:
+            raise ValueError("REG pool size must be within the native 16x16 feature grid")
         if config.reg.cls_predictor not in {"standard", "wide_intermediate"}:
             raise ValueError("unknown REG CLS predictor")
         if config.reg.cls_predictor == "wide_intermediate":
@@ -255,15 +259,21 @@ class SiT(nn.Module):
             self.cls_input: nn.Linear | None = nn.Linear(
                 config.reg.feature_dim, config.hidden_size
             )
+            if config.reg.token_mode == "cls_spatial":
+                self.reg_position_embedding = nn.Parameter(
+                    torch.empty(1, config.reg.pool_size**2, config.hidden_size)
+                )
+            else:
+                self.register_parameter("reg_position_embedding", None)
             if config.reg.cls_predictor == "standard":
                 self.cls_final_layer: FinalLayer | None = FinalLayer(
                     config.hidden_size, config.reg.feature_dim
                 )
-                self.cls_predictor: WideCLSPredictor | None = None
+                self.cls_predictor: WideREGPredictor | None = None
                 self.cls_clean_projection: nn.Linear | None = None
             else:
                 self.cls_final_layer = None
-                self.cls_predictor = WideCLSPredictor(
+                self.cls_predictor = WideREGPredictor(
                     config.hidden_size,
                     config.reg.cls_head_hidden_size,
                     config.reg.feature_dim,
@@ -280,6 +290,7 @@ class SiT(nn.Module):
             )
         else:
             self.cls_input = None
+            self.register_parameter("reg_position_embedding", None)
             self.cls_final_layer = None
             self.cls_predictor = None
             self.cls_clean_projection = None
@@ -290,6 +301,10 @@ class SiT(nn.Module):
     @property
     def num_patches(self) -> int:
         return self.grid_size * self.grid_size
+
+    @property
+    def num_reg_tokens(self) -> int:
+        return self.config.reg.num_tokens if self.config.reg.enabled else 0
 
     def _initialize_weights(self) -> None:
         def initialize(module: nn.Module) -> None:
@@ -302,6 +317,8 @@ class SiT(nn.Module):
         nn.init.xavier_uniform_(self.patch_projection.weight.flatten(1))
         nn.init.zeros_(self.patch_projection.bias)
         nn.init.normal_(self.class_embedding.weight, std=0.02)
+        if self.reg_position_embedding is not None:
+            nn.init.normal_(self.reg_position_embedding, std=0.02)
         for layer in (self.timestep_embedding.mlp[0], self.timestep_embedding.mlp[2]):
             nn.init.normal_(layer.weight, std=0.02)
         for block in self.blocks:
@@ -339,12 +356,19 @@ class SiT(nn.Module):
             batch, channels, self.config.image_size, self.config.image_size
         )
 
+    def _add_reg_positions(self, tokens: Tensor) -> Tensor:
+        if self.reg_position_embedding is None:
+            return tokens
+        return torch.cat(
+            (tokens[:, :1], tokens[:, 1:] + self.reg_position_embedding), dim=1
+        )
+
     def forward(
         self,
         noisy_image: Tensor,
         timestep: Tensor,
         labels: Tensor,
-        noisy_cls: Tensor | None = None,
+        noisy_reg: Tensor | None = None,
         return_repa: bool = False,
     ) -> SiTOutput:
         expected = (
@@ -367,17 +391,24 @@ class SiT(nn.Module):
         sequence = self.patch_projection(noisy_image).flatten(2).transpose(1, 2)
         patch_start = 0
         if self.config.reg.enabled:
-            if noisy_cls is None or noisy_cls.shape != (batch, self.config.reg.feature_dim):
+            expected_reg = (
+                batch,
+                self.num_reg_tokens,
+                self.config.reg.feature_dim,
+            )
+            if noisy_reg is None or tuple(noisy_reg.shape) != expected_reg:
                 raise ValueError(
-                    f"REG requires noisy_cls with shape [B, {self.config.reg.feature_dim}]"
+                    "REG requires noisy_reg with shape "
+                    f"[B, {self.num_reg_tokens}, {self.config.reg.feature_dim}]"
                 )
             assert self.cls_input is not None
-            sequence = torch.cat((self.cls_input(noisy_cls).unsqueeze(1), sequence), dim=1)
-            patch_start = 1
-        elif noisy_cls is not None:
-            raise ValueError("noisy_cls is only valid when model.reg.enabled is true")
+            reg_tokens = self._add_reg_positions(self.cls_input(noisy_reg))
+            sequence = torch.cat((reg_tokens, sequence), dim=1)
+            patch_start = self.num_reg_tokens
+        elif noisy_reg is not None:
+            raise ValueError("noisy_reg is only valid when model.reg.enabled is true")
 
-        cls: Tensor | None = None
+        reg: Tensor | None = None
         repa: Tensor | None = None
         for index, block in enumerate(self.blocks, start=1):
             if self._checkpointing():
@@ -404,7 +435,7 @@ class SiT(nn.Module):
                 and self.repa_projection is not None
                 and index == self.config.reg.repa_block
             ):
-                repa = self.repa_projection(sequence)
+                repa = self.repa_projection(sequence[:, patch_start:])
             if (
                 self.cls_predictor is not None
                 and index == self.config.reg.cls_head_block
@@ -412,21 +443,23 @@ class SiT(nn.Module):
                 if self._checkpointing():
                     predicted = checkpoint(
                         self.cls_predictor,
-                        sequence[:, :1],
+                        sequence[:, :patch_start],
                         conditioning,
                         use_reentrant=False,
                         preserve_rng_state=False,
                     )
                 else:
-                    predicted = self.cls_predictor(sequence[:, :1], conditioning)
-                cls = predicted.squeeze(1)
+                    predicted = self.cls_predictor(
+                        sequence[:, :patch_start], conditioning
+                    )
+                reg = predicted
                 assert self.cls_clean_projection is not None
-                clean_cls = self.cls_clean_projection(cls).unsqueeze(1)
-                sequence = torch.cat((clean_cls, sequence[:, 1:]), dim=1)
+                clean_reg = self._add_reg_positions(self.cls_clean_projection(reg))
+                sequence = torch.cat((clean_reg, sequence[:, patch_start:]), dim=1)
 
         patch_tokens = sequence[:, patch_start:]
         image = self._unpatchify(self.final_layer(patch_tokens, conditioning))
         if patch_start and self.cls_predictor is None:
             assert self.cls_final_layer is not None
-            cls = self.cls_final_layer(sequence[:, :1], conditioning).squeeze(1)
-        return SiTOutput(image=image, cls=cls, repa=repa)
+            reg = self.cls_final_layer(sequence[:, :patch_start], conditioning)
+        return SiTOutput(image=image, reg=reg, repa=repa)

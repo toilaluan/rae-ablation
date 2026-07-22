@@ -69,10 +69,10 @@ def validate_ema(
             device,
             dtype=dtype,
         )
-        cls_noise = (
+        reg_noise = (
             noise_for_samples(
                 noise_seeds,
-                (config.model.reg.feature_dim,),
+                (config.model.reg.num_tokens, config.model.reg.feature_dim),
                 device,
                 dtype=dtype,
                 seed_offset=1_000_003,
@@ -87,7 +87,7 @@ def validate_ema(
                 execution_model,
                 noise,
                 batch_labels,
-                cls_noise=cls_noise,
+                reg_noise=reg_noise,
                 steps=sampling.sampling_steps,
                 guidance_scale=sampling.guidance_scale,
                 timestep_shift=sampling.timestep_shift,
@@ -112,6 +112,10 @@ def validate_ema(
         reg_variant=config.model.reg.cls_predictor
         if config.model.reg.enabled
         else "disabled",
+        reg_token_mode=config.model.reg.token_mode
+        if config.model.reg.enabled
+        else "disabled",
+        reg_pool_size=config.model.reg.pool_size,
         checkpoint_hash=digest,
         parameters=sampling,
         generate_batch=generate_batch,

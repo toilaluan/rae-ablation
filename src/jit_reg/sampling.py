@@ -12,7 +12,7 @@ from .objective import shift_timestep
 
 class EulerSample(NamedTuple):
     image: Tensor
-    cls: Tensor
+    reg: Tensor
 
 
 def class_balanced_labels(sample_count: int, num_classes: int) -> Tensor:
@@ -35,7 +35,7 @@ def euler_sample(
     noise: Tensor,
     labels: Tensor,
     *,
-    cls_noise: None = None,
+    reg_noise: None = None,
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
@@ -50,7 +50,7 @@ def euler_sample(
     noise: Tensor,
     labels: Tensor,
     *,
-    cls_noise: Tensor,
+    reg_noise: Tensor,
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
@@ -65,7 +65,7 @@ def euler_sample(
     noise: Tensor,
     labels: Tensor,
     *,
-    cls_noise: Tensor | None = None,
+    reg_noise: Tensor | None = None,
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
@@ -84,8 +84,8 @@ def euler_sample(
         raise ValueError("CFG interval must satisfy 0 <= start <= end <= 1")
     if labels.shape != (noise.shape[0],):
         raise ValueError("labels must have shape [B]")
-    if cls_noise is not None and cls_noise.shape[0] != noise.shape[0]:
-        raise ValueError("CLS noise batch dimension must match image noise")
+    if reg_noise is not None and reg_noise.shape[0] != noise.shape[0]:
+        raise ValueError("REG noise batch dimension must match image noise")
     if num_classes is None:
         config = getattr(model, "config", None)
         num_classes = getattr(config, "num_classes", None)
@@ -93,7 +93,7 @@ def euler_sample(
         raise ValueError("num_classes is required when it cannot be read from model.config")
 
     x = noise.float()
-    cls_state = cls_noise.float() if cls_noise is not None else None
+    reg_state = reg_noise.float() if reg_noise is not None else None
     null_labels = torch.full_like(labels, num_classes)
     combined_labels = torch.cat((labels, null_labels))
     u = torch.linspace(0, 1, steps + 1, device=noise.device, dtype=torch.float32)
@@ -101,14 +101,14 @@ def euler_sample(
     for current, following in pairwise(schedule):
         timestep = current.expand(2 * noise.shape[0])
         combined_image = torch.cat((x, x)).to(noise.dtype)
-        combined_cls = None
-        if cls_state is not None:
-            combined_cls = torch.cat((cls_state, cls_state)).to(cls_noise.dtype)
+        combined_reg = None
+        if reg_state is not None:
+            combined_reg = torch.cat((reg_state, reg_state)).to(reg_noise.dtype)
         output = model(
             combined_image,
             timestep,
             combined_labels,
-            noisy_cls=combined_cls,
+            noisy_reg=combined_reg,
             return_repa=False,
         )
         conditional_image, unconditional_image = output.image.float().chunk(2)
@@ -121,18 +121,18 @@ def euler_sample(
         denominator = (1 - current).clamp_min(0.05)
         x = x + (following - current) * (image_prediction - x) / denominator
 
-        if cls_state is not None:
-            if output.cls is None:
-                raise RuntimeError("REG sampling requires a model CLS prediction")
-            conditional_cls, unconditional_cls = output.cls.float().chunk(2)
-            cls_prediction = (
-                _guided(conditional_cls, unconditional_cls, guidance_scale)
+        if reg_state is not None:
+            if output.reg is None:
+                raise RuntimeError("REG sampling requires a model REG-token prediction")
+            conditional_reg, unconditional_reg = output.reg.float().chunk(2)
+            reg_prediction = (
+                _guided(conditional_reg, unconditional_reg, guidance_scale)
                 if use_cfg
-                else conditional_cls
+                else conditional_reg
             )
-            cls_state = cls_state + (following - current) * (
-                cls_prediction - cls_state
+            reg_state = reg_state + (following - current) * (
+                reg_prediction - reg_state
             ) / denominator
-    if cls_state is None:
+    if reg_state is None:
         return x
-    return EulerSample(x, cls_state)
+    return EulerSample(x, reg_state)

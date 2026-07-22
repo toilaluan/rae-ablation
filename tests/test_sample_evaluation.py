@@ -49,6 +49,8 @@ def _sample(
         model_variant="SiT-B/32",
         reg_enabled=False,
         reg_variant="disabled",
+        reg_token_mode="disabled",
+        reg_pool_size=4,
         checkpoint_hash=checkpoint_hash,
         parameters=parameters or SamplingParameters(batch_size=2, sampling_steps=3),
         generate_batch=generate,  # type: ignore[arg-type]
@@ -88,10 +90,12 @@ def test_sample_archive_is_atomic_balanced_resumable_and_records_jit_metadata(
     with zipfile.ZipFile(archive) as values:
         assert values.getinfo("arr_0.npy").compress_type == zipfile.ZIP_STORED
     manifest = json.loads((tmp_path / "samples.json").read_text())
-    assert manifest["complete"] and manifest["schema_version"] == 5
+    assert manifest["complete"] and manifest["schema_version"] == 6
     assert manifest["patch_size"] == 32 and manifest["jit_grid_size"] == 8
     assert manifest["model_variant"] == "SiT-B/32" and not manifest["reg_enabled"]
     assert manifest["reg_variant"] == "disabled"
+    assert manifest["reg_token_mode"] == "disabled"
+    assert manifest["reg_pool_size"] == 4
     assert manifest["sampling"]["cfg_interval"] == [0.0, 1.0]
     preview = np.asarray(Image.open(tmp_path / "preview.png"))
     assert preview[0, [0, 256, 512, 768], 0].tolist() == [0, 1, 2, 3]
@@ -117,6 +121,8 @@ def test_sampling_resume_rejects_reg_variant_mismatch(tmp_path: Path) -> None:
         "patch_size": 32,
         "model_variant": "SiT-B/32",
         "reg_enabled": True,
+        "reg_token_mode": "cls_spatial",
+        "reg_pool_size": 4,
         "checkpoint_hash": "abc",
         "parameters": SamplingParameters(batch_size=2, sampling_steps=3),
         "generate_batch": generate,
@@ -124,6 +130,15 @@ def test_sampling_resume_rejects_reg_variant_mismatch(tmp_path: Path) -> None:
     sample_to_archive(reg_variant="standard", **common)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="does not match"):
         sample_to_archive(reg_variant="wide_intermediate", **common)  # type: ignore[arg-type]
+
+    token_path = tmp_path / "token-mode"
+    token_common = {**common, "output_dir": token_path, "reg_token_mode": "cls"}
+    sample_to_archive(reg_variant="standard", **token_common)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="does not match"):
+        sample_to_archive(
+            reg_variant="standard",
+            **{**token_common, "reg_token_mode": "cls_spatial"},
+        )
 
 
 @pytest.mark.parametrize("compressed", [False, True])
@@ -195,7 +210,7 @@ def test_distribution_and_console_logger(tmp_path: Path, capsys: pytest.CaptureF
             "train/epoch": 1.5,
             "train/loss": 3.0,
             "train/image_velocity_loss": 2.0,
-            "train/cls_velocity_loss": 0.0,
+            "train/reg_velocity_loss": 0.0,
             "train/repa_loss": 0.0,
             "train/lr": 1e-4,
             "train/gradient_norm": 0.5,

@@ -11,6 +11,7 @@ from torch import nn
 from jit_reg.config import REGConfig
 from jit_reg.reg import (
     DINOv3FeatureExtractor,
+    pool_spatial_features,
     prepare_reg_targets,
     resize_spatial_features,
 )
@@ -62,16 +63,15 @@ def test_dinov3_preprocessing_freezing_and_register_removal(
 
 
 @pytest.mark.parametrize("target_grid", [16, 8, 4])
-def test_repa_targets_resize_to_any_jit_grid(target_grid: int) -> None:
+def test_cls_reg_and_repa_targets_resize_to_any_jit_grid(target_grid: int) -> None:
     spatial = torch.arange(256 * 8, dtype=torch.float32).reshape(1, 256, 8).add(1)
     cls = torch.arange(8, dtype=torch.float32).reshape(1, 8).add(1)
     targets = prepare_reg_targets(cls, spatial, target_grid)
-    assert torch.equal(targets.cls, cls)
-    assert targets.spatial.shape == (1, target_grid**2, 8)
-    assert targets.sequence.shape == (1, 1 + target_grid**2, 8)
-    torch.testing.assert_close(targets.spatial.norm(dim=-1), torch.ones(1, target_grid**2))
+    assert torch.equal(targets.reg_tokens, cls[:, None])
+    assert targets.repa.shape == (1, target_grid**2, 8)
+    torch.testing.assert_close(targets.repa.norm(dim=-1), torch.ones(1, target_grid**2))
     if target_grid == 16:
-        torch.testing.assert_close(targets.spatial, F.normalize(spatial, dim=-1))
+        torch.testing.assert_close(targets.repa, F.normalize(spatial, dim=-1))
     else:
         expected = F.interpolate(
             spatial.transpose(1, 2).reshape(1, 8, 16, 16),
@@ -80,9 +80,32 @@ def test_repa_targets_resize_to_any_jit_grid(target_grid: int) -> None:
             align_corners=False,
             antialias=True,
         ).flatten(2).transpose(1, 2)
-        torch.testing.assert_close(targets.spatial, F.normalize(expected, dim=-1))
+        torch.testing.assert_close(targets.repa, F.normalize(expected, dim=-1))
+
+
+def test_spatial_reg_targets_pool_to_four_by_four_and_layer_normalize() -> None:
+    spatial = torch.arange(256 * 8, dtype=torch.float32).reshape(1, 256, 8)
+    cls = torch.arange(8, dtype=torch.float32).reshape(1, 8)
+    pooled = pool_spatial_features(spatial, 4)
+    expected = F.adaptive_avg_pool2d(
+        spatial.transpose(1, 2).reshape(1, 8, 16, 16), (4, 4)
+    ).flatten(2).transpose(1, 2)
+    expected = F.layer_norm(expected, (8,))
+    torch.testing.assert_close(pooled, expected)
+    torch.testing.assert_close(pooled.mean(dim=-1), torch.zeros(1, 16), atol=1e-6, rtol=0)
+    torch.testing.assert_close(pooled.var(dim=-1, unbiased=False), torch.ones(1, 16))
+
+    targets = prepare_reg_targets(
+        cls, spatial, 8, token_mode="cls_spatial", pool_size=4
+    )
+    assert targets.reg_tokens.shape == (1, 17, 8)
+    torch.testing.assert_close(targets.reg_tokens[:, 0], cls)
+    torch.testing.assert_close(targets.reg_tokens[:, 1:], pooled)
+    assert targets.repa.shape == (1, 64, 8)
 
 
 def test_spatial_feature_order_requires_a_square_grid() -> None:
     with pytest.raises(ValueError, match="square"):
         resize_spatial_features(torch.randn(1, 12, 8), 2)
+    with pytest.raises(ValueError, match="square"):
+        pool_spatial_features(torch.randn(1, 12, 8), 2)

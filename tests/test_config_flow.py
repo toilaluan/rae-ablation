@@ -26,6 +26,8 @@ def test_structured_config_and_unknown_key() -> None:
     )
     assert isinstance(config, ExperimentConfig)
     assert config.model.patch_size == 32
+    assert config.model.reg.token_mode == "cls"
+    assert config.model.reg.pool_size == 4
     assert not config.model.reg.enabled
     with pytest.raises(ConfigKeyError):
         load_config("configs/canonical.yaml", ["model.typo=1"])
@@ -75,6 +77,18 @@ def test_wide_reg_configuration_modes_and_head_rejection() -> None:
         config.validate()
 
 
+def test_reg_token_mode_and_pool_size_rejection() -> None:
+    config = ExperimentConfig()
+    config.model.reg.token_mode = "unknown"
+    with pytest.raises(ValueError, match="token_mode"):
+        config.validate()
+    config.model.reg.token_mode = "cls_spatial"
+    for pool_size in (0, 17):
+        config.model.reg.pool_size = pool_size
+        with pytest.raises(ValueError, match=r"dimensions|pool_size"):
+            config.validate()
+
+
 def test_logit_normal_timesteps_are_bounded_and_deterministic() -> None:
     first = sample_timesteps(
         4, torch.Generator().manual_seed(7), "cpu", loc=-0.25, scale=1.5
@@ -102,46 +116,46 @@ def test_clean_prediction_has_zero_velocity_loss_across_clipping_interval(
 def test_reg_weighted_loss_composition() -> None:
     clean = torch.randn(2, 3, 2, 2)
     noise = torch.randn_like(clean)
-    cls = torch.randn(2, 8)
-    cls_noise = torch.randn_like(cls)
+    reg = torch.randn(2, 5, 8)
+    reg_noise = torch.randn_like(reg)
     target = torch.randn(2, 5, 8)
     losses = jit_losses(
         clean,
         noise,
         torch.tensor([0.3, 0.99]),
         clean,
-        clean_cls=cls,
-        cls_noise=cls_noise,
-        cls_prediction=cls,
+        clean_reg=reg,
+        reg_noise=reg_noise,
+        reg_prediction=reg,
         repa_prediction=target,
         repa_target=target,
     )
     assert losses.image_velocity.item() == pytest.approx(0)
-    assert losses.cls_velocity.item() == pytest.approx(0)
-    assert losses.cls_x0_mse.item() == pytest.approx(0)
-    assert losses.cls_x0_cosine.item() == pytest.approx(1)
+    assert losses.reg_velocity.item() == pytest.approx(0)
+    assert losses.reg_x0_mse.item() == pytest.approx(0)
+    assert losses.reg_x0_cosine.item() == pytest.approx(1)
     assert losses.repa.item() == pytest.approx(-1)
     assert losses.total.item() == pytest.approx(-0.5)
 
 
-def test_cls_x0_diagnostics_are_unweighted() -> None:
+def test_reg_x0_diagnostics_are_unweighted() -> None:
     clean = torch.zeros(1, 1, 1, 1)
     noise = torch.ones_like(clean)
-    clean_cls = torch.tensor([[1.0, 0.0]])
-    predicted_cls = torch.tensor([[0.0, 2.0]])
+    clean_reg = torch.tensor([[[1.0, 0.0]]])
+    predicted_reg = torch.tensor([[[0.0, 2.0]]])
     losses = jit_losses(
         clean,
         noise,
         torch.tensor([0.5]),
         clean,
-        clean_cls=clean_cls,
-        cls_noise=torch.zeros_like(clean_cls),
-        cls_prediction=predicted_cls,
-        cls_weight=0,
+        clean_reg=clean_reg,
+        reg_noise=torch.zeros_like(clean_reg),
+        reg_prediction=predicted_reg,
+        reg_weight=0,
     )
     assert losses.total.item() == pytest.approx(0)
-    assert losses.cls_x0_mse.item() == pytest.approx(2.5)
-    assert losses.cls_x0_cosine.item() == pytest.approx(0)
+    assert losses.reg_x0_mse.item() == pytest.approx(2.5)
+    assert losses.reg_x0_cosine.item() == pytest.approx(0)
 
 
 def test_label_dropout_uses_null_class_and_explicit_rng() -> None:
@@ -168,17 +182,17 @@ class _CFGModel(nn.Module):
         image: torch.Tensor,
         _timestep: torch.Tensor,
         labels: torch.Tensor,
-        noisy_cls: torch.Tensor | None = None,
+        noisy_reg: torch.Tensor | None = None,
         return_repa: bool = False,
     ) -> SiTOutput:
         del return_repa
         conditional = (labels < self.config.num_classes).to(image.dtype)
         image_value = (2 * conditional).view(-1, 1, 1, 1).expand_as(image)
-        cls = None
-        if noisy_cls is not None:
-            cls_value = 1 + 2 * conditional
-            cls = cls_value[:, None].expand_as(noisy_cls)
-        return SiTOutput(image_value, cls)
+        reg = None
+        if noisy_reg is not None:
+            reg_value = 1 + 2 * conditional
+            reg = reg_value[:, None, None].expand_as(noisy_reg)
+        return SiTOutput(image_value, reg)
 
 
 def test_euler_cfg_scale_interval_boundaries_and_joint_reg_state() -> None:
@@ -206,13 +220,13 @@ def test_euler_cfg_scale_interval_boundaries_and_joint_reg_state() -> None:
         model,
         noise,
         labels,
-        cls_noise=torch.zeros(1, 4),
+        reg_noise=torch.zeros(1, 2, 4),
         steps=1,
         guidance_scale=1,
     )
     assert isinstance(reg, EulerSample)
     assert torch.equal(reg.image, torch.full_like(noise, 2))
-    assert torch.equal(reg.cls, torch.full((1, 4), 3.0))
+    assert torch.equal(reg.reg, torch.full((1, 2, 4), 3.0))
 
 
 @pytest.mark.parametrize(

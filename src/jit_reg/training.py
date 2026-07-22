@@ -151,8 +151,8 @@ def train(
             )
 
             targets = None
-            cls_noise = None
-            noisy_cls = None
+            reg_noise = None
+            noisy_reg = None
             if reg_encoder is not None:
                 with torch.autocast(
                     device_type=device.type,
@@ -160,13 +160,13 @@ def train(
                     enabled=device.type == "cuda",
                 ):
                     targets = reg_encoder.targets(pixels, config.model.grid_size)
-                cls_noise = torch.randn(
-                    targets.cls.shape,
+                reg_noise = torch.randn(
+                    targets.reg_tokens.shape,
                     device=device,
                     dtype=torch.float32,
-                    generator=streams.cls_noise,
+                    generator=streams.reg_noise,
                 )
-                noisy_cls = noisy_interpolate(targets.cls, cls_noise, timesteps)
+                noisy_reg = noisy_interpolate(targets.reg_tokens, reg_noise, timesteps)
 
             update = (batch_index + 1) % accumulation == 0
             sync_context = (
@@ -184,7 +184,7 @@ def train(
                         noisy_image,
                         timesteps,
                         model_labels,
-                        noisy_cls=noisy_cls,
+                        noisy_reg=noisy_reg,
                         return_repa=targets is not None,
                     )
                 losses = jit_losses(
@@ -192,12 +192,12 @@ def train(
                     image_noise,
                     timesteps,
                     output.image,
-                    clean_cls=targets.cls if targets is not None else None,
-                    cls_noise=cls_noise,
-                    cls_prediction=output.cls,
+                    clean_reg=targets.reg_tokens if targets is not None else None,
+                    reg_noise=reg_noise,
+                    reg_prediction=output.reg,
                     repa_prediction=output.repa,
-                    repa_target=targets.sequence if targets is not None else None,
-                    cls_weight=config.model.reg.cls_loss_weight,
+                    repa_target=targets.repa if targets is not None else None,
+                    reg_weight=config.model.reg.cls_loss_weight,
                     repa_weight=config.model.reg.repa_loss_weight,
                 )
                 (losses.total / accumulation).backward()
@@ -226,9 +226,9 @@ def train(
                 {
                     "train/loss": losses.total.item(),
                     "train/image_velocity_loss": losses.image_velocity.item(),
-                    "train/cls_velocity_loss": losses.cls_velocity.item(),
-                    "train/cls_x0_mse": losses.cls_x0_mse.item(),
-                    "train/cls_x0_cosine": losses.cls_x0_cosine.item(),
+                    "train/reg_velocity_loss": losses.reg_velocity.item(),
+                    "train/reg_x0_mse": losses.reg_x0_mse.item(),
+                    "train/reg_x0_cosine": losses.reg_x0_cosine.item(),
                     "train/repa_loss": losses.repa.item(),
                     "train/lr": lr,
                     "train/lr_adamw": lr,
