@@ -40,13 +40,13 @@ compile:
 train:
   epochs: 80
   global_batch_size: 1024
-  micro_batch_size: 256
+  micro_batch_size: 512
   max_steps: null
   grad_clip: 1.0
   ema_decay: 0.9995
   seed: 0
-  timestep_loc: 0.0
-  timestep_scale: 1.0
+  timestep_loc: -0.8
+  timestep_scale: 0.8
   horizontal_flip_probability: 0.5
   optimizer:
     kind: muon
