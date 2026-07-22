@@ -30,7 +30,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path("configs/canonical.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
-    parser.add_argument("--reg", action="store_true", help="sample a REG-enabled checkpoint")
+    reg = parser.add_mutually_exclusive_group()
+    reg.add_argument(
+        "--reg", action="store_true", help="sample a standard REG-enabled checkpoint"
+    )
+    reg.add_argument(
+        "--reg-widehead",
+        action="store_true",
+        help="sample a wide-intermediate REG checkpoint",
+    )
     parser.add_argument("--num-samples", type=int, default=50_000)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--sampling-steps", type=int, default=50)
@@ -45,7 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     config = load_config(args.config, args.override)
-    config.model.reg.enabled = config.model.reg.enabled or args.reg
+    if args.reg:
+        config.model.reg.enabled = True
+        config.model.reg.cls_predictor = "standard"
+    elif args.reg_widehead:
+        config.model.reg.enabled = True
+        config.model.reg.cls_predictor = "wide_intermediate"
     config.validate()
     parameters = SamplingParameters(
         batch_size=args.batch_size,
@@ -118,6 +131,9 @@ def main() -> None:
         patch_size=config.model.patch_size,
         model_variant=config.model.model_variant,
         reg_enabled=config.model.reg.enabled,
+        reg_variant=config.model.reg.cls_predictor
+        if config.model.reg.enabled
+        else "disabled",
         checkpoint_hash=digest,
         parameters=parameters,
         generate_batch=generate_batch,

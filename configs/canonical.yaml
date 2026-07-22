@@ -24,6 +24,11 @@ model:
     register_tokens: 4
     repa_block: 4
     repa_hidden_size: 2048
+    cls_predictor: standard
+    cls_head_block: 4
+    cls_head_hidden_size: 2048
+    cls_head_depth: 2
+    cls_head_mlp_ratio: 4.0
     cls_loss_weight: 0.03
     repa_loss_weight: 0.5
 compile:

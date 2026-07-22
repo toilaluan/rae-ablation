@@ -59,6 +59,22 @@ def test_head_dimension_and_reg_block_rejection() -> None:
         config.validate()
 
 
+def test_wide_reg_configuration_modes_and_head_rejection() -> None:
+    config = ExperimentConfig()
+    config.model.reg.cls_predictor = "wide_intermediate"
+    with pytest.raises(ValueError, match="requires REG"):
+        config.validate()
+    config.model.reg.enabled = True
+    config.validate()
+    for block in (0, config.model.depth):
+        config.model.reg.cls_head_block = block
+        with pytest.raises(ValueError, match="cls_head_block"):
+            config.validate()
+    config.model.reg.cls_predictor = "unknown"
+    with pytest.raises(ValueError, match="cls_predictor"):
+        config.validate()
+
+
 def test_logit_normal_timesteps_are_bounded_and_deterministic() -> None:
     first = sample_timesteps(
         4, torch.Generator().manual_seed(7), "cpu", loc=-0.25, scale=1.5
@@ -102,8 +118,30 @@ def test_reg_weighted_loss_composition() -> None:
     )
     assert losses.image_velocity.item() == pytest.approx(0)
     assert losses.cls_velocity.item() == pytest.approx(0)
+    assert losses.cls_x0_mse.item() == pytest.approx(0)
+    assert losses.cls_x0_cosine.item() == pytest.approx(1)
     assert losses.repa.item() == pytest.approx(-1)
     assert losses.total.item() == pytest.approx(-0.5)
+
+
+def test_cls_x0_diagnostics_are_unweighted() -> None:
+    clean = torch.zeros(1, 1, 1, 1)
+    noise = torch.ones_like(clean)
+    clean_cls = torch.tensor([[1.0, 0.0]])
+    predicted_cls = torch.tensor([[0.0, 2.0]])
+    losses = jit_losses(
+        clean,
+        noise,
+        torch.tensor([0.5]),
+        clean,
+        clean_cls=clean_cls,
+        cls_noise=torch.zeros_like(clean_cls),
+        cls_prediction=predicted_cls,
+        cls_weight=0,
+    )
+    assert losses.total.item() == pytest.approx(0)
+    assert losses.cls_x0_mse.item() == pytest.approx(2.5)
+    assert losses.cls_x0_cosine.item() == pytest.approx(0)
 
 
 def test_label_dropout_uses_null_class_and_explicit_rng() -> None:

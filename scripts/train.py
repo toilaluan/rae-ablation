@@ -31,7 +31,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train pixel-space JiT on ImageNet-256")
     parser.add_argument("--config", type=Path, default=Path("configs/canonical.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
-    parser.add_argument("--reg", action="store_true", help="enable DINOv3 REG and REPA")
+    reg = parser.add_mutually_exclusive_group()
+    reg.add_argument(
+        "--reg", action="store_true", help="enable standard DINOv3 REG and REPA"
+    )
+    reg.add_argument(
+        "--reg-widehead",
+        action="store_true",
+        help="enable REG with the wide intermediate clean-CLS predictor",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--validation-interval", type=int)
@@ -54,7 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     config = load_config(args.config, args.override)
-    config.model.reg.enabled = config.model.reg.enabled or args.reg
+    if args.reg:
+        config.model.reg.enabled = True
+        config.model.reg.cls_predictor = "standard"
+    elif args.reg_widehead:
+        config.model.reg.enabled = True
+        config.model.reg.cls_predictor = "wide_intermediate"
     if args.output:
         config.checkpoint.directory = str(args.output / "checkpoints")
         config.validation.plan_path = str(args.output / "validation-plan.pt")
@@ -170,7 +183,9 @@ def main() -> None:
     )
     logger.event(
         f"training initialized: variant={config.model.model_variant}, "
-        f"reg={config.model.reg.enabled}, parameters="
+        f"reg={config.model.reg.enabled}, reg_variant="
+        f"{config.model.reg.cls_predictor if config.model.reg.enabled else 'disabled'}, "
+        "parameters="
         f"{logged_config['model_parameters']['total']:,}"
     )
     if args.resume:

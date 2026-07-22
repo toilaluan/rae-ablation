@@ -48,6 +48,7 @@ def _sample(
         patch_size=32,
         model_variant="SiT-B/32",
         reg_enabled=False,
+        reg_variant="disabled",
         checkpoint_hash=checkpoint_hash,
         parameters=parameters or SamplingParameters(batch_size=2, sampling_steps=3),
         generate_batch=generate,  # type: ignore[arg-type]
@@ -87,15 +88,42 @@ def test_sample_archive_is_atomic_balanced_resumable_and_records_jit_metadata(
     with zipfile.ZipFile(archive) as values:
         assert values.getinfo("arr_0.npy").compress_type == zipfile.ZIP_STORED
     manifest = json.loads((tmp_path / "samples.json").read_text())
-    assert manifest["complete"] and manifest["schema_version"] == 4
+    assert manifest["complete"] and manifest["schema_version"] == 5
     assert manifest["patch_size"] == 32 and manifest["jit_grid_size"] == 8
     assert manifest["model_variant"] == "SiT-B/32" and not manifest["reg_enabled"]
+    assert manifest["reg_variant"] == "disabled"
     assert manifest["sampling"]["cfg_interval"] == [0.0, 1.0]
     preview = np.asarray(Image.open(tmp_path / "preview.png"))
     assert preview[0, [0, 256, 512, 768], 0].tolist() == [0, 1, 2, 3]
     assert not list(tmp_path.glob(".samples-*.npy"))
     with pytest.raises(ValueError, match="does not match"):
         _sample(tmp_path, resumed, checkpoint_hash="different", parameters=parameters)
+
+
+def test_sampling_resume_rejects_reg_variant_mismatch(tmp_path: Path) -> None:
+    plan = create_validation_plan(4, 2, 2, seed=3)
+
+    def generate(
+        positions: torch.Tensor, _labels: torch.Tensor, _seeds: torch.Tensor
+    ) -> torch.Tensor:
+        return _generated(positions)
+
+    common = {
+        "output_dir": tmp_path,
+        "plan": plan,
+        "sample_count": 4,
+        "num_classes": 2,
+        "image_size": 256,
+        "patch_size": 32,
+        "model_variant": "SiT-B/32",
+        "reg_enabled": True,
+        "checkpoint_hash": "abc",
+        "parameters": SamplingParameters(batch_size=2, sampling_steps=3),
+        "generate_batch": generate,
+    }
+    sample_to_archive(reg_variant="standard", **common)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="does not match"):
+        sample_to_archive(reg_variant="wide_intermediate", **common)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("compressed", [False, True])

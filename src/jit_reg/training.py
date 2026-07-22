@@ -227,6 +227,8 @@ def train(
                     "train/loss": losses.total.item(),
                     "train/image_velocity_loss": losses.image_velocity.item(),
                     "train/cls_velocity_loss": losses.cls_velocity.item(),
+                    "train/cls_x0_mse": losses.cls_x0_mse.item(),
+                    "train/cls_x0_cosine": losses.cls_x0_cosine.item(),
                     "train/repa_loss": losses.repa.item(),
                     "train/lr": lr,
                     "train/lr_adamw": lr,

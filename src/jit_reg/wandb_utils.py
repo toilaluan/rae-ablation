@@ -57,6 +57,8 @@ class RunLogger:
             f"loss={metrics['train/loss']:.6f} "
             f"image={metrics['train/image_velocity_loss']:.6f} "
             f"cls={metrics['train/cls_velocity_loss']:.6f} "
+            f"cls_x0_mse={metrics.get('train/cls_x0_mse', 0.0):.6f} "
+            f"cls_x0_cos={metrics.get('train/cls_x0_cosine', 0.0):.4f} "
             f"repa={metrics['train/repa_loss']:.6f} "
             f"lr={metrics['train/lr']:.3e} "
             f"grad_norm={metrics['train/gradient_norm']:.4f} "

@@ -153,14 +153,16 @@ class _TinyTarget(nn.Module):
         return REGTargets(cls, spatial, torch.cat((cls[:, None], spatial), dim=1))
 
 
-@pytest.mark.parametrize("reg_enabled", [False, True])
-def test_one_step_pixel_training_smoke(tmp_path: Path, reg_enabled: bool) -> None:
+@pytest.mark.parametrize("reg_variant", ["disabled", "standard", "wide_intermediate"])
+def test_one_step_pixel_training_smoke(tmp_path: Path, reg_variant: str) -> None:
+    reg_enabled = reg_variant != "disabled"
+    wide = reg_variant == "wide_intermediate"
     config = ExperimentConfig()
     config.model = ModelConfig(
         image_size=16,
         patch_size=8,
         hidden_size=16,
-        depth=1,
+        depth=2 if wide else 1,
         num_heads=4,
         mlp_ratio=2,
         num_classes=2,
@@ -169,6 +171,11 @@ def test_one_step_pixel_training_smoke(tmp_path: Path, reg_enabled: bool) -> Non
             feature_dim=8,
             repa_block=1,
             repa_hidden_size=16,
+            cls_predictor=reg_variant if reg_enabled else "standard",
+            cls_head_block=1,
+            cls_head_hidden_size=32,
+            cls_head_depth=2,
+            cls_head_mlp_ratio=2,
         ),
     )
     config.train.optimizer.kind = "adamw"

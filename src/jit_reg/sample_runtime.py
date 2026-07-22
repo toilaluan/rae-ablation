@@ -128,12 +128,13 @@ def _manifest_base(
     patch_size: int,
     model_variant: str,
     reg_enabled: bool,
+    reg_variant: str,
     parameters: SamplingParameters,
 ) -> dict[str, Any]:
     counts = torch.bincount(labels, minlength=num_classes)
     ids_digest = hashlib.sha256(sample_ids.numpy().tobytes()).hexdigest()
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "checkpoint_sha256": checkpoint_hash,
         "validation_plan_hash": plan.plan_hash,
         "sample_ids_sha256": ids_digest,
@@ -142,6 +143,7 @@ def _manifest_base(
         "jit_grid_size": image_size // patch_size,
         "model_variant": model_variant,
         "reg_enabled": reg_enabled,
+        "reg_variant": reg_variant,
         "sample_count": sample_count,
         "num_classes": num_classes,
         "class_counts": counts.tolist(),
@@ -304,6 +306,7 @@ def sample_to_archive(
     patch_size: int,
     model_variant: str,
     reg_enabled: bool,
+    reg_variant: str,
     checkpoint_hash: str,
     parameters: SamplingParameters,
     generate_batch: GenerateBatch,
@@ -314,6 +317,11 @@ def sample_to_archive(
         raise ValueError("image size must be positive and divisible by patch size")
     if not model_variant:
         raise ValueError("model variant cannot be empty")
+    expected_reg_variants = {"disabled", "standard", "wide_intermediate"}
+    if reg_variant not in expected_reg_variants:
+        raise ValueError("REG variant must be disabled, standard, or wide_intermediate")
+    if reg_enabled != (reg_variant != "disabled"):
+        raise ValueError("REG enabled status and variant do not agree")
     labels, sample_ids, noise_seeds = validate_sampling_plan(plan, sample_count, num_classes)
     output_dir = Path(output_dir)
     paths = _paths(output_dir)
@@ -328,6 +336,7 @@ def sample_to_archive(
         patch_size=patch_size,
         model_variant=model_variant,
         reg_enabled=reg_enabled,
+        reg_variant=reg_variant,
         parameters=parameters,
     )
     rank, world_size = _distributed()

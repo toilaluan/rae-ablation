@@ -14,6 +14,8 @@ class JiTLoss(NamedTuple):
     image_velocity: Tensor
     cls_velocity: Tensor
     repa: Tensor
+    cls_x0_mse: Tensor
+    cls_x0_cosine: Tensor
 
 
 def sample_timesteps(
@@ -93,8 +95,14 @@ def jit_losses(
         cls_loss = clean_prediction_velocity_loss(
             clean_cls, cls_noise, timestep, cls_prediction
         )
+        cls_x0_mse = F.mse_loss(cls_prediction.float(), clean_cls.float())
+        cls_x0_cosine = F.cosine_similarity(
+            cls_prediction.float(), clean_cls.float(), dim=-1
+        ).mean()
     else:
         cls_loss = zero
+        cls_x0_mse = zero
+        cls_x0_cosine = zero
     if repa_prediction is None and repa_target is None:
         repa_loss = zero
     elif repa_prediction is None or repa_target is None:
@@ -102,7 +110,14 @@ def jit_losses(
     else:
         repa_loss = negative_cosine_repa_loss(repa_prediction, repa_target)
     total = image_loss + cls_weight * cls_loss + repa_weight * repa_loss
-    return JiTLoss(total, image_loss, cls_loss, repa_loss)
+    return JiTLoss(
+        total,
+        image_loss,
+        cls_loss,
+        repa_loss,
+        cls_x0_mse,
+        cls_x0_cosine,
+    )
 
 
 def shift_timestep(u: Tensor, alpha: float) -> Tensor:

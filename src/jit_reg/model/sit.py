@@ -163,6 +163,48 @@ class REPAProjection(nn.Module):
         return self.layers(x)
 
 
+class WideCLSResidualLayer(nn.Module):
+    """Conditioned, attention-free adaLN-Zero SwiGLU residual layer."""
+
+    def __init__(self, hidden_size: int, mlp_ratio: float) -> None:
+        super().__init__()
+        self.norm = nn.RMSNorm(hidden_size, eps=1e-6)
+        self.feed_forward = SwiGLU(hidden_size, mlp_ratio)
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
+
+    def forward(self, x: Tensor, conditioning: Tensor) -> Tensor:
+        scale, gate = self.modulation(conditioning).chunk(2, dim=-1)
+        normalized = self.norm(x) * (1 + scale.unsqueeze(1))
+        return x + gate.unsqueeze(1) * self.feed_forward(normalized)
+
+
+class WideCLSPredictor(nn.Module):
+    """Predict clean DINO CLS features from an intermediate hidden CLS token."""
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        output_size: int,
+        depth: int,
+        mlp_ratio: float,
+    ) -> None:
+        super().__init__()
+        self.token_projection = nn.Linear(input_size, hidden_size)
+        self.conditioning_projection = nn.Linear(input_size, hidden_size)
+        self.layers = nn.ModuleList(
+            [WideCLSResidualLayer(hidden_size, mlp_ratio) for _ in range(depth)]
+        )
+        self.output = FinalLayer(hidden_size, output_size)
+
+    def forward(self, x: Tensor, conditioning: Tensor) -> Tensor:
+        x = self.token_projection(x)
+        conditioning = self.conditioning_projection(conditioning)
+        for layer in self.layers:
+            x = layer(x, conditioning)
+        return self.output(x, conditioning)
+
+
 class SiT(nn.Module):
     """Pixel-space, class-conditional SiT with optional REG token entanglement."""
 
@@ -180,6 +222,13 @@ class SiT(nn.Module):
             raise ValueError("attention head dimension must be divisible by four")
         if config.reg.enabled and not 1 <= config.reg.repa_block <= config.depth:
             raise ValueError("REG REPA block must be within model depth")
+        if config.reg.cls_predictor not in {"standard", "wide_intermediate"}:
+            raise ValueError("unknown REG CLS predictor")
+        if config.reg.cls_predictor == "wide_intermediate":
+            if not config.reg.enabled:
+                raise ValueError("wide-intermediate CLS predictor requires REG")
+            if not 1 <= config.reg.cls_head_block < config.depth:
+                raise ValueError("wide-intermediate CLS head must be before the final block")
         self.config = config
         self.grid_size = config.image_size // config.patch_size
         self.patch_projection = nn.Conv2d(
@@ -206,9 +255,24 @@ class SiT(nn.Module):
             self.cls_input: nn.Linear | None = nn.Linear(
                 config.reg.feature_dim, config.hidden_size
             )
-            self.cls_final_layer: FinalLayer | None = FinalLayer(
-                config.hidden_size, config.reg.feature_dim
-            )
+            if config.reg.cls_predictor == "standard":
+                self.cls_final_layer: FinalLayer | None = FinalLayer(
+                    config.hidden_size, config.reg.feature_dim
+                )
+                self.cls_predictor: WideCLSPredictor | None = None
+                self.cls_clean_projection: nn.Linear | None = None
+            else:
+                self.cls_final_layer = None
+                self.cls_predictor = WideCLSPredictor(
+                    config.hidden_size,
+                    config.reg.cls_head_hidden_size,
+                    config.reg.feature_dim,
+                    config.reg.cls_head_depth,
+                    config.reg.cls_head_mlp_ratio,
+                )
+                self.cls_clean_projection = nn.Linear(
+                    config.reg.feature_dim, config.hidden_size
+                )
             self.repa_projection: REPAProjection | None = REPAProjection(
                 config.hidden_size,
                 config.reg.repa_hidden_size,
@@ -217,6 +281,8 @@ class SiT(nn.Module):
         else:
             self.cls_input = None
             self.cls_final_layer = None
+            self.cls_predictor = None
+            self.cls_clean_projection = None
             self.repa_projection = None
         self.gradient_checkpointing = config.gradient_checkpointing
         self._initialize_weights()
@@ -241,9 +307,15 @@ class SiT(nn.Module):
         for block in self.blocks:
             nn.init.zeros_(block.modulation[-1].weight)
             nn.init.zeros_(block.modulation[-1].bias)
+        if self.cls_predictor is not None:
+            for layer in self.cls_predictor.layers:
+                nn.init.zeros_(layer.modulation[-1].weight)
+                nn.init.zeros_(layer.modulation[-1].bias)
         final_layers = [self.final_layer]
         if self.cls_final_layer is not None:
             final_layers.append(self.cls_final_layer)
+        if self.cls_predictor is not None:
+            final_layers.append(self.cls_predictor.output)
         for layer in final_layers:
             nn.init.zeros_(layer.modulation[-1].weight)
             nn.init.zeros_(layer.modulation[-1].bias)
@@ -305,6 +377,7 @@ class SiT(nn.Module):
         elif noisy_cls is not None:
             raise ValueError("noisy_cls is only valid when model.reg.enabled is true")
 
+        cls: Tensor | None = None
         repa: Tensor | None = None
         for index, block in enumerate(self.blocks, start=1):
             if self._checkpointing():
@@ -332,11 +405,28 @@ class SiT(nn.Module):
                 and index == self.config.reg.repa_block
             ):
                 repa = self.repa_projection(sequence)
+            if (
+                self.cls_predictor is not None
+                and index == self.config.reg.cls_head_block
+            ):
+                if self._checkpointing():
+                    predicted = checkpoint(
+                        self.cls_predictor,
+                        sequence[:, :1],
+                        conditioning,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                else:
+                    predicted = self.cls_predictor(sequence[:, :1], conditioning)
+                cls = predicted.squeeze(1)
+                assert self.cls_clean_projection is not None
+                clean_cls = self.cls_clean_projection(cls).unsqueeze(1)
+                sequence = torch.cat((clean_cls, sequence[:, 1:]), dim=1)
 
         patch_tokens = sequence[:, patch_start:]
         image = self._unpatchify(self.final_layer(patch_tokens, conditioning))
-        cls: Tensor | None = None
-        if patch_start:
+        if patch_start and self.cls_predictor is None:
             assert self.cls_final_layer is not None
             cls = self.cls_final_layer(sequence[:, :1], conditioning).squeeze(1)
         return SiTOutput(image=image, cls=cls, repa=repa)

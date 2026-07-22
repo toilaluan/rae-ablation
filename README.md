@@ -5,10 +5,15 @@ clean-image objective. The canonical baseline is SiT-B/32: 256×256 images are p
 8×8 patch grid, processed by a 12-block adaLN-Zero transformer, and predicted directly back into
 pixels. Patch size is configurable whenever it divides the image size exactly.
 
-Optional REG adds one noisy DINOv3 CLS token and block-4 REPA alignment. The frozen
+Optional standard REG adds one noisy DINOv3 CLS token and block-4 REPA alignment. The frozen
 `vit_base_patch16_dinov3.lvd1689m` target is loaded only for REG training. Its four register tokens
 are discarded and its 16×16 spatial features are bicubically resized to the configured JiT grid.
 Sampling a REG checkpoint does not load DINOv3.
+
+The opt-in wide-intermediate REG ablation predicts clean CLS x₀ after block 4 with two
+conditioned, 2048-wide SwiGLU residual layers. The prediction is independently projected back to
+the SiT hidden size and replaces the hidden CLS token before blocks 5–12; REPA is computed from
+the original block-4 sequence first. Standard REG remains the default REG architecture.
 
 ## Environment
 
@@ -57,6 +62,17 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --wandb
 ```
 
+Wide-intermediate REG + REPA (matched ablation):
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/canonical.yaml \
+  --reg-widehead \
+  --output runs/reg-widehead-p32 \
+  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
+  --wandb
+```
+
 Change patch size with a structured override, for example
 `--override model.patch_size=16`. The canonical recipe is 80 epochs, global batch 1024, Muon,
 learning rate `2e-4` for 25 epochs followed by a 25-epoch linear decay to `2e-5`, EMA `0.9995`,
@@ -65,7 +81,7 @@ learning rate `2e-4` for 25 epochs followed by a 25-epoch linear decay to `2e-5`
 Images are randomly flipped on the training device through a checkpointed RNG stream. The same
 flipped `[0,1]` image is normalized for DINOv3 in REG runs and scaled to `[-1,1]` for JiT.
 
-Resume either variant with the same model overrides and `--reg` status:
+Resume standard REG with the same model overrides and REG variant:
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
@@ -73,6 +89,18 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --reg \
   --output runs/reg-p32 \
   --resume runs/reg-p32/checkpoints/last \
+  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
+  --validate-now --wandb
+```
+
+Resume the wide-intermediate variant with `--reg-widehead`:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/canonical.yaml \
+  --reg-widehead \
+  --output runs/reg-widehead-p32 \
+  --resume runs/reg-widehead-p32/checkpoints/last \
   --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
   --validate-now --wandb
 ```
@@ -93,6 +121,8 @@ v_pred   = (x_pred - x_t) / max(1-t, 0.05)
 
 The baseline minimizes image velocity MSE. REG adds `0.03 × CLS velocity MSE` and
 `0.5 × negative cosine REPA loss` over `[DINO CLS, resized DINO patches]`.
+Both REG variants also log unweighted `train/cls_x0_mse` and
+`train/cls_x0_cosine`; these diagnostics do not change the objective weights.
 
 Sampling uses 50-step Euler integration and batched conditional/null-label CFG. Scale `1` selects
 the conditional prediction. CFG defaults to the full trajectory and can be restricted with
@@ -112,11 +142,28 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
   --checkpoint runs/reg-p32/checkpoints/last/ema-export.safetensors \
   --plan runs/reg-p32/validation-plan.pt \
   --output-dir generated/reg-p32
+
+uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
+  --config configs/canonical.yaml \
+  --reg-widehead \
+  --checkpoint runs/reg-widehead-p32/checkpoints/last/ema-export.safetensors \
+  --plan runs/reg-widehead-p32/validation-plan.pt \
+  --output-dir generated/reg-widehead-p32
 ```
 
 Generation is rank-partitioned and resumable. It writes an ADM-compatible `samples.npz`, a
-preview, and a manifest containing image size, patch size, JiT grid, model variant, REG status,
-checkpoint hash, validation-plan hash, and sampler parameters.
+preview, and a manifest containing image size, patch size, JiT grid, model variant, REG status and
+variant, checkpoint hash, validation-plan hash, and sampler parameters. Resuming into an existing
+sampling directory rejects a standard/wide REG variant mismatch.
+
+## Matched wide-head experiment
+
+Use the standard and wide-intermediate commands above from scratch with the same data revision,
+seed, optimizer, loss weights, validation plan, and sampler settings. The canonical 80-epoch run
+performs periodic FID-5K and final FID-50K. Compare FID convergence and final FID alongside image
+and CLS velocity losses, CLS x₀ MSE/cosine, REPA loss, gradient norm, parameter count, throughput,
+and peak memory. Treat the ablation as successful only when matched final FID improves with stable
+training; otherwise keep standard REG as the default and record the wide head as a negative result.
 
 ## Validate, evaluate, and compare
 
@@ -166,4 +213,6 @@ uv run python scripts/train.py \
   --eval-sampling-steps 2
 ```
 
-Add `--reg --override model.reg.repa_block=2` to smoke-test REG with the two-block model.
+Add `--reg --override model.reg.repa_block=2` to smoke-test standard REG with the two-block model.
+For wide-intermediate REG, add `--reg-widehead`, set `model.reg.repa_block=1`, and set
+`model.reg.cls_head_block=1`; the intermediate head must run before the final block.

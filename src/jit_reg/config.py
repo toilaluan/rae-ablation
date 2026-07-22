@@ -14,6 +14,11 @@ class REGConfig:
     register_tokens: int = 4
     repa_block: int = 4
     repa_hidden_size: int = 2048
+    cls_predictor: str = "standard"
+    cls_head_block: int = 4
+    cls_head_hidden_size: int = 2048
+    cls_head_depth: int = 2
+    cls_head_mlp_ratio: float = 4.0
     cls_loss_weight: float = 0.03
     repa_loss_weight: float = 0.5
 
@@ -151,10 +156,27 @@ class ExperimentConfig:
             reg.register_tokens,
             reg.repa_block,
             reg.repa_hidden_size,
+            reg.cls_head_hidden_size,
+            reg.cls_head_depth,
         ) < 1:
             raise ValueError("model.reg dimensions must be positive")
+        if reg.cls_head_block < 1:
+            raise ValueError("model.reg.cls_head_block must be positive")
+        if reg.cls_head_mlp_ratio <= 0:
+            raise ValueError("model.reg.cls_head_mlp_ratio must be positive")
+        if reg.cls_predictor not in {"standard", "wide_intermediate"}:
+            raise ValueError(
+                "model.reg.cls_predictor must be standard or wide_intermediate"
+            )
         if reg.enabled and reg.repa_block > m.depth:
             raise ValueError("model.reg.repa_block must be within model.depth")
+        if reg.cls_predictor == "wide_intermediate":
+            if not reg.enabled:
+                raise ValueError("wide_intermediate CLS predictor requires REG")
+            if not 1 <= reg.cls_head_block < m.depth:
+                raise ValueError(
+                    "model.reg.cls_head_block must be at least 1 and before model.depth"
+                )
         if reg.cls_loss_weight < 0 or reg.repa_loss_weight < 0:
             raise ValueError("model.reg loss weights cannot be negative")
         if self.train.optimizer.kind not in {"adamw", "muon"}:

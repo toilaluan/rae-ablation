@@ -109,6 +109,9 @@ def validate_ema(
         patch_size=config.model.patch_size,
         model_variant=config.model.model_variant,
         reg_enabled=config.model.reg.enabled,
+        reg_variant=config.model.reg.cls_predictor
+        if config.model.reg.enabled
+        else "disabled",
         checkpoint_hash=digest,
         parameters=sampling,
         generate_batch=generate_batch,
