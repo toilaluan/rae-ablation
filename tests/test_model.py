@@ -4,6 +4,7 @@ import copy
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from jit_reg.config import CompileConfig, ModelConfig, REGConfig
@@ -107,7 +108,24 @@ def test_cls_reg_prepends_one_unrotated_token_and_projects_image_tokens() -> Non
     assert torch.count_nonzero(output.reg) == 0
 
 
-def test_reg_uses_explicit_dual_time_conditioning_without_new_state() -> None:
+def test_reg_without_repa_has_no_repa_state_or_output() -> None:
+    config = tiny_config(reg=True)
+    config.reg.repa_enabled = False
+    config.reg.repa_block = 99
+    model = SiT(config)
+    assert model.repa_projection is None
+    assert not any(key.startswith("repa_projection.") for key in model.state_dict())
+    output = model(
+        torch.randn(2, 3, 32, 32),
+        torch.rand(2),
+        torch.tensor([1, 2]),
+        noisy_reg=torch.randn(2, 1, 8),
+        return_repa=True,
+    )
+    assert output.repa is None
+
+
+def test_reg_uses_one_shared_time_conditioning() -> None:
     model = SiT(tiny_config(reg=True))
     original_keys = tuple(model.state_dict())
     seen: list[torch.Tensor] = []
@@ -121,51 +139,10 @@ def test_reg_uses_explicit_dual_time_conditioning_without_new_state() -> None:
         torch.tensor([0.1, 0.2]),
         torch.tensor([1, 2]),
         noisy_reg=torch.randn(2, 1, 8),
-        reg_timestep=torch.tensor([0.8, 0.9]),
     )
     hook.remove()
-    assert len(seen) == 2
-    assert not torch.equal(seen[0], seen[1])
+    assert len(seen) == 1
     assert tuple(model.state_dict()) == original_keys
-
-
-def test_equal_explicit_reg_time_matches_legacy_shared_conditioning() -> None:
-    legacy = SiT(tiny_config(reg=True))
-    with torch.no_grad():
-        hidden = legacy.config.hidden_size
-        for block in legacy.blocks:
-            block.modulation[-1].bias[2 * hidden : 3 * hidden].fill_(1)
-            block.modulation[-1].bias[5 * hidden : 6 * hidden].fill_(1)
-        assert legacy.cls_final_layer is not None
-        nn.init.normal_(legacy.final_layer.projection.weight)
-        nn.init.normal_(legacy.cls_final_layer.projection.weight)
-    explicit = copy.deepcopy(legacy)
-    image = torch.randn(2, 3, 32, 32)
-    timestep = torch.tensor([0.3, 0.7])
-    labels = torch.tensor([1, 2])
-    noisy_reg = torch.randn(2, 1, 8)
-    first = legacy(image, timestep, labels, noisy_reg=noisy_reg)
-    second = explicit(
-        image,
-        timestep,
-        labels,
-        noisy_reg=noisy_reg,
-        reg_timestep=timestep,
-    )
-    torch.testing.assert_close(first.image, second.image, rtol=0, atol=0)
-    assert first.reg is not None and second.reg is not None
-    torch.testing.assert_close(first.reg, second.reg, rtol=0, atol=0)
-
-
-def test_baseline_rejects_reg_timestep() -> None:
-    model = SiT(tiny_config())
-    with pytest.raises(ValueError, match="reg_timestep"):
-        model(
-            torch.randn(1, 3, 32, 32),
-            torch.rand(1),
-            torch.tensor([1]),
-            reg_timestep=torch.rand(1),
-        )
 
 
 def test_spatial_reg_adds_learned_positions_and_projects_only_image_tokens() -> None:
@@ -301,6 +278,185 @@ def test_wide_reg_image_and_reg_losses_backpropagate_through_clean_path() -> Non
     assert torch.count_nonzero(model.cls_predictor.output.projection.weight.grad) > 0
 
 
+def test_wide_reg_x0_conditioning_and_configurable_continuation_tokens() -> None:
+    config = tiny_config(
+        reg=True,
+        reg_variant="wide_intermediate",
+        token_mode="cls_spatial",
+    )
+    config.reg.x0_conditioning = True
+    config.reg.continuation_tokens = 3
+    model = SiT(config)
+    assert model.cls_clean_projection is None
+    assert model.reg_x0_conditioning_projection is not None
+    assert model.reg_continuation_projection is not None
+    seen: dict[str, torch.Tensor] = {}
+
+    def capture_latent(_module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        seen["latent"] = inputs[0].detach().clone()
+
+    def capture_next(_module: nn.Module, inputs: tuple[object, ...]) -> None:
+        assert isinstance(inputs[0], torch.Tensor)
+        assert isinstance(inputs[1], torch.Tensor)
+        seen["next_sequence"] = inputs[0].detach().clone()
+        seen["next_conditioning"] = inputs[1].detach().clone()
+
+    def capture_final(_module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        seen["final_conditioning"] = inputs[1].detach().clone()
+
+    latent_hook = model.reg_continuation_projection.register_forward_pre_hook(capture_latent)
+    next_hook = model.blocks[config.reg.cls_head_block].register_forward_pre_hook(capture_next)
+    final_hook = model.final_layer.register_forward_pre_hook(capture_final)
+    image = torch.randn(2, 3, 32, 32)
+    timestep = torch.tensor([0.2, 0.7])
+    labels = torch.tensor([1, 2])
+    output = model(
+        image,
+        timestep,
+        labels,
+        noisy_reg=torch.randn(2, model.num_reg_tokens, 8),
+    )
+    latent_hook.remove()
+    next_hook.remove()
+    final_hook.remove()
+
+    continuation = model.reg_continuation_projection(seen["latent"]).reshape(2, 3, 16)
+    torch.testing.assert_close(seen["next_sequence"][:, :3], continuation)
+    assert seen["next_sequence"].shape[1] == 3 + model.num_patches
+    assert output.reg is not None and output.reg.shape == (2, model.num_reg_tokens, 8)
+    base = model.timestep_embedding(timestep) + model.class_embedding(labels)
+    expected_conditioning = base + model.reg_x0_conditioning_projection(output.reg[:, 0])
+    torch.testing.assert_close(seen["next_conditioning"], expected_conditioning)
+    torch.testing.assert_close(seen["final_conditioning"], expected_conditioning)
+
+
+def test_wide_extension_paths_receive_image_gradients() -> None:
+    config = tiny_config(reg=True, reg_variant="wide_intermediate")
+    config.reg.x0_conditioning = True
+    config.reg.continuation_tokens = 2
+    model = SiT(config)
+    assert model.reg_x0_conditioning_projection is not None
+    assert model.reg_continuation_projection is not None
+    assert model.cls_predictor is not None
+    with torch.no_grad():
+        nn.init.normal_(model.final_layer.projection.weight)
+        nn.init.normal_(model.final_layer.modulation[-1].weight)
+        hidden = config.hidden_size
+        model.blocks[config.reg.cls_head_block].modulation[-1].bias[
+            2 * hidden : 3 * hidden
+        ].fill_(1)
+    output = model(
+        torch.randn(2, 3, 32, 32),
+        torch.rand(2),
+        torch.tensor([1, 2]),
+        noisy_reg=torch.randn(2, 1, 8),
+    )
+    output.image.square().mean().backward()
+    assert model.reg_x0_conditioning_projection.weight.grad is not None
+    assert model.reg_continuation_projection.weight.grad is not None
+    assert model.cls_predictor.output.projection.weight.grad is not None
+
+
+@pytest.mark.parametrize("source", ["x0_cls", "wide_cls"])
+def test_patch_reprojection_recovers_raw_xt_patches_at_wide_head(source: str) -> None:
+    config = tiny_config(reg=True, reg_variant="wide_intermediate")
+    config.reg.patch_reprojection.enabled = True
+    config.reg.patch_reprojection.source = source
+    config.reg.patch_reprojection.intermediate_size = 32
+    model = SiT(config)
+    assert model.reg_patch_reprojection is not None
+    assert model.reg_patch_reprojection.value_projection.in_features == 8 * 8 * 3
+    assert model.reg_patch_reprojection.value_projection.out_features == 32
+    assert model.reg_patch_reprojection.output_projection.out_features == 16
+    expected_source_size = 8 if source == "x0_cls" else 32
+    assert model.reg_patch_reprojection.source_projection.in_features == expected_source_size
+    seen: dict[str, torch.Tensor] = {}
+
+    def capture_head(
+        _module: nn.Module,
+        _inputs: tuple[object, ...],
+        output: torch.Tensor,
+    ) -> None:
+        seen["head_sequence"] = output.detach().clone()
+
+    def capture_reprojection_input(
+        _module: nn.Module,
+        inputs: tuple[torch.Tensor, ...],
+    ) -> None:
+        seen["raw_patches"] = inputs[0].detach().clone()
+        seen["source"] = inputs[1].detach().clone()
+        seen["time"] = inputs[2].detach().clone()
+
+    def capture_reprojection_output(
+        _module: nn.Module,
+        _inputs: tuple[torch.Tensor, ...],
+        output: torch.Tensor,
+    ) -> None:
+        seen["delta"] = output.detach().clone()
+
+    def capture_next(_module: nn.Module, inputs: tuple[object, ...]) -> None:
+        assert isinstance(inputs[0], torch.Tensor)
+        seen["next_sequence"] = inputs[0].detach().clone()
+
+    head_hook = model.blocks[config.reg.cls_head_block - 1].register_forward_hook(capture_head)
+    input_hook = model.reg_patch_reprojection.register_forward_pre_hook(
+        capture_reprojection_input
+    )
+    output_hook = model.reg_patch_reprojection.register_forward_hook(
+        capture_reprojection_output
+    )
+    next_hook = model.blocks[config.reg.cls_head_block].register_forward_pre_hook(capture_next)
+    image = torch.randn(2, 3, 32, 32)
+    timestep = torch.tensor([0.25, 0.75])
+    output = model(
+        image,
+        timestep,
+        torch.tensor([1, 2]),
+        noisy_reg=torch.randn(2, 1, 8),
+    )
+    head_hook.remove()
+    input_hook.remove()
+    output_hook.remove()
+    next_hook.remove()
+
+    expected_raw = F.unfold(image, kernel_size=8, stride=8).transpose(1, 2)
+    torch.testing.assert_close(seen["raw_patches"], expected_raw)
+    torch.testing.assert_close(seen["time"], model.timestep_embedding(timestep))
+    if source == "x0_cls":
+        assert output.reg is not None
+        torch.testing.assert_close(seen["source"], output.reg[:, 0])
+    else:
+        assert seen["source"].shape == (2, 32)
+    expected_image_tokens = seen["head_sequence"][:, 1:] + seen["delta"]
+    torch.testing.assert_close(seen["next_sequence"][:, 1:], expected_image_tokens)
+
+
+def test_patch_reprojection_receives_image_loss_gradients() -> None:
+    config = tiny_config(reg=True, reg_variant="wide_intermediate")
+    config.reg.patch_reprojection.enabled = True
+    config.reg.patch_reprojection.intermediate_size = 32
+    model = SiT(config)
+    assert model.reg_patch_reprojection is not None
+    assert model.cls_predictor is not None
+    with torch.no_grad():
+        nn.init.normal_(model.final_layer.projection.weight)
+        hidden = config.hidden_size
+        model.blocks[config.reg.cls_head_block].modulation[-1].bias[
+            2 * hidden : 3 * hidden
+        ].fill_(1)
+    output = model(
+        torch.randn(2, 3, 32, 32),
+        torch.rand(2),
+        torch.tensor([1, 2]),
+        noisy_reg=torch.randn(2, 1, 8),
+    )
+    output.image.square().mean().backward()
+    assert model.reg_patch_reprojection.value_projection.weight.grad is not None
+    assert model.reg_patch_reprojection.source_projection.weight.grad is not None
+    assert model.reg_patch_reprojection.output_projection.weight.grad is not None
+    assert model.cls_predictor.output.projection.weight.grad is not None
+
+
 def test_wide_swiglu_and_clean_projection_optimizer_policy() -> None:
     model = SiT(
         tiny_config(
@@ -397,7 +553,6 @@ def test_tiny_sit_regional_compile_has_clean_raw_keys(
         torch.rand(1),
         torch.tensor([1]),
         noisy_reg=torch.randn(1, model.num_reg_tokens, 8) if reg_variant is not None else None,
-        reg_timestep=torch.rand(1) if reg_variant is not None else None,
     )
     (output.image.sum() + (output.reg.sum() if output.reg is not None else 0)).backward()
     state = clean_state_dict(model)

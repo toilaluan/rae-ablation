@@ -14,6 +14,7 @@ from torch import nn
 from torch.utils.data import TensorDataset
 
 from jit_reg.checkpoint import EMA, CheckpointManager, should_checkpoint
+from jit_reg.checkpoint_bundle import load_checkpoint_bundle
 from jit_reg.config import (
     DataConfig,
     ExperimentConfig,
@@ -93,7 +94,8 @@ def test_validation_plan_noise_and_rng_stream_resume(tmp_path: Path) -> None:
     del legacy["reg_noise"]
     streams.load_state_dict(legacy)
     assert torch.equal(streams.reg_noise.get_state(), saved["reg_noise"])
-    assert torch.equal(streams.reg_timesteps.get_state(), saved["reg_timesteps"])
+    legacy["reg_timesteps"] = torch.Generator().manual_seed(99).get_state()
+    streams.load_state_dict(legacy)
     state = torch.random.get_rng_state()
     with preserve_global_rng():
         torch.randn(100)
@@ -114,6 +116,8 @@ def test_checkpoint_resume_retention_best_and_no_scheduler(tmp_path: Path) -> No
     ema = EMA(model)
     manager = CheckpointManager(tmp_path, keep_last_n=2)
     streams = RNGStreams.create(1)
+    plan = create_validation_plan(20, 10, 2, seed=9)
+    plan.save(tmp_path / "validation-plan.pt")
     kwargs = dict(
         global_step=1,
         model=model,
@@ -121,7 +125,8 @@ def test_checkpoint_resume_retention_best_and_no_scheduler(tmp_path: Path) -> No
         optimizer_state={"optimizers": []},
         rng_streams=streams.state_dict(),
         data_fingerprint="data",
-        validation_plan_hash="plan",
+        validation_plan_hash=plan.plan_hash,
+        validation_plan_path=tmp_path / "validation-plan.pt",
         last_completed_validation_epoch=None,
         wandb_run_id="run",
         resolved_config={"model": {"variant": "SiT-Tiny"}},
@@ -137,11 +142,87 @@ def test_checkpoint_resume_retention_best_and_no_scheduler(tmp_path: Path) -> No
     training = torch.load(tmp_path / "epoch-0003" / "training.pt", weights_only=False)
     assert "scheduler" not in training and "data_fingerprint" in training
     restored = _tiny_model()
-    resumed = manager.load(tmp_path / "epoch-0003", restored, EMA(restored), "data", "plan")
+    resumed = manager.load(
+        tmp_path / "epoch-0003", restored, EMA(restored), "data", plan.plan_hash
+    )
     assert resumed.epoch == 3 and resumed.wandb_run_id == "run"
     with pytest.raises(ValueError, match="fingerprint"):
-        manager.load(tmp_path / "epoch-0003", restored, EMA(restored), "other", "plan")
+        manager.load(
+            tmp_path / "epoch-0003", restored, EMA(restored), "other", plan.plan_hash
+        )
     assert json.loads((tmp_path / "epoch-0003" / "config.json").read_text())
+    assert (tmp_path / "epoch-0003" / "validation-plan.pt").is_file()
+    assert json.loads((tmp_path / "epoch-0003" / "metadata.json").read_text())
+
+
+def test_checkpoint_bundle_is_self_contained_and_supports_legacy_layout(tmp_path: Path) -> None:
+    model = _tiny_model()
+    config = ExperimentConfig()
+    config.model = model.config
+    config.validation.final_samples = 20
+    config.validation.periodic_samples = 10
+    config.validation.plan_path = "validation-plan.pt"
+    config.compile.enabled = False
+    config.validate()
+    plan = create_validation_plan(20, 10, 10, seed=config.train.seed + 7)
+    plan_path = tmp_path / "validation-plan.pt"
+    plan.save(plan_path)
+    manager = CheckpointManager(tmp_path / "checkpoints")
+    checkpoint = manager.save(
+        completed_epoch=1,
+        global_step=1,
+        model=model,
+        ema=EMA(model),
+        optimizer_state={"optimizers": []},
+        rng_streams=RNGStreams.create(1).state_dict(),
+        data_fingerprint="data",
+        validation_plan_hash=plan.plan_hash,
+        validation_plan_path=plan_path,
+        last_completed_validation_epoch=None,
+        wandb_run_id=None,
+        resolved_config=config.as_dict(),
+    )
+    bundle = load_checkpoint_bundle(tmp_path / "checkpoints")
+    assert bundle.directory == checkpoint.resolve()
+    assert bundle.weights.name == "ema.safetensors"
+    assert bundle.plan.plan_hash == plan.plan_hash
+
+    (checkpoint / "metadata.json").unlink()
+    (checkpoint / "validation-plan.pt").unlink()
+    saved_config = json.loads((checkpoint / "config.json").read_text())
+    saved_config["train"]["reg_relative_timestep_shift_min"] = 0.5
+    saved_config["train"]["reg_relative_timestep_shift_max"] = 8.0
+    (checkpoint / "config.json").write_text(json.dumps(saved_config))
+    legacy = load_checkpoint_bundle(checkpoint)
+    assert legacy.plan.plan_hash == plan.plan_hash
+
+
+def test_checkpoint_retention_protects_sampled_epochs(tmp_path: Path) -> None:
+    model = _tiny_model()
+    manager = CheckpointManager(tmp_path / "checkpoints", keep_last_n=1)
+    plan = create_validation_plan(20, 10, 10, seed=7)
+    plan_path = tmp_path / "plan.pt"
+    plan.save(plan_path)
+    kwargs = {
+        "global_step": 1,
+        "model": model,
+        "ema": EMA(model),
+        "optimizer_state": {"optimizers": []},
+        "rng_streams": RNGStreams.create(1).state_dict(),
+        "data_fingerprint": "data",
+        "validation_plan_hash": plan.plan_hash,
+        "validation_plan_path": plan_path,
+        "last_completed_validation_epoch": None,
+        "wandb_run_id": None,
+        "resolved_config": ExperimentConfig().as_dict(),
+    }
+    first = manager.save(completed_epoch=1, **kwargs)
+    (first / "samples-euler-test").mkdir()
+    manager.save(completed_epoch=2, **kwargs)
+    manager.save(completed_epoch=3, **kwargs)
+    assert first.is_dir()
+    assert not (manager.directory / "epoch-0002").exists()
+    assert (manager.directory / "epoch-0003").is_dir()
 
 
 class _TinyTarget(nn.Module):
@@ -159,16 +240,29 @@ class _TinyTarget(nn.Module):
         return REGTargets(reg_tokens, spatial)
 
 
+class _TinyCache:
+    fingerprint = "tiny-cache"
+
+    def lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(indices.numel(), 1, 8, dtype=torch.bfloat16)
+
+
 @pytest.mark.parametrize(
-    ("reg_variant", "token_mode"),
+    ("reg_variant", "token_mode", "cached"),
     [
-        ("disabled", "cls"),
-        ("standard", "cls"),
-        ("standard", "cls_spatial"),
-        ("wide_intermediate", "cls_spatial"),
+        ("disabled", "cls", False),
+        ("standard", "cls", False),
+        ("standard", "cls_spatial", False),
+        ("wide_intermediate", "cls_spatial", False),
+        ("standard", "cls", True),
     ],
 )
-def test_one_step_pixel_training_smoke(tmp_path: Path, reg_variant: str, token_mode: str) -> None:
+def test_one_step_pixel_training_smoke(
+    tmp_path: Path,
+    reg_variant: str,
+    token_mode: str,
+    cached: bool,
+) -> None:
     reg_enabled = reg_variant != "disabled"
     wide = reg_variant == "wide_intermediate"
     config = ExperimentConfig()
@@ -182,6 +276,7 @@ def test_one_step_pixel_training_smoke(tmp_path: Path, reg_variant: str, token_m
         num_classes=2,
         reg=REGConfig(
             enabled=reg_enabled,
+            repa_enabled=not cached,
             feature_dim=8,
             token_mode=token_mode,
             pool_size=2,
@@ -199,6 +294,8 @@ def test_one_step_pixel_training_smoke(tmp_path: Path, reg_variant: str, token_m
     config.train.global_batch_size = 2
     config.train.micro_batch_size = 2
     config.train.max_steps = 1
+    config.train.horizontal_flip_probability = 0 if cached else 0.5
+    config.reg_cache.enabled = cached
     config.data.workers = 0
     config.validation.interval = 0
     config.checkpoint.directory = str(tmp_path / "checkpoints")
@@ -207,6 +304,8 @@ def test_one_step_pixel_training_smoke(tmp_path: Path, reg_variant: str, token_m
     streams = RNGStreams.create(3)
     loader, sampler = make_train_loader(dataset, config, streams)
     model = SiT(config.model)
+    plan = create_validation_plan(4, 2, 2, seed=5)
+    plan.save(tmp_path / "plan.pt")
     state = train(
         canonical_model=model,
         execution_model=model,
@@ -218,9 +317,13 @@ def test_one_step_pixel_training_smoke(tmp_path: Path, reg_variant: str, token_m
         config=config,
         checkpoint_manager=CheckpointManager(config.checkpoint.directory),
         data_fingerprint="data",
-        validation_plan_hash="plan",
+        validation_plan_hash=plan.plan_hash,
+        validation_plan_path=tmp_path / "plan.pt",
         logger=RunLogger(WandbConfig(), {}, True, log_interval=1),
-        reg_encoder=_TinyTarget(token_mode) if reg_enabled else None,  # type: ignore[arg-type]
+        reg_encoder=(
+            _TinyTarget(token_mode) if reg_enabled and not cached else None
+        ),  # type: ignore[arg-type]
+        reg_cache=_TinyCache() if cached else None,  # type: ignore[arg-type]
     )
     assert state.global_step == 1
     assert (tmp_path / "checkpoints" / "epoch-0001" / "training.pt").is_file()

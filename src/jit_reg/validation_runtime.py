@@ -89,7 +89,6 @@ def validate_ema(
                 steps=sampling.sampling_steps,
                 guidance_scale=sampling.guidance_scale,
                 timestep_shift=sampling.timestep_shift,
-                reg_timestep_shift=sampling.reg_timestep_shift,
                 cfg_interval=(sampling.cfg_start, sampling.cfg_end),
                 num_classes=config.model.num_classes,
             )
@@ -109,8 +108,27 @@ def validate_ema(
         model_variant=config.model.model_variant,
         reg_enabled=config.model.reg.enabled,
         reg_variant=config.model.reg.cls_predictor if config.model.reg.enabled else "disabled",
+        repa_enabled=config.model.reg.enabled and config.model.reg.repa_enabled,
         reg_token_mode=config.model.reg.token_mode if config.model.reg.enabled else "disabled",
         reg_pool_size=config.model.reg.pool_size,
+        reg_x0_conditioning=(
+            config.model.reg.x0_conditioning if config.model.reg.enabled else False
+        ),
+        reg_continuation_tokens=(
+            config.model.reg.continuation_tokens if config.model.reg.enabled else None
+        ),
+        reg_patch_reprojection_enabled=(
+            config.model.reg.patch_reprojection.enabled
+            if config.model.reg.enabled
+            else False
+        ),
+        reg_patch_reprojection_source=config.model.reg.patch_reprojection.source,
+        reg_patch_reprojection_intermediate_size=(
+            config.model.reg.patch_reprojection.intermediate_size
+        ),
+        reg_patch_reprojection_include_timestep=(
+            config.model.reg.patch_reprojection.include_timestep
+        ),
         checkpoint_hash=digest,
         parameters=sampling,
         generate_batch=generate_batch,

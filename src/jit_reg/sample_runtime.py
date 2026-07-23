@@ -29,17 +29,12 @@ class SamplingParameters:
     cfg_start: float = 0.0
     cfg_end: float = 1.0
     log_interval: int = 10
-    reg_timestep_shift: float | None = None
 
     def validate(self) -> None:
         if self.batch_size < 1 or self.sampling_steps < 1 or self.log_interval < 1:
             raise ValueError("sampling batch size, steps, and log interval must be positive")
         if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
             raise ValueError("timestep shift must be finite and positive")
-        if self.reg_timestep_shift is not None and (
-            not math.isfinite(self.reg_timestep_shift) or self.reg_timestep_shift <= 0
-        ):
-            raise ValueError("REG timestep shift must be finite and positive")
         if not math.isfinite(self.guidance_scale):
             raise ValueError("guidance scale must be finite")
         if not 0 <= self.cfg_start <= self.cfg_end <= 1:
@@ -47,6 +42,22 @@ class SamplingParameters:
 
 
 GenerateBatch = Callable[[Tensor, Tensor, Tensor], Tensor]
+
+
+def _float_slug(value: float) -> str:
+    return repr(float(value)).replace("-", "m").replace("+", "").replace(".", "p")
+
+
+def sampling_output_name(sample_count: int, parameters: SamplingParameters) -> str:
+    parameters.validate()
+    if sample_count < 1:
+        raise ValueError("sample count must be positive")
+    return (
+        f"samples-euler-n{sample_count}-steps{parameters.sampling_steps}"
+        f"-cfg{_float_slug(parameters.guidance_scale)}"
+        f"-shift{_float_slug(parameters.timestep_shift)}"
+        f"-window{_float_slug(parameters.cfg_start)}-{_float_slug(parameters.cfg_end)}"
+    )
 
 
 def checkpoint_sha256(path: str | Path) -> str:
@@ -134,14 +145,21 @@ def _manifest_base(
     model_variant: str,
     reg_enabled: bool,
     reg_variant: str,
+    repa_enabled: bool,
     reg_token_mode: str,
     reg_pool_size: int,
+    reg_x0_conditioning: bool,
+    reg_continuation_tokens: int | None,
+    reg_patch_reprojection_enabled: bool,
+    reg_patch_reprojection_source: str,
+    reg_patch_reprojection_intermediate_size: int,
+    reg_patch_reprojection_include_timestep: bool,
     parameters: SamplingParameters,
 ) -> dict[str, Any]:
     counts = torch.bincount(labels, minlength=num_classes)
     ids_digest = hashlib.sha256(sample_ids.numpy().tobytes()).hexdigest()
     return {
-        "schema_version": 7,
+        "schema_version": 8,
         "checkpoint_sha256": checkpoint_hash,
         "validation_plan_hash": plan.plan_hash,
         "sample_ids_sha256": ids_digest,
@@ -151,8 +169,29 @@ def _manifest_base(
         "model_variant": model_variant,
         "reg_enabled": reg_enabled,
         "reg_variant": reg_variant,
+        "repa_enabled": repa_enabled,
         "reg_token_mode": reg_token_mode,
         "reg_pool_size": reg_pool_size,
+        "reg_x0_conditioning": reg_x0_conditioning,
+        "reg_continuation_tokens": reg_continuation_tokens,
+        "reg_patch_reprojection": {
+            "enabled": reg_patch_reprojection_enabled,
+            "source": (
+                reg_patch_reprojection_source
+                if reg_patch_reprojection_enabled
+                else None
+            ),
+            "intermediate_size": (
+                reg_patch_reprojection_intermediate_size
+                if reg_patch_reprojection_enabled
+                else None
+            ),
+            "include_timestep": (
+                reg_patch_reprojection_include_timestep
+                if reg_patch_reprojection_enabled
+                else None
+            ),
+        },
         "sample_count": sample_count,
         "num_classes": num_classes,
         "class_counts": counts.tolist(),
@@ -162,13 +201,6 @@ def _manifest_base(
             "sampling_steps": parameters.sampling_steps,
             "guidance_scale": parameters.guidance_scale,
             "timestep_shift": parameters.timestep_shift,
-            "reg_timestep_shift": (
-                parameters.reg_timestep_shift
-                if reg_enabled and parameters.reg_timestep_shift is not None
-                else parameters.timestep_shift
-                if reg_enabled
-                else None
-            ),
             "cfg_interval": [parameters.cfg_start, parameters.cfg_end],
         },
     }
@@ -322,8 +354,15 @@ def sample_to_archive(
     model_variant: str,
     reg_enabled: bool,
     reg_variant: str,
+    repa_enabled: bool,
     reg_token_mode: str,
     reg_pool_size: int,
+    reg_x0_conditioning: bool,
+    reg_continuation_tokens: int | None,
+    reg_patch_reprojection_enabled: bool,
+    reg_patch_reprojection_source: str,
+    reg_patch_reprojection_intermediate_size: int,
+    reg_patch_reprojection_include_timestep: bool,
     checkpoint_hash: str,
     parameters: SamplingParameters,
     generate_batch: GenerateBatch,
@@ -339,13 +378,25 @@ def sample_to_archive(
         raise ValueError("REG variant must be disabled, standard, or wide_intermediate")
     if reg_enabled != (reg_variant != "disabled"):
         raise ValueError("REG enabled status and variant do not agree")
-    if not reg_enabled and parameters.reg_timestep_shift is not None:
-        raise ValueError("REG timestep shift requires REG sampling")
     expected_token_modes = {"disabled", "cls", "cls_spatial"}
     if reg_token_mode not in expected_token_modes:
         raise ValueError("REG token mode must be disabled, cls, or cls_spatial")
     if reg_enabled != (reg_token_mode != "disabled"):
         raise ValueError("REG enabled status and token mode do not agree")
+    if repa_enabled and not reg_enabled:
+        raise ValueError("REPA cannot be enabled without REG")
+    if reg_x0_conditioning and reg_variant != "wide_intermediate":
+        raise ValueError("REG x0 conditioning requires wide_intermediate")
+    if reg_continuation_tokens is not None and (
+        reg_variant != "wide_intermediate" or reg_continuation_tokens < 1
+    ):
+        raise ValueError("REG continuation tokens require wide_intermediate and a positive count")
+    if reg_patch_reprojection_enabled and reg_variant != "wide_intermediate":
+        raise ValueError("REG patch reprojection requires wide_intermediate")
+    if reg_patch_reprojection_source not in {"x0_cls", "wide_cls"}:
+        raise ValueError("unknown REG patch-reprojection source")
+    if reg_patch_reprojection_intermediate_size < 1:
+        raise ValueError("REG patch-reprojection intermediate size must be positive")
     if not 1 <= reg_pool_size <= 16:
         raise ValueError("REG pool size must be within the native 16x16 feature grid")
     labels, sample_ids, noise_seeds = validate_sampling_plan(plan, sample_count, num_classes)
@@ -363,8 +414,19 @@ def sample_to_archive(
         model_variant=model_variant,
         reg_enabled=reg_enabled,
         reg_variant=reg_variant,
+        repa_enabled=repa_enabled,
         reg_token_mode=reg_token_mode,
         reg_pool_size=reg_pool_size,
+        reg_x0_conditioning=reg_x0_conditioning,
+        reg_continuation_tokens=reg_continuation_tokens,
+        reg_patch_reprojection_enabled=reg_patch_reprojection_enabled,
+        reg_patch_reprojection_source=reg_patch_reprojection_source,
+        reg_patch_reprojection_intermediate_size=(
+            reg_patch_reprojection_intermediate_size
+        ),
+        reg_patch_reprojection_include_timestep=(
+            reg_patch_reprojection_include_timestep
+        ),
         parameters=parameters,
     )
     rank, world_size = _distributed()
@@ -383,17 +445,11 @@ def sample_to_archive(
         raise RuntimeError(state[2])
     if rank == 0:
         status = "complete" if state[0] else "resuming" if state[1] else "new"
-        resolved_reg_shift = (
-            parameters.reg_timestep_shift
-            if parameters.reg_timestep_shift is not None
-            else parameters.timestep_shift
-        )
         print(
             f"sampling configuration: samples={sample_count} classes={num_classes} "
             f"batch_size={parameters.batch_size} steps={parameters.sampling_steps} "
             f"guidance={parameters.guidance_scale:g} "
-            f"image_shift={parameters.timestep_shift:g} "
-            f"reg_shift={resolved_reg_shift:g}"
+            f"timestep_shift={parameters.timestep_shift:g}"
         )
         print(f"sampling state: {status}, completed={state[1]}/{sample_count}")
     if state[0]:

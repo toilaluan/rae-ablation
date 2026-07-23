@@ -19,6 +19,7 @@ model:
   variant: SiT-B
   reg:
     enabled: false
+    repa_enabled: true
     model_name: vit_base_patch16_dinov3.lvd1689m
     feature_dim: 768
     register_tokens: 4
@@ -31,8 +32,18 @@ model:
     cls_head_hidden_size: 2048
     cls_head_depth: 2
     cls_head_mlp_ratio: 4.0
+    x0_conditioning: false
+    continuation_tokens: null
+    patch_reprojection:
+      enabled: false
+      source: x0_cls
+      intermediate_size: 2048
+      include_timestep: true
     cls_loss_weight: 0.03
     repa_loss_weight: 0.5
+reg_cache:
+  enabled: false
+  directory: data/reg-tokens
 compile:
   enabled: true
   backend: inductor
@@ -49,8 +60,6 @@ train:
   seed: 0
   timestep_loc: -0.8
   timestep_scale: 0.8
-  reg_relative_timestep_shift_min: 0.5
-  reg_relative_timestep_shift_max: 8.0
   horizontal_flip_probability: 0.5
   optimizer:
     kind: muon

@@ -17,6 +17,7 @@ from jit_reg.model.compile import compile_model_regions
 from jit_reg.model.sit import SiT
 from jit_reg.optim import build_optimizer
 from jit_reg.reg import DINOv3FeatureExtractor
+from jit_reg.reg_cache import REGTokenCache
 from jit_reg.rng import RNGStreams
 from jit_reg.sample_runtime import SamplingParameters
 from jit_reg.training import TrainState, make_train_loader, train
@@ -38,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="enable REG with the wide intermediate clean-token predictor",
     )
+    parser.add_argument("--no-repa", action="store_true", help="disable REPA for a REG run")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--validation-interval", type=int)
@@ -51,7 +53,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-sampling-steps", type=int, default=50)
     parser.add_argument("--eval-guidance-scale", type=float, default=1.78)
     parser.add_argument("--eval-timestep-shift", type=float, default=1.0)
-    parser.add_argument("--eval-reg-timestep-shift", type=float)
     parser.add_argument("--eval-cfg-start", type=float, default=0.0)
     parser.add_argument("--eval-cfg-end", type=float, default=1.0)
     parser.add_argument("--eval-log-interval", type=int, default=10)
@@ -59,14 +60,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
-    config = load_config(args.config, args.override)
+    parser = build_parser()
+    args = parser.parse_args()
+    overrides = list(args.override)
     if args.reg:
-        config.model.reg.enabled = True
-        config.model.reg.cls_predictor = "standard"
+        overrides.extend(
+            ["model.reg.enabled=true", "model.reg.cls_predictor=standard"]
+        )
     elif args.reg_widehead:
-        config.model.reg.enabled = True
-        config.model.reg.cls_predictor = "wide_intermediate"
+        overrides.extend(
+            ["model.reg.enabled=true", "model.reg.cls_predictor=wide_intermediate"]
+        )
+    if args.no_repa:
+        overrides.append("model.reg.repa_enabled=false")
+    config = load_config(args.config, overrides)
+    if args.no_repa and not config.model.reg.enabled:
+        parser.error("--no-repa requires REG")
     if args.output:
         config.checkpoint.directory = str(args.output / "checkpoints")
         config.validation.plan_path = str(args.output / "validation-plan.pt")
@@ -84,7 +93,6 @@ def main() -> None:
         sampling_steps=args.eval_sampling_steps,
         guidance_scale=args.eval_guidance_scale,
         timestep_shift=args.eval_timestep_shift,
-        reg_timestep_shift=args.eval_reg_timestep_shift,
         cfg_start=args.eval_cfg_start,
         cfg_end=args.eval_cfg_end,
         log_interval=args.eval_log_interval,
@@ -101,6 +109,12 @@ def main() -> None:
         torch.manual_seed(streams.initialization.initial_seed())
         model = SiT(config.model).to(device)
     dataset = load_imagenet(config.data, config.model.image_size)
+    cache_active = (
+        config.reg_cache.enabled
+        and config.model.reg.enabled
+        and not config.model.reg.repa_enabled
+    )
+    reg_cache = REGTokenCache(config, len(dataset)) if cache_active else None
     fingerprint = data_fingerprint(config.data, config.model.image_size)
     plan_path = Path(config.validation.plan_path)
     if rank == 0 and not plan_path.exists():
@@ -120,7 +134,14 @@ def main() -> None:
     state = TrainState()
     resume_run_id: str | None = None
     if args.resume:
-        resumed = manager.load(args.resume.resolve(), model, ema, fingerprint, plan.plan_hash)
+        resumed = manager.load(
+            args.resume.resolve(),
+            model,
+            ema,
+            fingerprint,
+            plan.plan_hash,
+            reg_cache.fingerprint if reg_cache is not None else None,
+        )
         optimizer.load_state_dict(resumed.optimizer)
         streams.load_state_dict(resumed.rng_streams)
         state = TrainState(
@@ -136,9 +157,9 @@ def main() -> None:
             execution_model,
             device_ids=[device.index] if device.type == "cuda" else None,
         )
-    reg_encoder = (
-        torch.compile(DINOv3FeatureExtractor(config.model.reg)).to(device).bfloat16() if config.model.reg.enabled else None
-    )
+    reg_encoder = None
+    if config.model.reg.enabled and reg_cache is None:
+        reg_encoder = torch.compile(DINOv3FeatureExtractor(config.model.reg)).to(device).bfloat16()
     loader, sampler = make_train_loader(dataset, config, streams)
     logged_config = config.as_dict()
     logged_config["online_validation"] = {
@@ -147,7 +168,6 @@ def main() -> None:
         "sampling_steps": sampling.sampling_steps,
         "guidance_scale": sampling.guidance_scale,
         "timestep_shift": sampling.timestep_shift,
-        "reg_timestep_shift": sampling.reg_timestep_shift,
         "cfg_interval": [sampling.cfg_start, sampling.cfg_end],
         "log_interval": sampling.log_interval,
     }
@@ -156,6 +176,7 @@ def main() -> None:
         "data_fingerprint": fingerprint,
         "validation_plan_hash": plan.plan_hash,
         "reg_target": config.model.reg.model_name if config.model.reg.enabled else None,
+        "reg_cache_fingerprint": reg_cache.fingerprint if reg_cache is not None else None,
     }
     logged_config["model_parameters"] = {
         "total": sum(parameter.numel() for parameter in model.parameters()),
@@ -222,8 +243,10 @@ def main() -> None:
             checkpoint_manager=manager,
             data_fingerprint=fingerprint,
             validation_plan_hash=plan.plan_hash,
+            validation_plan_path=plan_path,
             logger=logger,
             reg_encoder=reg_encoder,
+            reg_cache=reg_cache,
             state=state,
             validation_callback=validate_callback,
         )

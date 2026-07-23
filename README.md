@@ -5,7 +5,8 @@ clean-image objective. The canonical baseline is SiT-B/32: 256×256 images are p
 8×8 patch grid, processed by a 12-block adaLN-Zero transformer, and predicted directly back into
 pixels. Patch size is configurable whenever it divides the image size exactly.
 
-Optional standard REG adds a jointly diffused DINOv3 feature state and block-4 REPA alignment.
+Optional standard REG adds a jointly diffused DINOv3 feature state and optional block-4 REPA
+alignment.
 The default `model.reg.token_mode=cls` state contains one CLS token. The opt-in `cls_spatial` mode
 also adaptively pools the normalized 16×16 patch map to a configurable grid (4×4 by default),
 applies parameter-free LayerNorm to each pooled token, and gives those tokens learned absolute
@@ -14,9 +15,12 @@ training and its four register tokens are discarded. REPA aligns only SiT image-
 DINO patch features resized to the JiT grid. Sampling a REG checkpoint does not load DINOv3.
 
 The opt-in wide-intermediate REG ablation predicts the complete clean REG state x₀ after block 4
-with two conditioned, 2048-wide SwiGLU residual layers. The prediction is independently projected
-back to the SiT hidden size and replaces the hidden REG prefix before blocks 5–12; spatial
-positions are reapplied on reinjection. Standard REG remains the default REG architecture.
+with two conditioned, 2048-wide SwiGLU residual layers. By default, the prediction is projected
+back to the SiT hidden size and replaces the hidden REG prefix before blocks 5–12. Two additional
+ablations can project predicted CLS x₀ into downstream conditioning and project the final wide CLS
+latent into a configurable number of continuation REG tokens. A third optional branch uses
+predicted x₀ or the wide CLS latent to gate a fresh projection of the raw noisy 32×32×3 patches
+back into the image-token stream. Standard REG remains the default.
 
 ## Environment
 
@@ -65,6 +69,17 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --wandb
 ```
 
+REG without REPA:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/canonical.yaml \
+  --reg --no-repa \
+  --output runs/reg-no-repa-p32 \
+  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
+  --wandb
+```
+
 REG with CLS plus a pooled 4×4 spatial feature map:
 
 ```bash
@@ -89,21 +104,79 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --wandb
 ```
 
+Enable the two independent wide-head extensions with structured overrides:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/canonical.yaml \
+  --reg-widehead --no-repa \
+  --override model.reg.x0_conditioning=true \
+  --override model.reg.continuation_tokens=4 \
+  --output runs/reg-wide-extended-p32 \
+  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
+  --wandb
+```
+
+Enable conditional raw-patch reprojection with its default 2048-dimensional interaction:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/canonical.yaml \
+  --reg-widehead --no-repa \
+  --override model.reg.patch_reprojection.enabled=true \
+  --override model.reg.patch_reprojection.source=x0_cls \
+  --output runs/reg-patch-reprojection-p32 \
+  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
+  --wandb
+```
+
+At the intermediate REG head, this branch patchifies the original noisy image again, projects each
+raw patch into `model.reg.patch_reprojection.intermediate_size`, gates it with either predicted CLS
+x₀ or the final wide CLS latent (plus timestep conditioning by default), projects it to the SiT
+hidden size, and adds it to the existing image tokens with a learned residual scale initialized to
+`1e-3`. Set `source=wide_cls` to test the less constrained latent source.
+
 Change patch size with a structured override, for example
 `--override model.patch_size=16`. The canonical recipe is 80 epochs, global batch 1024, Muon,
 learning rate `2e-4` for 25 epochs followed by a 25-epoch linear decay to `2e-5`, EMA `0.9995`,
 10% classifier-free label dropout, and logit-normal image timesteps with location `-0.8` and
 scale `0.8`.
 
-REG training uses an explicit second timestep. Each example draws a log-uniform relative REG
-shift from `train.reg_relative_timestep_shift_min=0.5` through
-`train.reg_relative_timestep_shift_max=8.0`, then applies that shift to the sampled image
-timestep. The transformer shares timestep and modulation weights between modalities but evaluates
-them separately, so REG and patch tokens receive their own adaLN conditioning. Set both bounds to
-`1.0` to reproduce equal-time REG training.
+REG and image states use the same sampled timestep for interpolation, velocity losses, transformer
+conditioning, validation, and sampling.
 
 Images are randomly flipped on the training device through a checkpointed RNG stream. The same
 flipped `[0,1]` image is normalized for DINOv3 in REG runs and scaled to `[-1,1]` for JiT.
+
+## Cache REG targets
+
+REPA-disabled runs can read precomputed REG targets and avoid loading DINOv3 during training. The
+cache stores BF16 CLS tokens for `token_mode=cls`, or CLS plus only the configured pooled tokens
+for `token_mode=cls_spatial`. Native 16×16 patch features and REPA targets are never saved.
+
+Cached runs deliberately disable horizontal flipping, so use the same zero flip probability when
+building and training:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/cache_reg.py \
+  --config configs/canonical.yaml \
+  --override model.reg.token_mode=cls \
+  --override train.horizontal_flip_probability=0
+
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/canonical.yaml \
+  --reg --no-repa \
+  --override reg_cache.enabled=true \
+  --override train.horizontal_flip_probability=0 \
+  --output runs/reg-cached-p32 \
+  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
+  --wandb
+```
+
+Use matching `model.reg.token_mode` and `model.reg.pool_size` overrides in both commands. Caches
+live under `data/reg-tokens/<fingerprint>/`, are resumable under `torchrun`, and are rejected when
+their dataset, DINO model, token configuration, environment, shape, or completion state differs.
+REPA-enabled runs continue to extract DINO features online because REPA requires spatial targets.
 
 Resume standard REG with the same model overrides and REG variant:
 
@@ -130,8 +203,9 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
 ```
 
 Checkpoints contain raw model and EMA weights, optimizer state, all explicit RNG streams, the
-pinned dataset/preprocessing fingerprint, validation-plan hash, resolved configuration, and W&B
-identity. DINOv3 is outside model/EMA state. `last` and `best-fid` are resumable pointers.
+pinned dataset/preprocessing and REG-cache fingerprints, resolved configuration, validation plan,
+lightweight metadata, and W&B identity. DINOv3 is outside model/EMA state. `last` and `best-fid`
+are resumable pointers.
 
 ## Objective and sampling
 
@@ -151,44 +225,27 @@ objective weights.
 Sampling uses 50-step Euler integration and batched conditional/null-label CFG. Scale `1` selects
 the conditional prediction. CFG defaults to the full trajectory and can be restricted with
 `--cfg-start` and `--cfg-end`. REG sampling deterministically initializes and jointly integrates
-the image and complete configured REG state with separate Euler timesteps. `--timestep-shift`
-controls the absolute image schedule; `--reg-timestep-shift` controls the absolute REG schedule
-and defaults to the image value when omitted. Sampling `cls_spatial` checkpoints requires the
-same `model.reg.token_mode` and `model.reg.pool_size` overrides used for training.
+the image and configured REG state with the same schedule. `--timestep-shift` controls that shared
+schedule.
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --config configs/canonical.yaml \
-  --checkpoint runs/baseline-p32/checkpoints/last/ema-export.safetensors \
-  --plan runs/baseline-p32/validation-plan.pt \
-  --output-dir generated/baseline-p32
+  --checkpoint-dir runs/baseline-p32/checkpoints/last
 
 uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --config configs/canonical.yaml \
-  --reg \
-  --checkpoint runs/reg-p32/checkpoints/last/ema-export.safetensors \
-  --plan runs/reg-p32/validation-plan.pt \
-  --output-dir generated/reg-p32
+  --checkpoint-dir runs/reg-p32/checkpoints/last
 
 uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --config configs/canonical.yaml \
-  --reg-widehead \
   --timestep-shift 0.125 \
-  --reg-timestep-shift 0.5 \
-  --checkpoint runs/reg-widehead-p32/checkpoints/last/ema-export.safetensors \
-  --plan runs/reg-widehead-p32/validation-plan.pt \
-  --output-dir generated/reg-widehead-p32
+  --checkpoint-dir runs/reg-widehead-p32/checkpoints/last
 ```
 
-With image shift `0.125`, REG shifts `{0.0625, 0.125, 0.25, 0.5, 1.0}` correspond to relative
-rates `{0.5×, 1×, 2×, 4×, 8×}` covered by the canonical training range. Online validation exposes
-the same controls as `--eval-timestep-shift` and `--eval-reg-timestep-shift`. Sampling beyond the
-trained relative range is extrapolation.
-
 Generation is rank-partitioned and resumable. It writes an ADM-compatible `samples.npz`, a
-preview, and a manifest containing image size, patch size, JiT grid, model variant, REG status,
-predictor variant, token mode, pool size, checkpoint hash, validation-plan hash, and sampler
-parameters. Resuming into an existing sampling directory rejects incompatible REG settings.
+preview, and a manifest beneath the resolved epoch checkpoint. The child directory name records
+sample count, Euler steps, CFG scale, timestep shift, and CFG interval, for example
+`samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-1p0`. Its manifest also records model and
+REG settings, checkpoint hash, validation-plan hash, and sampler parameters. Resuming rejects
+incompatible settings, and checkpoint retention protects epochs containing sampling outputs.
 
 ## Matched wide-head experiment
 
@@ -206,12 +263,12 @@ same immutable labels, sample IDs, and noise seeds as standalone sampling. To ev
 
 ```bash
 uv run python scripts/eval.py \
-  --samples generated/baseline-p32/samples.npz \
+  --samples runs/baseline-p32/checkpoints/last/samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-1p0/samples.npz \
   --reference data/VIRTUAL_imagenet256_labeled.npz \
   --output runs/baseline-p32/evaluation.json
 
 uv run python scripts/eval.py \
-  --samples generated/reg-p32/samples.npz \
+  --samples runs/reg-p32/checkpoints/last/samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-1p0/samples.npz \
   --reference data/VIRTUAL_imagenet256_labeled.npz \
   --output runs/reg-p32/evaluation.json
 

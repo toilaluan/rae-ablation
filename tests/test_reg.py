@@ -104,6 +104,17 @@ def test_spatial_reg_targets_pool_to_four_by_four_and_layer_normalize() -> None:
     assert targets.repa.shape == (1, 64, 8)
 
 
+def test_reg_targets_can_omit_repa_features() -> None:
+    targets = prepare_reg_targets(
+        torch.randn(2, 8),
+        torch.randn(2, 16, 8),
+        2,
+        include_repa=False,
+    )
+    assert targets.reg_tokens.shape == (2, 1, 8)
+    assert targets.repa is None
+
+
 def test_spatial_feature_order_requires_a_square_grid() -> None:
     with pytest.raises(ValueError, match="square"):
         resize_spatial_features(torch.randn(1, 12, 8), 2)

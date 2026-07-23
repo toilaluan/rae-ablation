@@ -21,7 +21,11 @@ from jit_reg.evaluation import (
     fid_from_statistics,
     validate_reference_statistics,
 )
-from jit_reg.sample_runtime import SamplingParameters, sample_to_archive
+from jit_reg.sample_runtime import (
+    SamplingParameters,
+    sample_to_archive,
+    sampling_output_name,
+)
 from jit_reg.validation import create_validation_plan
 from jit_reg.validation_runtime import validate_ema
 from jit_reg.wandb_utils import RunLogger
@@ -49,8 +53,15 @@ def _sample(
         model_variant="SiT-B/32",
         reg_enabled=False,
         reg_variant="disabled",
+        repa_enabled=False,
         reg_token_mode="disabled",
         reg_pool_size=4,
+        reg_x0_conditioning=False,
+        reg_continuation_tokens=None,
+        reg_patch_reprojection_enabled=False,
+        reg_patch_reprojection_source="x0_cls",
+        reg_patch_reprojection_intermediate_size=2048,
+        reg_patch_reprojection_include_timestep=True,
         checkpoint_hash=checkpoint_hash,
         parameters=parameters or SamplingParameters(batch_size=2, sampling_steps=3),
         generate_batch=generate,  # type: ignore[arg-type]
@@ -90,14 +101,20 @@ def test_sample_archive_is_atomic_balanced_resumable_and_records_jit_metadata(
     with zipfile.ZipFile(archive) as values:
         assert values.getinfo("arr_0.npy").compress_type == zipfile.ZIP_STORED
     manifest = json.loads((tmp_path / "samples.json").read_text())
-    assert manifest["complete"] and manifest["schema_version"] == 7
+    assert manifest["complete"] and manifest["schema_version"] == 8
     assert manifest["patch_size"] == 32 and manifest["jit_grid_size"] == 8
     assert manifest["model_variant"] == "SiT-B/32" and not manifest["reg_enabled"]
     assert manifest["reg_variant"] == "disabled"
+    assert not manifest["repa_enabled"]
     assert manifest["reg_token_mode"] == "disabled"
     assert manifest["reg_pool_size"] == 4
+    assert manifest["reg_patch_reprojection"] == {
+        "enabled": False,
+        "source": None,
+        "intermediate_size": None,
+        "include_timestep": None,
+    }
     assert manifest["sampling"]["cfg_interval"] == [0.0, 1.0]
-    assert manifest["sampling"]["reg_timestep_shift"] is None
     preview = np.asarray(Image.open(tmp_path / "preview.png"))
     assert preview[0, [0, 256, 512, 768], 0].tolist() == [0, 1, 2, 3]
     assert not list(tmp_path.glob(".samples-*.npy"))
@@ -122,8 +139,15 @@ def test_sampling_resume_rejects_reg_variant_mismatch(tmp_path: Path) -> None:
         "patch_size": 32,
         "model_variant": "SiT-B/32",
         "reg_enabled": True,
+        "repa_enabled": True,
         "reg_token_mode": "cls_spatial",
         "reg_pool_size": 4,
+        "reg_x0_conditioning": False,
+        "reg_continuation_tokens": None,
+        "reg_patch_reprojection_enabled": False,
+        "reg_patch_reprojection_source": "x0_cls",
+        "reg_patch_reprojection_intermediate_size": 2048,
+        "reg_patch_reprojection_include_timestep": True,
         "checkpoint_hash": "abc",
         "parameters": SamplingParameters(batch_size=2, sampling_steps=3),
         "generate_batch": generate,
@@ -141,34 +165,24 @@ def test_sampling_resume_rejects_reg_variant_mismatch(tmp_path: Path) -> None:
             **{**token_common, "reg_token_mode": "cls_spatial"},
         )
 
-    shift_path = tmp_path / "reg-shift"
-    shift_common = {
-        **common,
-        "output_dir": shift_path,
-        "parameters": SamplingParameters(
-            batch_size=2,
-            sampling_steps=3,
-            timestep_shift=0.125,
-            reg_timestep_shift=0.5,
-        ),
-    }
-    sample_to_archive(reg_variant="standard", **shift_common)  # type: ignore[arg-type]
-    manifest = json.loads((shift_path / "samples.json").read_text())
-    assert manifest["sampling"]["timestep_shift"] == 0.125
-    assert manifest["sampling"]["reg_timestep_shift"] == 0.5
-    with pytest.raises(ValueError, match="does not match"):
-        sample_to_archive(
-            reg_variant="standard",
-            **{
-                **shift_common,
-                "parameters": SamplingParameters(
-                    batch_size=2,
-                    sampling_steps=3,
-                    timestep_shift=0.125,
-                    reg_timestep_shift=1.0,
-                ),
-            },
-        )
+    first = SamplingParameters(
+        batch_size=2,
+        sampling_steps=3,
+        guidance_scale=1.5,
+        timestep_shift=0.125,
+    )
+    second = SamplingParameters(
+        batch_size=8,
+        sampling_steps=3,
+        guidance_scale=1.5,
+        timestep_shift=0.125,
+        log_interval=20,
+    )
+    assert sampling_output_name(4, first) == sampling_output_name(4, second)
+    assert sampling_output_name(4, first) != sampling_output_name(
+        4,
+        SamplingParameters(sampling_steps=4, timestep_shift=0.125),
+    )
 
 
 @pytest.mark.parametrize("compressed", [False, True])
@@ -212,7 +226,9 @@ def test_evaluate_npz_with_streamed_features(tmp_path: Path) -> None:
     assert metrics["FID"] == pytest.approx(0.0, abs=1e-8)
 
 
-@pytest.mark.parametrize("script", ["train.py", "sample.py", "eval.py", "compare.py"])
+@pytest.mark.parametrize(
+    "script", ["train.py", "sample.py", "cache_reg.py", "eval.py", "compare.py"]
+)
 def test_standalone_script_help(script: str) -> None:
     root = Path(__file__).resolve().parents[1]
     result = subprocess.run(

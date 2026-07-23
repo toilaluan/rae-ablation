@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -7,8 +8,17 @@ from typing import Any
 
 
 @dataclass
+class PatchReprojectionConfig:
+    enabled: bool = False
+    source: str = "x0_cls"
+    intermediate_size: int = 2048
+    include_timestep: bool = True
+
+
+@dataclass
 class REGConfig:
     enabled: bool = False
+    repa_enabled: bool = True
     model_name: str = "vit_base_patch16_dinov3.lvd1689m"
     feature_dim: int = 768
     register_tokens: int = 4
@@ -21,6 +31,11 @@ class REGConfig:
     cls_head_hidden_size: int = 2048
     cls_head_depth: int = 2
     cls_head_mlp_ratio: float = 4.0
+    x0_conditioning: bool = False
+    continuation_tokens: int | None = None
+    patch_reprojection: PatchReprojectionConfig = field(
+        default_factory=PatchReprojectionConfig
+    )
     cls_loss_weight: float = 0.03
     repa_loss_weight: float = 0.5
 
@@ -77,6 +92,12 @@ class DataConfig:
 
 
 @dataclass
+class REGCacheConfig:
+    enabled: bool = False
+    directory: str = "data/reg-tokens"
+
+
+@dataclass
 class OptimizerConfig:
     kind: str = "muon"
     lr: float = 2e-4
@@ -97,8 +118,6 @@ class TrainConfig:
     seed: int = 0
     timestep_loc: float = 0.0
     timestep_scale: float = 1.0
-    reg_relative_timestep_shift_min: float = 0.5
-    reg_relative_timestep_shift_max: float = 8.0
     horizontal_flip_probability: float = 0.5
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
@@ -135,6 +154,7 @@ class WandbConfig:
 @dataclass
 class ExperimentConfig:
     data: DataConfig = field(default_factory=DataConfig)
+    reg_cache: REGCacheConfig = field(default_factory=REGCacheConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     compile: CompileConfig = field(default_factory=CompileConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
@@ -184,7 +204,7 @@ class ExperimentConfig:
             raise ValueError("model.reg.cls_head_mlp_ratio must be positive")
         if reg.cls_predictor not in {"standard", "wide_intermediate"}:
             raise ValueError("model.reg.cls_predictor must be standard or wide_intermediate")
-        if reg.enabled and reg.repa_block > m.depth:
+        if reg.enabled and reg.repa_enabled and reg.repa_block > m.depth:
             raise ValueError("model.reg.repa_block must be within model.depth")
         if reg.cls_predictor == "wide_intermediate":
             if not reg.enabled:
@@ -193,6 +213,25 @@ class ExperimentConfig:
                 raise ValueError(
                     "model.reg.cls_head_block must be at least 1 and before model.depth"
                 )
+        elif (
+            reg.x0_conditioning
+            or reg.continuation_tokens is not None
+            or reg.patch_reprojection.enabled
+        ):
+            raise ValueError(
+                "REG x0 conditioning, continuation tokens, and patch reprojection "
+                "require wide_intermediate"
+            )
+        if reg.continuation_tokens is not None and reg.continuation_tokens < 1:
+            raise ValueError("model.reg.continuation_tokens must be positive or null")
+        if reg.patch_reprojection.source not in {"x0_cls", "wide_cls"}:
+            raise ValueError(
+                "model.reg.patch_reprojection.source must be x0_cls or wide_cls"
+            )
+        if reg.patch_reprojection.intermediate_size < 1:
+            raise ValueError(
+                "model.reg.patch_reprojection.intermediate_size must be positive"
+            )
         if reg.cls_loss_weight < 0 or reg.repa_loss_weight < 0:
             raise ValueError("model.reg loss weights cannot be negative")
         if self.train.optimizer.kind not in {"adamw", "muon"}:
@@ -230,21 +269,15 @@ class ExperimentConfig:
             raise ValueError("train.timestep_loc must be finite")
         if not math.isfinite(self.train.timestep_scale) or self.train.timestep_scale <= 0:
             raise ValueError("train.timestep_scale must be finite and positive")
-        reg_shift_min = self.train.reg_relative_timestep_shift_min
-        reg_shift_max = self.train.reg_relative_timestep_shift_max
-        if (
-            not math.isfinite(reg_shift_min)
-            or not math.isfinite(reg_shift_max)
-            or reg_shift_min <= 0
-            or reg_shift_max <= 0
-            or reg_shift_min > reg_shift_max
-        ):
-            raise ValueError(
-                "train REG relative timestep shifts must be finite, positive, "
-                "and ordered min <= max"
-            )
         if not 0 <= self.train.horizontal_flip_probability <= 1:
             raise ValueError("train.horizontal_flip_probability must be in [0, 1]")
+        cache_active = self.reg_cache.enabled and reg.enabled and not reg.repa_enabled
+        if cache_active and self.train.horizontal_flip_probability != 0:
+            raise ValueError(
+                "cached REG training requires train.horizontal_flip_probability=0"
+            )
+        if not self.reg_cache.directory:
+            raise ValueError("reg_cache.directory cannot be empty")
         if self.checkpoint.keep_last_n < 0:
             raise ValueError("checkpoint.keep_last_n cannot be negative")
 
@@ -268,5 +301,25 @@ def load_config(
     result = OmegaConf.to_object(cfg)
     if not isinstance(result, ExperimentConfig):
         raise TypeError("configuration did not resolve to ExperimentConfig")
+    result.validate()
+    return result
+
+
+def load_checkpoint_config(path: str | Path) -> ExperimentConfig:
+    """Load a saved resolved config while migrating known removed fields."""
+    values = json.loads(Path(path).read_text())
+    if not isinstance(values, dict):
+        raise ValueError("checkpoint config must be a JSON object")
+    train = values.get("train")
+    if isinstance(train, dict):
+        train.pop("reg_relative_timestep_shift_min", None)
+        train.pop("reg_relative_timestep_shift_max", None)
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.merge(OmegaConf.structured(ExperimentConfig), values)
+    OmegaConf.set_struct(cfg, True)
+    result = OmegaConf.to_object(cfg)
+    if not isinstance(result, ExperimentConfig):
+        raise TypeError("checkpoint configuration did not resolve to ExperimentConfig")
     result.validate()
     return result

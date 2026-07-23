@@ -32,6 +32,7 @@ class ResumeState:
     validation_plan_hash: str
     optimizer: dict[str, Any]
     rng_streams: dict[str, Tensor]
+    reg_cache_fingerprint: str | None = None
 
 
 def should_checkpoint(completed_epoch: int, total_epochs: int, interval: int) -> bool:
@@ -82,9 +83,11 @@ class CheckpointManager:
         rng_streams: dict[str, Tensor],
         data_fingerprint: str,
         validation_plan_hash: str,
+        validation_plan_path: str | Path,
         last_completed_validation_epoch: int | None,
         wandb_run_id: str | None,
         resolved_config: dict[str, Any],
+        reg_cache_fingerprint: str | None = None,
         fid: float | None = None,
     ) -> Path:
         name = f"epoch-{completed_epoch:04d}"
@@ -105,10 +108,33 @@ class CheckpointManager:
             "validation_plan_hash": validation_plan_hash,
             "optimizer": optimizer_state,
             "rng_streams": rng_streams,
+            "reg_cache_fingerprint": reg_cache_fingerprint,
         }
         torch.save(training, temporary / "training.pt")
         (temporary / "config.json").write_text(
             json.dumps(resolved_config, indent=2, sort_keys=True) + "\n"
+        )
+        plan_path = Path(validation_plan_path)
+        if not plan_path.is_file():
+            raise FileNotFoundError(f"validation plan is missing: {plan_path}")
+        plan_state = torch.load(plan_path, map_location="cpu", weights_only=True)
+        if plan_state.get("plan_hash") != validation_plan_hash:
+            raise ValueError("validation plan file and hash do not match")
+        shutil.copy2(plan_path, temporary / "validation-plan.pt")
+        (temporary / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "completed_epoch": completed_epoch,
+                    "global_step": global_step,
+                    "data_fingerprint": data_fingerprint,
+                    "validation_plan_hash": validation_plan_hash,
+                    "reg_cache_fingerprint": reg_cache_fingerprint,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
         )
         os.replace(temporary, target)
         self._point("last", name)
@@ -139,6 +165,14 @@ class CheckpointManager:
         best = self.directory / "best-fid"
         if best.is_symlink():
             protected.add(os.readlink(best))
+        protected.update(
+            path.name
+            for path in checkpoints
+            if any(
+                child.is_dir() and child.name.startswith("samples-")
+                for child in path.iterdir()
+            )
+        )
         removable = [
             path for path in checkpoints[: -self.keep_last_n] if path.name not in protected
         ]
@@ -152,6 +186,7 @@ class CheckpointManager:
         ema: EMA,
         expected_data_fingerprint: str | None = None,
         expected_validation_plan_hash: str | None = None,
+        expected_reg_cache_fingerprint: str | None = None,
     ) -> ResumeState:
         path = Path(checkpoint)
         if not path.is_absolute():
@@ -166,6 +201,11 @@ class CheckpointManager:
             and state["validation_plan_hash"] != expected_validation_plan_hash
         ):
             raise ValueError("checkpoint validation-plan hash mismatch")
+        saved_cache_fingerprint = state.get("reg_cache_fingerprint")
+        if expected_reg_cache_fingerprint != saved_cache_fingerprint and (
+            expected_reg_cache_fingerprint is not None or saved_cache_fingerprint is not None
+        ):
+            raise ValueError("checkpoint REG-cache fingerprint mismatch")
         return ResumeState(**state)
 
     def export_ema(self, ema: EMA, path: str | Path) -> None:

@@ -12,7 +12,7 @@ from .config import REGConfig
 
 class REGTargets(NamedTuple):
     reg_tokens: Tensor
-    repa: Tensor
+    repa: Tensor | None
 
 
 def resize_spatial_features(spatial: Tensor, target_grid: int) -> Tensor:
@@ -62,6 +62,7 @@ def prepare_reg_targets(
     *,
     token_mode: str = "cls",
     pool_size: int = 4,
+    include_repa: bool = True,
 ) -> REGTargets:
     if cls.ndim != 2 or spatial.ndim != 3:
         raise ValueError("CLS and spatial features must have shapes [B, D] and [B, N, D]")
@@ -74,7 +75,7 @@ def prepare_reg_targets(
         reg_tokens = torch.cat((cls.float().unsqueeze(1), pooled), dim=1)
     else:
         raise ValueError("token_mode must be cls or cls_spatial")
-    repa = resize_spatial_features(spatial, target_grid)
+    repa = resize_spatial_features(spatial, target_grid) if include_repa else None
     return REGTargets(reg_tokens=reg_tokens, repa=repa)
 
 
@@ -168,4 +169,5 @@ class DINOv3FeatureExtractor(nn.Module):
             target_grid,
             token_mode=self.config.token_mode,
             pool_size=self.config.pool_size,
+            include_repa=self.config.repa_enabled,
         )
