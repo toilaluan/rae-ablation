@@ -37,7 +37,7 @@ compile:
   enabled: true
   backend: inductor
   mode: default
-  fullgraph: false
+  fullgraph: true
   dynamic: false
 train:
   epochs: 80
@@ -61,10 +61,10 @@ train:
     beta2: 0.95
 validation:
   interval: 5
-  periodic_samples: 5000
+  periodic_samples: 10000
   final_samples: 50000
   plan_path: validation-plan.pt
-  validate_now: false
+  validate_now: true
 checkpoint:
   directory: checkpoints
   interval: 5

@@ -137,7 +137,7 @@ def main() -> None:
             device_ids=[device.index] if device.type == "cuda" else None,
         )
     reg_encoder = (
-        DINOv3FeatureExtractor(config.model.reg).to(device) if config.model.reg.enabled else None
+        torch.compile(DINOv3FeatureExtractor(config.model.reg)).to(device).bfloat16() if config.model.reg.enabled else None
     )
     loader, sampler = make_train_loader(dataset, config, streams)
     logged_config = config.as_dict()
@@ -204,7 +204,7 @@ def main() -> None:
         return metrics
 
     try:
-        if config.validation.validate_now and state.epoch > 0:
+        if config.validation.validate_now:
             logger.event(f"forced validation started after epoch {state.epoch}")
             forced_metrics = validate_callback(state.epoch, state.epoch >= config.train.epochs)
             state.last_completed_validation_epoch = state.epoch

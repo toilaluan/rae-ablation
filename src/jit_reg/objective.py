@@ -97,7 +97,7 @@ def clean_prediction_velocity_loss(
     predicted_velocity = x_to_velocity(noisy, prediction, timestep)
     return F.mse_loss(predicted_velocity, target_velocity)
 
-
+@torch.compile
 def jit_losses(
     clean_image: Tensor,
     image_noise: Tensor,
