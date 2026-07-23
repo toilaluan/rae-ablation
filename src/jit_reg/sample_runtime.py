@@ -29,12 +29,17 @@ class SamplingParameters:
     cfg_start: float = 0.0
     cfg_end: float = 1.0
     log_interval: int = 10
+    reg_timestep_shift: float | None = None
 
     def validate(self) -> None:
         if self.batch_size < 1 or self.sampling_steps < 1 or self.log_interval < 1:
             raise ValueError("sampling batch size, steps, and log interval must be positive")
         if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
             raise ValueError("timestep shift must be finite and positive")
+        if self.reg_timestep_shift is not None and (
+            not math.isfinite(self.reg_timestep_shift) or self.reg_timestep_shift <= 0
+        ):
+            raise ValueError("REG timestep shift must be finite and positive")
         if not math.isfinite(self.guidance_scale):
             raise ValueError("guidance scale must be finite")
         if not 0 <= self.cfg_start <= self.cfg_end <= 1:
@@ -136,7 +141,7 @@ def _manifest_base(
     counts = torch.bincount(labels, minlength=num_classes)
     ids_digest = hashlib.sha256(sample_ids.numpy().tobytes()).hexdigest()
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "checkpoint_sha256": checkpoint_hash,
         "validation_plan_hash": plan.plan_hash,
         "sample_ids_sha256": ids_digest,
@@ -157,6 +162,13 @@ def _manifest_base(
             "sampling_steps": parameters.sampling_steps,
             "guidance_scale": parameters.guidance_scale,
             "timestep_shift": parameters.timestep_shift,
+            "reg_timestep_shift": (
+                parameters.reg_timestep_shift
+                if reg_enabled and parameters.reg_timestep_shift is not None
+                else parameters.timestep_shift
+                if reg_enabled
+                else None
+            ),
             "cfg_interval": [parameters.cfg_start, parameters.cfg_end],
         },
     }
@@ -244,9 +256,7 @@ def _initialize_or_resume(
     images_mm.flush()
     labels_mm.flush()
     completion_mm.flush()
-    _write_json_atomic(
-        paths["manifest"], {**base, "complete": False, "completed_samples": 0}
-    )
+    _write_json_atomic(paths["manifest"], {**base, "complete": False, "completed_samples": 0})
     return False, 0
 
 
@@ -263,9 +273,10 @@ def _as_uint8_nhwc(images: Tensor, expected: int, image_size: int) -> np.ndarray
 
 
 def _write_zip_member(archive: zipfile.ZipFile, source: Path, name: str) -> None:
-    with source.open("rb") as input_handle, archive.open(
-        name, mode="w", force_zip64=True
-    ) as output_handle:
+    with (
+        source.open("rb") as input_handle,
+        archive.open(name, mode="w", force_zip64=True) as output_handle,
+    ):
         shutil.copyfileobj(input_handle, output_handle, length=8 * 1024 * 1024)
 
 
@@ -328,6 +339,8 @@ def sample_to_archive(
         raise ValueError("REG variant must be disabled, standard, or wide_intermediate")
     if reg_enabled != (reg_variant != "disabled"):
         raise ValueError("REG enabled status and variant do not agree")
+    if not reg_enabled and parameters.reg_timestep_shift is not None:
+        raise ValueError("REG timestep shift requires REG sampling")
     expected_token_modes = {"disabled", "cls", "cls_spatial"}
     if reg_token_mode not in expected_token_modes:
         raise ValueError("REG token mode must be disabled, cls, or cls_spatial")
@@ -370,10 +383,17 @@ def sample_to_archive(
         raise RuntimeError(state[2])
     if rank == 0:
         status = "complete" if state[0] else "resuming" if state[1] else "new"
+        resolved_reg_shift = (
+            parameters.reg_timestep_shift
+            if parameters.reg_timestep_shift is not None
+            else parameters.timestep_shift
+        )
         print(
             f"sampling configuration: samples={sample_count} classes={num_classes} "
             f"batch_size={parameters.batch_size} steps={parameters.sampling_steps} "
-            f"guidance={parameters.guidance_scale:g} shift={parameters.timestep_shift:g}"
+            f"guidance={parameters.guidance_scale:g} "
+            f"image_shift={parameters.timestep_shift:g} "
+            f"reg_shift={resolved_reg_shift:g}"
         )
         print(f"sampling state: {status}, completed={state[1]}/{sample_count}")
     if state[0]:
@@ -393,9 +413,7 @@ def sample_to_archive(
     for batch_index, begin in enumerate(range(0, pending.numel(), parameters.batch_size), start=1):
         positions = pending[begin : begin + parameters.batch_size]
         decoded = generate_batch(positions, labels[positions], noise_seeds[positions])
-        images_mm[positions.numpy()] = _as_uint8_nhwc(
-            decoded, positions.numel(), image_size
-        )
+        images_mm[positions.numpy()] = _as_uint8_nhwc(decoded, positions.numel(), image_size)
         images_mm.flush()
         completion_mm[positions.numpy()] = 1
         completion_mm.flush()

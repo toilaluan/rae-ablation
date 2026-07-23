@@ -49,6 +49,8 @@ train:
   seed: 0
   timestep_loc: -0.8
   timestep_scale: 0.8
+  reg_relative_timestep_shift_min: 0.5
+  reg_relative_timestep_shift_max: 8.0
   horizontal_flip_probability: 0.5
   optimizer:
     kind: muon

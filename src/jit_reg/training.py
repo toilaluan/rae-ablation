@@ -16,7 +16,12 @@ from .checkpoint import EMA, CheckpointManager, should_checkpoint
 from .config import ExperimentConfig
 from .data import random_horizontal_flip
 from .model.sit import classifier_free_labels
-from .objective import jit_losses, noisy_interpolate, sample_timesteps
+from .objective import (
+    jit_losses,
+    noisy_interpolate,
+    sample_reg_timesteps,
+    sample_timesteps,
+)
 from .optim import CompositeOptimizer, learning_rate_at_epoch, set_learning_rate
 from .reg import DINOv3FeatureExtractor
 from .rng import RNGStreams
@@ -96,9 +101,7 @@ def train(
     state = state or TrainState()
     rank, world_size = distributed_info()
     device = next(canonical_model.parameters()).device
-    accumulation = config.train.global_batch_size // (
-        config.train.micro_batch_size * world_size
-    )
+    accumulation = config.train.global_batch_size // (config.train.micro_batch_size * world_size)
     if accumulation < 1 or config.train.global_batch_size % (
         config.train.micro_batch_size * world_size
     ):
@@ -153,6 +156,8 @@ def train(
             targets = None
             reg_noise = None
             noisy_reg = None
+            reg_timesteps = None
+            relative_reg_shifts = None
             if reg_encoder is not None:
                 with torch.autocast(
                     device_type=device.type,
@@ -166,7 +171,13 @@ def train(
                     dtype=torch.float32,
                     generator=streams.reg_noise,
                 )
-                noisy_reg = noisy_interpolate(targets.reg_tokens, reg_noise, timesteps)
+                reg_timesteps, relative_reg_shifts = sample_reg_timesteps(
+                    timesteps,
+                    streams.reg_timesteps,
+                    min_relative_shift=config.train.reg_relative_timestep_shift_min,
+                    max_relative_shift=config.train.reg_relative_timestep_shift_max,
+                )
+                noisy_reg = noisy_interpolate(targets.reg_tokens, reg_noise, reg_timesteps)
 
             update = (batch_index + 1) % accumulation == 0
             sync_context = (
@@ -185,6 +196,7 @@ def train(
                         timesteps,
                         model_labels,
                         noisy_reg=noisy_reg,
+                        reg_timestep=reg_timesteps,
                         return_repa=targets is not None,
                     )
                 losses = jit_losses(
@@ -195,6 +207,7 @@ def train(
                     clean_reg=targets.reg_tokens if targets is not None else None,
                     reg_noise=reg_noise,
                     reg_prediction=output.reg,
+                    reg_timestep=reg_timesteps,
                     repa_prediction=output.repa,
                     repa_target=targets.repa if targets is not None else None,
                     reg_weight=config.model.reg.cls_loss_weight,
@@ -230,11 +243,20 @@ def train(
                     "train/reg_x0_mse": losses.reg_x0_mse.item(),
                     "train/reg_x0_cosine": losses.reg_x0_cosine.item(),
                     "train/repa_loss": losses.repa.item(),
+                    "train/image_timestep_mean": timesteps.mean().item(),
+                    "train/reg_timestep_mean": (
+                        reg_timesteps.mean().item()
+                        if reg_timesteps is not None
+                        else timesteps.mean().item()
+                    ),
+                    "train/reg_relative_timestep_shift_geomean": (
+                        relative_reg_shifts.log().mean().exp().item()
+                        if relative_reg_shifts is not None
+                        else 1.0
+                    ),
                     "train/lr": lr,
                     "train/lr_adamw": lr,
-                    "train/lr_muon": lr
-                    if config.train.optimizer.kind == "muon"
-                    else 0.0,
+                    "train/lr_muon": lr if config.train.optimizer.kind == "muon" else 0.0,
                     "train/gradient_norm": float(grad_norm),
                     "train/ema_decay": ema.decay,
                     "throughput/images_per_second": images / elapsed,
@@ -259,8 +281,7 @@ def train(
 
         state.epoch = epoch_index + 1
         final_epoch = state.epoch == config.train.epochs or (
-            config.train.max_steps is not None
-            and state.global_step >= config.train.max_steps
+            config.train.max_steps is not None and state.global_step >= config.train.max_steps
         )
         validation_metrics: dict[str, float] = {}
         if validation_callback is not None and should_validate(
@@ -280,9 +301,7 @@ def train(
                     logger.event(f"{name}: {value:.6f}")
 
         if rank == 0 and (
-            should_checkpoint(
-                state.epoch, config.train.epochs, config.checkpoint.interval
-            )
+            should_checkpoint(state.epoch, config.train.epochs, config.checkpoint.interval)
             or final_epoch
         ):
             fid = validation_metrics.get("validation/FID-50K")
@@ -311,9 +330,7 @@ def train(
             {"train/epoch_seconds": time.perf_counter() - epoch_started},
             step=state.global_step,
         )
-        logger.event(
-            f"epoch {state.epoch} finished in {time.perf_counter() - epoch_started:.1f}s"
-        )
+        logger.event(f"epoch {state.epoch} finished in {time.perf_counter() - epoch_started:.1f}s")
         if final_epoch:
             break
     return state

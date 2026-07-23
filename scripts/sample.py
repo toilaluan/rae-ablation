@@ -31,9 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=Path("configs/canonical.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     reg = parser.add_mutually_exclusive_group()
-    reg.add_argument(
-        "--reg", action="store_true", help="sample a standard REG-enabled checkpoint"
-    )
+    reg.add_argument("--reg", action="store_true", help="sample a standard REG-enabled checkpoint")
     reg.add_argument(
         "--reg-widehead",
         action="store_true",
@@ -44,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sampling-steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=1.78)
     parser.add_argument("--timestep-shift", type=float, default=1.0)
+    parser.add_argument("--reg-timestep-shift", type=float)
     parser.add_argument("--cfg-start", type=float, default=0.0)
     parser.add_argument("--cfg-end", type=float, default=1.0)
     parser.add_argument("--log-interval", type=int, default=10)
@@ -65,6 +64,7 @@ def main() -> None:
         sampling_steps=args.sampling_steps,
         guidance_scale=args.guidance_scale,
         timestep_shift=args.timestep_shift,
+        reg_timestep_shift=args.reg_timestep_shift,
         cfg_start=args.cfg_start,
         cfg_end=args.cfg_end,
         log_interval=args.log_interval,
@@ -105,9 +105,7 @@ def main() -> None:
             if config.model.reg.enabled
             else None
         )
-        with torch.autocast(
-            device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
-        ):
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             generated = euler_sample(
                 execution_model,
                 noise,
@@ -116,6 +114,7 @@ def main() -> None:
                 steps=parameters.sampling_steps,
                 guidance_scale=parameters.guidance_scale,
                 timestep_shift=parameters.timestep_shift,
+                reg_timestep_shift=parameters.reg_timestep_shift,
                 cfg_interval=(parameters.cfg_start, parameters.cfg_end),
                 num_classes=config.model.num_classes,
             )
@@ -131,12 +130,8 @@ def main() -> None:
         patch_size=config.model.patch_size,
         model_variant=config.model.model_variant,
         reg_enabled=config.model.reg.enabled,
-        reg_variant=config.model.reg.cls_predictor
-        if config.model.reg.enabled
-        else "disabled",
-        reg_token_mode=config.model.reg.token_mode
-        if config.model.reg.enabled
-        else "disabled",
+        reg_variant=config.model.reg.cls_predictor if config.model.reg.enabled else "disabled",
+        reg_token_mode=config.model.reg.token_mode if config.model.reg.enabled else "disabled",
         reg_pool_size=config.model.reg.pool_size,
         checkpoint_hash=digest,
         parameters=parameters,

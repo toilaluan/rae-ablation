@@ -107,6 +107,67 @@ def test_cls_reg_prepends_one_unrotated_token_and_projects_image_tokens() -> Non
     assert torch.count_nonzero(output.reg) == 0
 
 
+def test_reg_uses_explicit_dual_time_conditioning_without_new_state() -> None:
+    model = SiT(tiny_config(reg=True))
+    original_keys = tuple(model.state_dict())
+    seen: list[torch.Tensor] = []
+
+    def capture_modulation(_module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        seen.append(inputs[0].detach().clone())
+
+    hook = model.blocks[0].modulation.register_forward_pre_hook(capture_modulation)
+    model(
+        torch.randn(2, 3, 32, 32),
+        torch.tensor([0.1, 0.2]),
+        torch.tensor([1, 2]),
+        noisy_reg=torch.randn(2, 1, 8),
+        reg_timestep=torch.tensor([0.8, 0.9]),
+    )
+    hook.remove()
+    assert len(seen) == 2
+    assert not torch.equal(seen[0], seen[1])
+    assert tuple(model.state_dict()) == original_keys
+
+
+def test_equal_explicit_reg_time_matches_legacy_shared_conditioning() -> None:
+    legacy = SiT(tiny_config(reg=True))
+    with torch.no_grad():
+        hidden = legacy.config.hidden_size
+        for block in legacy.blocks:
+            block.modulation[-1].bias[2 * hidden : 3 * hidden].fill_(1)
+            block.modulation[-1].bias[5 * hidden : 6 * hidden].fill_(1)
+        assert legacy.cls_final_layer is not None
+        nn.init.normal_(legacy.final_layer.projection.weight)
+        nn.init.normal_(legacy.cls_final_layer.projection.weight)
+    explicit = copy.deepcopy(legacy)
+    image = torch.randn(2, 3, 32, 32)
+    timestep = torch.tensor([0.3, 0.7])
+    labels = torch.tensor([1, 2])
+    noisy_reg = torch.randn(2, 1, 8)
+    first = legacy(image, timestep, labels, noisy_reg=noisy_reg)
+    second = explicit(
+        image,
+        timestep,
+        labels,
+        noisy_reg=noisy_reg,
+        reg_timestep=timestep,
+    )
+    torch.testing.assert_close(first.image, second.image, rtol=0, atol=0)
+    assert first.reg is not None and second.reg is not None
+    torch.testing.assert_close(first.reg, second.reg, rtol=0, atol=0)
+
+
+def test_baseline_rejects_reg_timestep() -> None:
+    model = SiT(tiny_config())
+    with pytest.raises(ValueError, match="reg_timestep"):
+        model(
+            torch.randn(1, 3, 32, 32),
+            torch.rand(1),
+            torch.tensor([1]),
+            reg_timestep=torch.rand(1),
+        )
+
+
 def test_spatial_reg_adds_learned_positions_and_projects_only_image_tokens() -> None:
     model = SiT(tiny_config(reg=True, token_mode="cls_spatial", pool_size=2))
     assert model.num_reg_tokens == 5
@@ -147,8 +208,7 @@ def test_standard_reg_has_original_state_and_no_wide_allocations() -> None:
     assert model.cls_clean_projection is None
     assert any(key.startswith("cls_final_layer.") for key in state)
     assert not any(
-        key.startswith("cls_predictor.") or key.startswith("cls_clean_projection.")
-        for key in state
+        key.startswith("cls_predictor.") or key.startswith("cls_clean_projection.") for key in state
     )
     assert "reg_position_embedding" not in state
     restored = SiT(tiny_config(reg=True))
@@ -158,9 +218,7 @@ def test_standard_reg_has_original_state_and_no_wide_allocations() -> None:
 
 @pytest.mark.parametrize("token_mode", ["cls", "cls_spatial"])
 def test_wide_reg_predicts_and_reinjects_after_repa(token_mode: str) -> None:
-    config = tiny_config(
-        reg=True, reg_variant="wide_intermediate", token_mode=token_mode
-    )
+    config = tiny_config(reg=True, reg_variant="wide_intermediate", token_mode=token_mode)
     config.reg.repa_block = config.reg.cls_head_block
     model = SiT(config)
     assert model.cls_final_layer is None
@@ -205,9 +263,7 @@ def test_wide_reg_predicts_and_reinjects_after_repa(token_mode: str) -> None:
         predicted_reg.view(1, 1, -1).expand(2, model.num_reg_tokens, -1),
     )
     expected_clean = model._add_reg_positions(model.cls_clean_projection(output.reg))
-    torch.testing.assert_close(
-        seen["next"][:, : model.num_reg_tokens], expected_clean
-    )
+    torch.testing.assert_close(seen["next"][:, : model.num_reg_tokens], expected_clean)
     torch.testing.assert_close(seen["repa"], seen["next"][:, model.num_reg_tokens :])
     assert output.repa is not None and output.repa.shape == (2, 16, 8)
 
@@ -264,9 +320,7 @@ def test_wide_swiglu_and_clean_projection_optimizer_policy() -> None:
     assert not _muon_eligible(wide_projection, parameters[wide_projection])
     clean_projection = "cls_clean_projection.weight"
     assert not _muon_eligible(clean_projection, parameters[clean_projection])
-    assert not _muon_eligible(
-        "reg_position_embedding", parameters["reg_position_embedding"]
-    )
+    assert not _muon_eligible("reg_position_embedding", parameters["reg_position_embedding"])
 
 
 @pytest.mark.parametrize(
@@ -278,9 +332,7 @@ def test_wide_swiglu_and_clean_projection_optimizer_policy() -> None:
         ("wide_intermediate", "cls_spatial"),
     ],
 )
-def test_sit_variants_smoke_euler_sampling(
-    reg_variant: str, token_mode: str
-) -> None:
+def test_sit_variants_smoke_euler_sampling(reg_variant: str, token_mode: str) -> None:
     enabled = reg_variant != "disabled"
     model = SiT(
         tiny_config(
@@ -339,16 +391,13 @@ def test_tiny_sit_regional_compile_has_clean_raw_keys(
             token_mode="cls_spatial" if reg_variant is not None else "cls",
         )
     )
-    view = compile_model_regions(
-        model, CompileConfig(True, "eager", "default", False, False)
-    )
+    view = compile_model_regions(model, CompileConfig(True, "eager", "default", False, False))
     output = view(
         torch.randn(1, 3, 32, 32),
         torch.rand(1),
         torch.tensor([1]),
-        noisy_reg=torch.randn(1, model.num_reg_tokens, 8)
-        if reg_variant is not None
-        else None,
+        noisy_reg=torch.randn(1, model.num_reg_tokens, 8) if reg_variant is not None else None,
+        reg_timestep=torch.rand(1) if reg_variant is not None else None,
     )
     (output.image.sum() + (output.reg.sum() if output.reg is not None else 0)).backward()
     state = clean_state_dict(model)

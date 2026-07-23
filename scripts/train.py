@@ -32,9 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=Path("configs/canonical.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     reg = parser.add_mutually_exclusive_group()
-    reg.add_argument(
-        "--reg", action="store_true", help="enable standard DINOv3 REG and REPA"
-    )
+    reg.add_argument("--reg", action="store_true", help="enable standard DINOv3 REG and REPA")
     reg.add_argument(
         "--reg-widehead",
         action="store_true",
@@ -53,6 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-sampling-steps", type=int, default=50)
     parser.add_argument("--eval-guidance-scale", type=float, default=1.78)
     parser.add_argument("--eval-timestep-shift", type=float, default=1.0)
+    parser.add_argument("--eval-reg-timestep-shift", type=float)
     parser.add_argument("--eval-cfg-start", type=float, default=0.0)
     parser.add_argument("--eval-cfg-end", type=float, default=1.0)
     parser.add_argument("--eval-log-interval", type=int, default=10)
@@ -85,6 +84,7 @@ def main() -> None:
         sampling_steps=args.eval_sampling_steps,
         guidance_scale=args.eval_guidance_scale,
         timestep_shift=args.eval_timestep_shift,
+        reg_timestep_shift=args.eval_reg_timestep_shift,
         cfg_start=args.eval_cfg_start,
         cfg_end=args.eval_cfg_end,
         log_interval=args.eval_log_interval,
@@ -116,15 +116,11 @@ def main() -> None:
 
     ema = EMA(model, config.train.ema_decay)
     optimizer = build_optimizer(model, config.train.optimizer)
-    manager = CheckpointManager(
-        config.checkpoint.directory, config.checkpoint.keep_last_n
-    )
+    manager = CheckpointManager(config.checkpoint.directory, config.checkpoint.keep_last_n)
     state = TrainState()
     resume_run_id: str | None = None
     if args.resume:
-        resumed = manager.load(
-            args.resume.resolve(), model, ema, fingerprint, plan.plan_hash
-        )
+        resumed = manager.load(args.resume.resolve(), model, ema, fingerprint, plan.plan_hash)
         optimizer.load_state_dict(resumed.optimizer)
         streams.load_state_dict(resumed.rng_streams)
         state = TrainState(
@@ -141,9 +137,7 @@ def main() -> None:
             device_ids=[device.index] if device.type == "cuda" else None,
         )
     reg_encoder = (
-        DINOv3FeatureExtractor(config.model.reg).to(device)
-        if config.model.reg.enabled
-        else None
+        DINOv3FeatureExtractor(config.model.reg).to(device) if config.model.reg.enabled else None
     )
     loader, sampler = make_train_loader(dataset, config, streams)
     logged_config = config.as_dict()
@@ -153,25 +147,20 @@ def main() -> None:
         "sampling_steps": sampling.sampling_steps,
         "guidance_scale": sampling.guidance_scale,
         "timestep_shift": sampling.timestep_shift,
+        "reg_timestep_shift": sampling.reg_timestep_shift,
         "cfg_interval": [sampling.cfg_start, sampling.cfg_end],
         "log_interval": sampling.log_interval,
     }
     logged_config["provenance"] = {
-        "dataset_and_preprocessing": preprocessing_metadata(
-            config.data, config.model.image_size
-        ),
+        "dataset_and_preprocessing": preprocessing_metadata(config.data, config.model.image_size),
         "data_fingerprint": fingerprint,
         "validation_plan_hash": plan.plan_hash,
-        "reg_target": config.model.reg.model_name
-        if config.model.reg.enabled
-        else None,
+        "reg_target": config.model.reg.model_name if config.model.reg.enabled else None,
     }
     logged_config["model_parameters"] = {
         "total": sum(parameter.numel() for parameter in model.parameters()),
         "trainable": sum(
-            parameter.numel()
-            for parameter in model.parameters()
-            if parameter.requires_grad
+            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
         ),
     }
     logger = RunLogger(
@@ -189,9 +178,7 @@ def main() -> None:
         f"{logged_config['model_parameters']['total']:,}"
     )
     if args.resume:
-        logger.event(
-            f"resumed from {args.resume}: epoch={state.epoch}, step={state.global_step}"
-        )
+        logger.event(f"resumed from {args.resume}: epoch={state.epoch}, step={state.global_step}")
     output_root = Path(config.checkpoint.directory).parent / "validation"
 
     def validate_callback(epoch: int, final: bool) -> dict[str, float]:
@@ -219,9 +206,7 @@ def main() -> None:
     try:
         if config.validation.validate_now and state.epoch > 0:
             logger.event(f"forced validation started after epoch {state.epoch}")
-            forced_metrics = validate_callback(
-                state.epoch, state.epoch >= config.train.epochs
-            )
+            forced_metrics = validate_callback(state.epoch, state.epoch >= config.train.epochs)
             state.last_completed_validation_epoch = state.epoch
             config.validation.validate_now = False
             logger.log(forced_metrics, step=state.global_step)

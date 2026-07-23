@@ -80,9 +80,7 @@ def validate_ema(
             if config.model.reg.enabled
             else None
         )
-        with torch.autocast(
-            device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
-        ):
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             generated = euler_sample(
                 execution_model,
                 noise,
@@ -91,6 +89,7 @@ def validate_ema(
                 steps=sampling.sampling_steps,
                 guidance_scale=sampling.guidance_scale,
                 timestep_shift=sampling.timestep_shift,
+                reg_timestep_shift=sampling.reg_timestep_shift,
                 cfg_interval=(sampling.cfg_start, sampling.cfg_end),
                 num_classes=config.model.num_classes,
             )
@@ -109,12 +108,8 @@ def validate_ema(
         patch_size=config.model.patch_size,
         model_variant=config.model.model_variant,
         reg_enabled=config.model.reg.enabled,
-        reg_variant=config.model.reg.cls_predictor
-        if config.model.reg.enabled
-        else "disabled",
-        reg_token_mode=config.model.reg.token_mode
-        if config.model.reg.enabled
-        else "disabled",
+        reg_variant=config.model.reg.cls_predictor if config.model.reg.enabled else "disabled",
+        reg_token_mode=config.model.reg.token_mode if config.model.reg.enabled else "disabled",
         reg_pool_size=config.model.reg.pool_size,
         checkpoint_hash=digest,
         parameters=sampling,
@@ -137,9 +132,7 @@ def validate_ema(
         save_evaluation(output / "evaluation.json", raw, plan.plan_hash)
         suffix = "50K" if final else "5K"
         metrics[f"validation/FID-{suffix}"] = raw["FID"]
-        metrics["validation/images_per_second"] = count / max(
-            time.perf_counter() - started, 1e-9
-        )
+        metrics["validation/images_per_second"] = count / max(time.perf_counter() - started, 1e-9)
         metrics["validation/sampling_nfe"] = float(sampling.sampling_steps)
         metrics["validation/peak_memory_gib"] = (
             torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0

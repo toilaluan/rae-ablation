@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 import torch
@@ -26,10 +27,38 @@ def sample_timesteps(
     loc: float = 0.0,
     scale: float = 1.0,
 ) -> Tensor:
-    normal = torch.randn(
-        batch_size, generator=generator, device=device, dtype=torch.float32
-    )
+    normal = torch.randn(batch_size, generator=generator, device=device, dtype=torch.float32)
     return (loc + scale * normal).sigmoid()
+
+
+def sample_reg_timesteps(
+    image_timestep: Tensor,
+    generator: torch.Generator,
+    *,
+    min_relative_shift: float,
+    max_relative_shift: float,
+) -> tuple[Tensor, Tensor]:
+    """Sample per-example log-uniform REG shifts relative to image time."""
+    if image_timestep.ndim != 1:
+        raise ValueError("image timestep must have shape [B]")
+    if (
+        not math.isfinite(min_relative_shift)
+        or not math.isfinite(max_relative_shift)
+        or min_relative_shift <= 0
+        or max_relative_shift <= 0
+        or min_relative_shift > max_relative_shift
+    ):
+        raise ValueError("relative REG timestep shifts must be finite, positive, and ordered")
+    if min_relative_shift == max_relative_shift:
+        relative_shift = torch.full_like(image_timestep, min_relative_shift)
+    else:
+        log_shift = torch.empty_like(image_timestep).uniform_(
+            math.log(min_relative_shift),
+            math.log(max_relative_shift),
+            generator=generator,
+        )
+        relative_shift = log_shift.exp()
+    return shift_timestep(image_timestep, relative_shift), relative_shift
 
 
 def _expand(timestep: Tensor, like: Tensor) -> Tensor:
@@ -78,6 +107,7 @@ def jit_losses(
     clean_reg: Tensor | None = None,
     reg_noise: Tensor | None = None,
     reg_prediction: Tensor | None = None,
+    reg_timestep: Tensor | None = None,
     repa_prediction: Tensor | None = None,
     repa_target: Tensor | None = None,
     reg_weight: float = 0.03,
@@ -94,14 +124,17 @@ def jit_losses(
                 "clean REG tokens, REG noise, and REG prediction must be provided together"
             )
         assert clean_reg is not None and reg_noise is not None and reg_prediction is not None
+        resolved_reg_timestep = timestep if reg_timestep is None else reg_timestep
         reg_loss = clean_prediction_velocity_loss(
-            clean_reg, reg_noise, timestep, reg_prediction
+            clean_reg, reg_noise, resolved_reg_timestep, reg_prediction
         )
         reg_x0_mse = F.mse_loss(reg_prediction.float(), clean_reg.float())
         reg_x0_cosine = F.cosine_similarity(
             reg_prediction.float(), clean_reg.float(), dim=-1
         ).mean()
     else:
+        if reg_timestep is not None:
+            raise ValueError("REG timestep requires clean REG values and a REG prediction")
         reg_loss = zero
         reg_x0_mse = zero
         reg_x0_cosine = zero
@@ -122,5 +155,5 @@ def jit_losses(
     )
 
 
-def shift_timestep(u: Tensor, alpha: float) -> Tensor:
+def shift_timestep(u: Tensor, alpha: float | Tensor) -> Tensor:
     return alpha * u / (1 + (alpha - 1) * u)

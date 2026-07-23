@@ -52,9 +52,7 @@ def _tiny_model() -> SiT:
 
 
 def test_pinned_dataset_adapter_fingerprint_and_device_flip() -> None:
-    rows = [
-        {"image": Image.fromarray(np.full((8, 8, 3), 128, np.uint8)), "label": 7}
-    ]
+    rows = [{"image": Image.fromarray(np.full((8, 8, 3), 128, np.uint8)), "label": 7}]
     dataset = ImageNetDataset(rows, 16)
     image, label, index = dataset[0]
     assert image.shape == (3, 16, 16)
@@ -95,6 +93,7 @@ def test_validation_plan_noise_and_rng_stream_resume(tmp_path: Path) -> None:
     del legacy["reg_noise"]
     streams.load_state_dict(legacy)
     assert torch.equal(streams.reg_noise.get_state(), saved["reg_noise"])
+    assert torch.equal(streams.reg_timesteps.get_state(), saved["reg_timesteps"])
     state = torch.random.get_rng_state()
     with preserve_global_rng():
         torch.randn(100)
@@ -135,14 +134,10 @@ def test_checkpoint_resume_retention_best_and_no_scheduler(tmp_path: Path) -> No
     assert (tmp_path / "best-fid").resolve().name == "epoch-0003"
     weights = load_file(str(tmp_path / "epoch-0003" / "model.safetensors"))
     assert not any("_orig_mod" in key for key in weights)
-    training = torch.load(
-        tmp_path / "epoch-0003" / "training.pt", weights_only=False
-    )
+    training = torch.load(tmp_path / "epoch-0003" / "training.pt", weights_only=False)
     assert "scheduler" not in training and "data_fingerprint" in training
     restored = _tiny_model()
-    resumed = manager.load(
-        tmp_path / "epoch-0003", restored, EMA(restored), "data", "plan"
-    )
+    resumed = manager.load(tmp_path / "epoch-0003", restored, EMA(restored), "data", "plan")
     assert resumed.epoch == 3 and resumed.wandb_run_id == "run"
     with pytest.raises(ValueError, match="fingerprint"):
         manager.load(tmp_path / "epoch-0003", restored, EMA(restored), "other", "plan")
@@ -173,9 +168,7 @@ class _TinyTarget(nn.Module):
         ("wide_intermediate", "cls_spatial"),
     ],
 )
-def test_one_step_pixel_training_smoke(
-    tmp_path: Path, reg_variant: str, token_mode: str
-) -> None:
+def test_one_step_pixel_training_smoke(tmp_path: Path, reg_variant: str, token_mode: str) -> None:
     reg_enabled = reg_variant != "disabled"
     wide = reg_variant == "wide_intermediate"
     config = ExperimentConfig()

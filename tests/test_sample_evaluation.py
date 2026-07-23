@@ -90,13 +90,14 @@ def test_sample_archive_is_atomic_balanced_resumable_and_records_jit_metadata(
     with zipfile.ZipFile(archive) as values:
         assert values.getinfo("arr_0.npy").compress_type == zipfile.ZIP_STORED
     manifest = json.loads((tmp_path / "samples.json").read_text())
-    assert manifest["complete"] and manifest["schema_version"] == 6
+    assert manifest["complete"] and manifest["schema_version"] == 7
     assert manifest["patch_size"] == 32 and manifest["jit_grid_size"] == 8
     assert manifest["model_variant"] == "SiT-B/32" and not manifest["reg_enabled"]
     assert manifest["reg_variant"] == "disabled"
     assert manifest["reg_token_mode"] == "disabled"
     assert manifest["reg_pool_size"] == 4
     assert manifest["sampling"]["cfg_interval"] == [0.0, 1.0]
+    assert manifest["sampling"]["reg_timestep_shift"] is None
     preview = np.asarray(Image.open(tmp_path / "preview.png"))
     assert preview[0, [0, 256, 512, 768], 0].tolist() == [0, 1, 2, 3]
     assert not list(tmp_path.glob(".samples-*.npy"))
@@ -140,6 +141,35 @@ def test_sampling_resume_rejects_reg_variant_mismatch(tmp_path: Path) -> None:
             **{**token_common, "reg_token_mode": "cls_spatial"},
         )
 
+    shift_path = tmp_path / "reg-shift"
+    shift_common = {
+        **common,
+        "output_dir": shift_path,
+        "parameters": SamplingParameters(
+            batch_size=2,
+            sampling_steps=3,
+            timestep_shift=0.125,
+            reg_timestep_shift=0.5,
+        ),
+    }
+    sample_to_archive(reg_variant="standard", **shift_common)  # type: ignore[arg-type]
+    manifest = json.loads((shift_path / "samples.json").read_text())
+    assert manifest["sampling"]["timestep_shift"] == 0.125
+    assert manifest["sampling"]["reg_timestep_shift"] == 0.5
+    with pytest.raises(ValueError, match="does not match"):
+        sample_to_archive(
+            reg_variant="standard",
+            **{
+                **shift_common,
+                "parameters": SamplingParameters(
+                    batch_size=2,
+                    sampling_steps=3,
+                    timestep_shift=0.125,
+                    reg_timestep_shift=1.0,
+                ),
+            },
+        )
+
 
 @pytest.mark.parametrize("compressed", [False, True])
 def test_npz_reader_streams_stored_and_compressed(tmp_path: Path, compressed: bool) -> None:
@@ -166,14 +196,10 @@ class _TinyFeatures(nn.Module):
 
 
 def test_evaluate_npz_with_streamed_features(tmp_path: Path) -> None:
-    images = np.stack(
-        [np.full((256, 256, 3), value, dtype=np.uint8) for value in (1, 2, 3, 4)]
-    )
+    images = np.stack([np.full((256, 256, 3), value, dtype=np.uint8) for value in (1, 2, 3, 4)])
     samples = tmp_path / "samples.npz"
     np.savez_compressed(samples, images)
-    features = np.stack(
-        (np.array([1, 2, 3, 4]), np.array([1, 4, 9, 16])), axis=1
-    )
+    features = np.stack((np.array([1, 2, 3, 4]), np.array([1, 4, 9, 16])), axis=1)
     reference = tmp_path / "reference.npz"
     np.savez(reference, mu=features.mean(0), sigma=np.cov(features, rowvar=False))
     metrics = evaluate_npz(
@@ -200,7 +226,9 @@ def test_standalone_script_help(script: str) -> None:
     assert "usage:" in result.stdout
 
 
-def test_distribution_and_console_logger(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_distribution_and_console_logger(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     root = Path(__file__).resolve().parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text())
     assert project["project"]["name"] == "jit-reg"

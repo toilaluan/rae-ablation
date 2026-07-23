@@ -19,7 +19,50 @@ class SiTOutput(NamedTuple):
 
 
 def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    if shift.ndim == 2:
+        shift = shift.unsqueeze(1)
+        scale = scale.unsqueeze(1)
+    return x * (1 + scale) + shift
+
+
+def _gate(x: Tensor, gate: Tensor) -> Tensor:
+    return x * (gate.unsqueeze(1) if gate.ndim == 2 else gate)
+
+
+def _modulate_modalities(
+    x: Tensor,
+    image_shift: Tensor,
+    image_scale: Tensor,
+    patch_start: int,
+    reg_shift: Tensor | None = None,
+    reg_scale: Tensor | None = None,
+) -> Tensor:
+    if reg_shift is None or reg_scale is None:
+        return _modulate(x, image_shift, image_scale)
+    return torch.cat(
+        (
+            _modulate(x[:, :patch_start], reg_shift, reg_scale),
+            _modulate(x[:, patch_start:], image_shift, image_scale),
+        ),
+        dim=1,
+    )
+
+
+def _gate_modalities(
+    x: Tensor,
+    image_gate: Tensor,
+    patch_start: int,
+    reg_gate: Tensor | None = None,
+) -> Tensor:
+    if reg_gate is None:
+        return _gate(x, image_gate)
+    return torch.cat(
+        (
+            _gate(x[:, :patch_start], reg_gate),
+            _gate(x[:, patch_start:], image_gate),
+        ),
+        dim=1,
+    )
 
 
 def classifier_free_labels(
@@ -78,9 +121,11 @@ class Attention(nn.Module):
 
     def forward(self, x: Tensor, height: int, width: int, patch_start: int) -> Tensor:
         batch, tokens, _hidden = x.shape
-        qkv = self.qkv(x).reshape(
-            batch, tokens, 3, self.num_heads, self.head_dim
-        ).permute(2, 0, 3, 1, 4)
+        qkv = (
+            self.qkv(x)
+            .reshape(batch, tokens, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
         patch_q, patch_k = apply_2d_rope(
@@ -124,16 +169,46 @@ class SiTBlock(nn.Module):
         height: int,
         width: int,
         patch_start: int,
+        reg_conditioning: Tensor | None = None,
     ) -> Tensor:
-        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = self.modulation(
-            conditioning
-        ).chunk(6, dim=-1)
-        x = x + gate_a.unsqueeze(1) * self.attention(
-            _modulate(self.norm1(x), shift_a, scale_a), height, width, patch_start
+        image_parameters = self.modulation(conditioning).chunk(6, dim=-1)
+        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = image_parameters
+        reg_shift_a = reg_scale_a = reg_gate_a = None
+        reg_shift_m = reg_scale_m = reg_gate_m = None
+        if reg_conditioning is not None:
+            (
+                reg_shift_a,
+                reg_scale_a,
+                reg_gate_a,
+                reg_shift_m,
+                reg_scale_m,
+                reg_gate_m,
+            ) = self.modulation(reg_conditioning).chunk(6, dim=-1)
+        attended = self.attention(
+            _modulate_modalities(
+                self.norm1(x),
+                shift_a,
+                scale_a,
+                patch_start,
+                reg_shift_a,
+                reg_scale_a,
+            ),
+            height,
+            width,
+            patch_start,
         )
-        return x + gate_m.unsqueeze(1) * self.feed_forward(
-            _modulate(self.norm2(x), shift_m, scale_m)
+        x = x + _gate_modalities(attended, gate_a, patch_start, reg_gate_a)
+        fed_forward = self.feed_forward(
+            _modulate_modalities(
+                self.norm2(x),
+                shift_m,
+                scale_m,
+                patch_start,
+                reg_shift_m,
+                reg_scale_m,
+            )
         )
+        return x + _gate_modalities(fed_forward, gate_m, patch_start, reg_gate_m)
 
 
 class FinalLayer(nn.Module):
@@ -256,9 +331,7 @@ class SiT(nn.Module):
         patch_values = config.patch_size * config.patch_size * config.in_channels
         self.final_layer = FinalLayer(config.hidden_size, patch_values)
         if config.reg.enabled:
-            self.cls_input: nn.Linear | None = nn.Linear(
-                config.reg.feature_dim, config.hidden_size
-            )
+            self.cls_input: nn.Linear | None = nn.Linear(config.reg.feature_dim, config.hidden_size)
             if config.reg.token_mode == "cls_spatial":
                 self.reg_position_embedding = nn.Parameter(
                     torch.empty(1, config.reg.pool_size**2, config.hidden_size)
@@ -280,9 +353,7 @@ class SiT(nn.Module):
                     config.reg.cls_head_depth,
                     config.reg.cls_head_mlp_ratio,
                 )
-                self.cls_clean_projection = nn.Linear(
-                    config.reg.feature_dim, config.hidden_size
-                )
+                self.cls_clean_projection = nn.Linear(config.reg.feature_dim, config.hidden_size)
             self.repa_projection: REPAProjection | None = REPAProjection(
                 config.hidden_size,
                 config.reg.repa_hidden_size,
@@ -349,9 +420,7 @@ class SiT(nn.Module):
         batch = tokens.shape[0]
         patch = self.config.patch_size
         channels = self.config.in_channels
-        values = tokens.reshape(
-            batch, self.grid_size, self.grid_size, patch, patch, channels
-        )
+        values = tokens.reshape(batch, self.grid_size, self.grid_size, patch, patch, channels)
         return torch.einsum("bhwpqc->bchpwq", values).reshape(
             batch, channels, self.config.image_size, self.config.image_size
         )
@@ -359,9 +428,7 @@ class SiT(nn.Module):
     def _add_reg_positions(self, tokens: Tensor) -> Tensor:
         if self.reg_position_embedding is None:
             return tokens
-        return torch.cat(
-            (tokens[:, :1], tokens[:, 1:] + self.reg_position_embedding), dim=1
-        )
+        return torch.cat((tokens[:, :1], tokens[:, 1:] + self.reg_position_embedding), dim=1)
 
     def forward(
         self,
@@ -370,6 +437,8 @@ class SiT(nn.Module):
         labels: Tensor,
         noisy_reg: Tensor | None = None,
         return_repa: bool = False,
+        *,
+        reg_timestep: Tensor | None = None,
     ) -> SiTOutput:
         expected = (
             noisy_image.shape[0],
@@ -385,9 +454,13 @@ class SiT(nn.Module):
         batch = noisy_image.shape[0]
         if timestep.shape != (batch,) or labels.shape != (batch,):
             raise ValueError("timestep and labels must both have shape [B]")
+        if reg_timestep is not None and reg_timestep.shape != (batch,):
+            raise ValueError("reg_timestep must have shape [B]")
         if torch.any(labels < 0) or torch.any(labels > self.config.num_classes):
             raise ValueError("labels contain an invalid class index")
-        conditioning = self.timestep_embedding(timestep) + self.class_embedding(labels)
+        class_conditioning = self.class_embedding(labels)
+        conditioning = self.timestep_embedding(timestep) + class_conditioning
+        reg_conditioning: Tensor | None = None
         sequence = self.patch_projection(noisy_image).flatten(2).transpose(1, 2)
         patch_start = 0
         if self.config.reg.enabled:
@@ -405,8 +478,12 @@ class SiT(nn.Module):
             reg_tokens = self._add_reg_positions(self.cls_input(noisy_reg))
             sequence = torch.cat((reg_tokens, sequence), dim=1)
             patch_start = self.num_reg_tokens
+            if reg_timestep is not None:
+                reg_conditioning = self.timestep_embedding(reg_timestep) + class_conditioning
         elif noisy_reg is not None:
             raise ValueError("noisy_reg is only valid when model.reg.enabled is true")
+        elif reg_timestep is not None:
+            raise ValueError("reg_timestep is only valid when model.reg.enabled is true")
 
         reg: Tensor | None = None
         repa: Tensor | None = None
@@ -419,6 +496,7 @@ class SiT(nn.Module):
                     self.grid_size,
                     self.grid_size,
                     patch_start,
+                    reg_conditioning,
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
@@ -429,6 +507,7 @@ class SiT(nn.Module):
                     self.grid_size,
                     self.grid_size,
                     patch_start,
+                    reg_conditioning,
                 )
             if (
                 return_repa
@@ -436,10 +515,7 @@ class SiT(nn.Module):
                 and index == self.config.reg.repa_block
             ):
                 repa = self.repa_projection(sequence[:, patch_start:])
-            if (
-                self.cls_predictor is not None
-                and index == self.config.reg.cls_head_block
-            ):
+            if self.cls_predictor is not None and index == self.config.reg.cls_head_block:
                 if self._checkpointing():
                     predicted = checkpoint(
                         self.cls_predictor,
@@ -450,7 +526,8 @@ class SiT(nn.Module):
                     )
                 else:
                     predicted = self.cls_predictor(
-                        sequence[:, :patch_start], conditioning
+                        sequence[:, :patch_start],
+                        conditioning if reg_conditioning is None else reg_conditioning,
                     )
                 reg = predicted
                 assert self.cls_clean_projection is not None
@@ -461,5 +538,8 @@ class SiT(nn.Module):
         image = self._unpatchify(self.final_layer(patch_tokens, conditioning))
         if patch_start and self.cls_predictor is None:
             assert self.cls_final_layer is not None
-            reg = self.cls_final_layer(sequence[:, :patch_start], conditioning)
+            reg = self.cls_final_layer(
+                sequence[:, :patch_start],
+                conditioning if reg_conditioning is None else reg_conditioning,
+            )
         return SiTOutput(image=image, reg=reg, repa=repa)

@@ -12,6 +12,7 @@ from jit_reg.model.sit import SiTOutput, classifier_free_labels
 from jit_reg.objective import (
     jit_losses,
     noisy_interpolate,
+    sample_reg_timesteps,
     sample_timesteps,
     shift_timestep,
 )
@@ -39,9 +40,7 @@ def test_structured_config_and_unknown_key() -> None:
     ("image_size", "patch_size", "message"),
     [(256, 0, "positive"), (255, 32, "divisible")],
 )
-def test_patch_configuration_rejection(
-    image_size: int, patch_size: int, message: str
-) -> None:
+def test_patch_configuration_rejection(image_size: int, patch_size: int, message: str) -> None:
     config = ExperimentConfig()
     config.model.image_size = image_size
     config.model.patch_size = patch_size
@@ -90,14 +89,55 @@ def test_reg_token_mode_and_pool_size_rejection() -> None:
 
 
 def test_logit_normal_timesteps_are_bounded_and_deterministic() -> None:
-    first = sample_timesteps(
-        4, torch.Generator().manual_seed(7), "cpu", loc=-0.25, scale=1.5
-    )
-    second = sample_timesteps(
-        4, torch.Generator().manual_seed(7), "cpu", loc=-0.25, scale=1.5
-    )
+    first = sample_timesteps(4, torch.Generator().manual_seed(7), "cpu", loc=-0.25, scale=1.5)
+    second = sample_timesteps(4, torch.Generator().manual_seed(7), "cpu", loc=-0.25, scale=1.5)
     assert torch.equal(first, second)
     assert torch.all((first > 0) & (first < 1))
+
+
+def test_log_uniform_reg_timesteps_are_bounded_deterministic_and_relative() -> None:
+    image = torch.tensor([0.1, 0.3, 0.6, 0.9])
+    first, first_shift = sample_reg_timesteps(
+        image,
+        torch.Generator().manual_seed(8),
+        min_relative_shift=0.5,
+        max_relative_shift=8.0,
+    )
+    second, second_shift = sample_reg_timesteps(
+        image,
+        torch.Generator().manual_seed(8),
+        min_relative_shift=0.5,
+        max_relative_shift=8.0,
+    )
+    assert torch.equal(first, second)
+    assert torch.equal(first_shift, second_shift)
+    assert torch.all((first_shift >= 0.5) & (first_shift <= 8.0))
+    recovered = first * (1 - image) / (image * (1 - first))
+    torch.testing.assert_close(recovered, first_shift)
+
+    generator = torch.Generator().manual_seed(9)
+    state = generator.get_state()
+    equal, shifts = sample_reg_timesteps(
+        image,
+        generator,
+        min_relative_shift=1.0,
+        max_relative_shift=1.0,
+    )
+    assert torch.equal(generator.get_state(), state)
+    assert torch.equal(equal, image)
+    assert torch.equal(shifts, torch.ones_like(image))
+
+
+@pytest.mark.parametrize(
+    ("minimum", "maximum"),
+    [(0.0, 1.0), (1.0, 0.5), (1.0, math.inf)],
+)
+def test_reg_timestep_shift_range_rejection(minimum: float, maximum: float) -> None:
+    config = ExperimentConfig()
+    config.train.reg_relative_timestep_shift_min = minimum
+    config.train.reg_relative_timestep_shift_max = maximum
+    with pytest.raises(ValueError, match="relative timestep shifts"):
+        config.validate()
 
 
 @pytest.mark.parametrize("timestep", [torch.tensor([0.2, 0.8]), torch.tensor([0.96, 0.99])])
@@ -138,6 +178,25 @@ def test_reg_weighted_loss_composition() -> None:
     assert losses.total.item() == pytest.approx(-0.5)
 
 
+def test_reg_velocity_loss_uses_its_own_timestep() -> None:
+    clean = torch.zeros(1, 1, 1, 1)
+    clean_reg = torch.zeros(1, 1, 1)
+    losses = jit_losses(
+        clean,
+        torch.ones_like(clean),
+        torch.tensor([0.5]),
+        clean,
+        clean_reg=clean_reg,
+        reg_noise=torch.ones_like(clean_reg),
+        reg_prediction=torch.ones_like(clean_reg),
+        reg_timestep=torch.tensor([0.75]),
+        reg_weight=1,
+    )
+    assert losses.image_velocity.item() == pytest.approx(0)
+    assert losses.reg_velocity.item() == pytest.approx(16)
+    assert losses.total.item() == pytest.approx(16)
+
+
 def test_reg_x0_diagnostics_are_unweighted() -> None:
     clean = torch.zeros(1, 1, 1, 1)
     noise = torch.ones_like(clean)
@@ -160,12 +219,8 @@ def test_reg_x0_diagnostics_are_unweighted() -> None:
 
 def test_label_dropout_uses_null_class_and_explicit_rng() -> None:
     labels = torch.arange(100)
-    first = classifier_free_labels(
-        labels, 100, 0.1, torch.Generator().manual_seed(4)
-    )
-    second = classifier_free_labels(
-        labels, 100, 0.1, torch.Generator().manual_seed(4)
-    )
+    first = classifier_free_labels(labels, 100, 0.1, torch.Generator().manual_seed(4))
+    second = classifier_free_labels(labels, 100, 0.1, torch.Generator().manual_seed(4))
     assert torch.equal(first, second)
     assert torch.any(first == 100)
     assert torch.all((first == labels) | (first == 100))
@@ -183,9 +238,10 @@ class _CFGModel(nn.Module):
         _timestep: torch.Tensor,
         labels: torch.Tensor,
         noisy_reg: torch.Tensor | None = None,
+        reg_timestep: torch.Tensor | None = None,
         return_repa: bool = False,
     ) -> SiTOutput:
-        del return_repa
+        del reg_timestep, return_repa
         conditional = (labels < self.config.num_classes).to(image.dtype)
         image_value = (2 * conditional).view(-1, 1, 1, 1).expand_as(image)
         reg = None
@@ -227,6 +283,62 @@ def test_euler_cfg_scale_interval_boundaries_and_joint_reg_state() -> None:
     assert isinstance(reg, EulerSample)
     assert torch.equal(reg.image, torch.full_like(noise, 2))
     assert torch.equal(reg.reg, torch.full((1, 2, 4), 3.0))
+
+
+class _RecordingTimeModel(_CFGModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.times: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        timestep: torch.Tensor,
+        labels: torch.Tensor,
+        noisy_reg: torch.Tensor | None = None,
+        reg_timestep: torch.Tensor | None = None,
+        return_repa: bool = False,
+    ) -> SiTOutput:
+        assert reg_timestep is not None
+        self.times.append((timestep.detach().clone(), reg_timestep.detach().clone()))
+        return super().forward(
+            image,
+            timestep,
+            labels,
+            noisy_reg=noisy_reg,
+            reg_timestep=reg_timestep,
+            return_repa=return_repa,
+        )
+
+
+def test_euler_uses_distinct_image_and_reg_schedules() -> None:
+    model = _RecordingTimeModel()
+    result = euler_sample(
+        model,
+        torch.zeros(1, 1, 1, 1),
+        torch.tensor([2]),
+        reg_noise=torch.zeros(1, 1, 1),
+        steps=2,
+        guidance_scale=1,
+        timestep_shift=0.125,
+        reg_timestep_shift=0.5,
+    )
+    assert isinstance(result, EulerSample)
+    assert len(model.times) == 2
+    assert torch.equal(model.times[0][0], torch.zeros(2))
+    assert torch.equal(model.times[0][1], torch.zeros(2))
+    torch.testing.assert_close(model.times[1][0], torch.full((2,), 1 / 9))
+    torch.testing.assert_close(model.times[1][1], torch.full((2,), 1 / 3))
+    assert torch.equal(result.image, torch.full_like(result.image, 2))
+    assert torch.equal(result.reg, torch.full_like(result.reg, 3))
+
+    with pytest.raises(ValueError, match="requires REG noise"):
+        euler_sample(
+            model,
+            torch.zeros(1, 1, 1, 1),
+            torch.tensor([2]),
+            reg_timestep_shift=0.5,
+        )
 
 
 @pytest.mark.parametrize(

@@ -92,7 +92,15 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
 Change patch size with a structured override, for example
 `--override model.patch_size=16`. The canonical recipe is 80 epochs, global batch 1024, Muon,
 learning rate `2e-4` for 25 epochs followed by a 25-epoch linear decay to `2e-5`, EMA `0.9995`,
-10% classifier-free label dropout, and logit-normal timesteps with location 0 and scale 1.
+10% classifier-free label dropout, and logit-normal image timesteps with location `-0.8` and
+scale `0.8`.
+
+REG training uses an explicit second timestep. Each example draws a log-uniform relative REG
+shift from `train.reg_relative_timestep_shift_min=0.5` through
+`train.reg_relative_timestep_shift_max=8.0`, then applies that shift to the sampled image
+timestep. The transformer shares timestep and modulation weights between modalities but evaluates
+them separately, so REG and patch tokens receive their own adaLN conditioning. Set both bounds to
+`1.0` to reproduce equal-time REG training.
 
 Images are randomly flipped on the training device through a checkpointed RNG stream. The same
 flipped `[0,1]` image is normalized for DINOv3 in REG runs and scaled to `[-1,1]` for JiT.
@@ -143,8 +151,10 @@ objective weights.
 Sampling uses 50-step Euler integration and batched conditional/null-label CFG. Scale `1` selects
 the conditional prediction. CFG defaults to the full trajectory and can be restricted with
 `--cfg-start` and `--cfg-end`. REG sampling deterministically initializes and jointly integrates
-the image and complete configured REG state. Sampling `cls_spatial` checkpoints requires the same
-`model.reg.token_mode` and `model.reg.pool_size` overrides used for training.
+the image and complete configured REG state with separate Euler timesteps. `--timestep-shift`
+controls the absolute image schedule; `--reg-timestep-shift` controls the absolute REG schedule
+and defaults to the image value when omitted. Sampling `cls_spatial` checkpoints requires the
+same `model.reg.token_mode` and `model.reg.pool_size` overrides used for training.
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
@@ -163,10 +173,17 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
 uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
   --config configs/canonical.yaml \
   --reg-widehead \
+  --timestep-shift 0.125 \
+  --reg-timestep-shift 0.5 \
   --checkpoint runs/reg-widehead-p32/checkpoints/last/ema-export.safetensors \
   --plan runs/reg-widehead-p32/validation-plan.pt \
   --output-dir generated/reg-widehead-p32
 ```
+
+With image shift `0.125`, REG shifts `{0.0625, 0.125, 0.25, 0.5, 1.0}` correspond to relative
+rates `{0.5×, 1×, 2×, 4×, 8×}` covered by the canonical training range. Online validation exposes
+the same controls as `--eval-timestep-shift` and `--eval-reg-timestep-shift`. Sampling beyond the
+trained relative range is extrapolation.
 
 Generation is rank-partitioned and resumable. It writes an ADM-compatible `samples.npz`, a
 preview, and a manifest containing image size, patch size, JiT grid, model variant, REG status,

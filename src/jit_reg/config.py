@@ -97,6 +97,8 @@ class TrainConfig:
     seed: int = 0
     timestep_loc: float = 0.0
     timestep_scale: float = 1.0
+    reg_relative_timestep_shift_min: float = 0.5
+    reg_relative_timestep_shift_max: float = 8.0
     horizontal_flip_probability: float = 0.5
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
@@ -153,23 +155,24 @@ class ExperimentConfig:
         if m.hidden_size % m.num_heads:
             raise ValueError("model.hidden_size must be divisible by model.num_heads")
         if (m.hidden_size // m.num_heads) % 4:
-            raise ValueError(
-                "model attention head dimension must be divisible by 4 for 2D RoPE"
-            )
+            raise ValueError("model attention head dimension must be divisible by 4 for 2D RoPE")
         if not 0 <= m.class_dropout_prob < 1:
             raise ValueError("model.class_dropout_prob must be in [0, 1)")
         if not m.variant:
             raise ValueError("model.variant cannot be empty")
         reg = m.reg
-        if min(
-            reg.feature_dim,
-            reg.register_tokens,
-            reg.pool_size,
-            reg.repa_block,
-            reg.repa_hidden_size,
-            reg.cls_head_hidden_size,
-            reg.cls_head_depth,
-        ) < 1:
+        if (
+            min(
+                reg.feature_dim,
+                reg.register_tokens,
+                reg.pool_size,
+                reg.repa_block,
+                reg.repa_hidden_size,
+                reg.cls_head_hidden_size,
+                reg.cls_head_depth,
+            )
+            < 1
+        ):
             raise ValueError("model.reg dimensions must be positive")
         if reg.token_mode not in {"cls", "cls_spatial"}:
             raise ValueError("model.reg.token_mode must be cls or cls_spatial")
@@ -180,9 +183,7 @@ class ExperimentConfig:
         if reg.cls_head_mlp_ratio <= 0:
             raise ValueError("model.reg.cls_head_mlp_ratio must be positive")
         if reg.cls_predictor not in {"standard", "wide_intermediate"}:
-            raise ValueError(
-                "model.reg.cls_predictor must be standard or wide_intermediate"
-            )
+            raise ValueError("model.reg.cls_predictor must be standard or wide_intermediate")
         if reg.enabled and reg.repa_block > m.depth:
             raise ValueError("model.reg.repa_block must be within model.depth")
         if reg.cls_predictor == "wide_intermediate":
@@ -229,6 +230,19 @@ class ExperimentConfig:
             raise ValueError("train.timestep_loc must be finite")
         if not math.isfinite(self.train.timestep_scale) or self.train.timestep_scale <= 0:
             raise ValueError("train.timestep_scale must be finite and positive")
+        reg_shift_min = self.train.reg_relative_timestep_shift_min
+        reg_shift_max = self.train.reg_relative_timestep_shift_max
+        if (
+            not math.isfinite(reg_shift_min)
+            or not math.isfinite(reg_shift_max)
+            or reg_shift_min <= 0
+            or reg_shift_max <= 0
+            or reg_shift_min > reg_shift_max
+        ):
+            raise ValueError(
+                "train REG relative timestep shifts must be finite, positive, "
+                "and ordered min <= max"
+            )
         if not 0 <= self.train.horizontal_flip_probability <= 1:
             raise ValueError("train.horizontal_flip_probability must be in [0, 1]")
         if self.checkpoint.keep_last_n < 0:
