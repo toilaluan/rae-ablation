@@ -185,6 +185,47 @@ def test_sampling_resume_rejects_reg_variant_mismatch(tmp_path: Path) -> None:
     )
 
 
+def test_standard_sampling_ignores_wide_only_metadata(tmp_path: Path) -> None:
+    def generate(
+        positions: torch.Tensor, _labels: torch.Tensor, _seeds: torch.Tensor
+    ) -> torch.Tensor:
+        return _generated(positions)
+
+    sample_to_archive(
+        output_dir=tmp_path,
+        plan=create_validation_plan(4, 2, 2, seed=3),
+        sample_count=4,
+        num_classes=2,
+        image_size=256,
+        patch_size=32,
+        model_variant="SiT-B/32",
+        reg_enabled=True,
+        reg_variant="standard",
+        repa_enabled=False,
+        reg_token_mode="cls",
+        reg_pool_size=4,
+        reg_x0_conditioning=True,
+        reg_continuation_tokens=0,
+        reg_patch_reprojection_enabled=True,
+        reg_patch_reprojection_source="unknown",
+        reg_patch_reprojection_intermediate_size=0,
+        reg_patch_reprojection_include_timestep=True,
+        checkpoint_hash="abc",
+        parameters=SamplingParameters(batch_size=2, sampling_steps=3),
+        generate_batch=generate,
+    )
+
+    manifest = json.loads((tmp_path / "samples.json").read_text())
+    assert not manifest["reg_x0_conditioning"]
+    assert manifest["reg_continuation_tokens"] is None
+    assert manifest["reg_patch_reprojection"] == {
+        "enabled": False,
+        "source": None,
+        "intermediate_size": None,
+        "include_timestep": None,
+    }
+
+
 @pytest.mark.parametrize("compressed", [False, True])
 def test_npz_reader_streams_stored_and_compressed(tmp_path: Path, compressed: bool) -> None:
     images = np.arange(3 * 256 * 256 * 3, dtype=np.uint8).reshape(3, 256, 256, 3)

@@ -98,6 +98,7 @@ def validate_ema(
     digest = state_dict_sha256(ema.state_dict()) if rank == 0 else None
     digest = broadcast_string(digest, rank)
     started = time.perf_counter()
+    wide_extensions_active = config.model.reg.wide_extensions_active
     archive = sample_to_archive(
         output_dir=output,
         plan=plan,
@@ -112,14 +113,14 @@ def validate_ema(
         reg_token_mode=config.model.reg.token_mode if config.model.reg.enabled else "disabled",
         reg_pool_size=config.model.reg.pool_size,
         reg_x0_conditioning=(
-            config.model.reg.x0_conditioning if config.model.reg.enabled else False
+            config.model.reg.x0_conditioning if wide_extensions_active else False
         ),
         reg_continuation_tokens=(
-            config.model.reg.continuation_tokens if config.model.reg.enabled else None
+            config.model.reg.continuation_tokens if wide_extensions_active else None
         ),
         reg_patch_reprojection_enabled=(
             config.model.reg.patch_reprojection.enabled
-            if config.model.reg.enabled
+            if wide_extensions_active
             else False
         ),
         reg_patch_reprojection_source=config.model.reg.patch_reprojection.source,

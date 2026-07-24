@@ -378,6 +378,10 @@ def sample_to_archive(
         raise ValueError("REG variant must be disabled, standard, or wide_intermediate")
     if reg_enabled != (reg_variant != "disabled"):
         raise ValueError("REG enabled status and variant do not agree")
+    if reg_variant != "wide_intermediate":
+        reg_x0_conditioning = False
+        reg_continuation_tokens = None
+        reg_patch_reprojection_enabled = False
     expected_token_modes = {"disabled", "cls", "cls_spatial"}
     if reg_token_mode not in expected_token_modes:
         raise ValueError("REG token mode must be disabled, cls, or cls_spatial")
@@ -385,18 +389,13 @@ def sample_to_archive(
         raise ValueError("REG enabled status and token mode do not agree")
     if repa_enabled and not reg_enabled:
         raise ValueError("REPA cannot be enabled without REG")
-    if reg_x0_conditioning and reg_variant != "wide_intermediate":
-        raise ValueError("REG x0 conditioning requires wide_intermediate")
-    if reg_continuation_tokens is not None and (
-        reg_variant != "wide_intermediate" or reg_continuation_tokens < 1
-    ):
-        raise ValueError("REG continuation tokens require wide_intermediate and a positive count")
-    if reg_patch_reprojection_enabled and reg_variant != "wide_intermediate":
-        raise ValueError("REG patch reprojection requires wide_intermediate")
-    if reg_patch_reprojection_source not in {"x0_cls", "wide_cls"}:
-        raise ValueError("unknown REG patch-reprojection source")
-    if reg_patch_reprojection_intermediate_size < 1:
-        raise ValueError("REG patch-reprojection intermediate size must be positive")
+    if reg_variant == "wide_intermediate":
+        if reg_continuation_tokens is not None and reg_continuation_tokens < 1:
+            raise ValueError("REG continuation token count must be positive")
+        if reg_patch_reprojection_source not in {"x0_cls", "wide_cls"}:
+            raise ValueError("unknown REG patch-reprojection source")
+        if reg_patch_reprojection_intermediate_size < 1:
+            raise ValueError("REG patch-reprojection intermediate size must be positive")
     if not 1 <= reg_pool_size <= 16:
         raise ValueError("REG pool size must be within the native 16x16 feature grid")
     labels, sample_ids, noise_seeds = validate_sampling_plan(plan, sample_count, num_classes)

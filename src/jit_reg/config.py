@@ -47,6 +47,14 @@ class REGConfig:
             return 1 + self.pool_size**2
         raise ValueError(f"unknown REG token mode: {self.token_mode}")
 
+    @property
+    def wide_extensions_active(self) -> bool:
+        return (
+            self.enabled
+            and self.cls_predictor == "wide_intermediate"
+            and self.cls_head_block != -1
+        )
+
 
 @dataclass
 class ModelConfig:

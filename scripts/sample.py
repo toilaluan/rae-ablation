@@ -102,6 +102,7 @@ def main() -> None:
         image = generated.image if isinstance(generated, EulerSample) else generated
         return image.float().add(1).div(2)
 
+    wide_extensions_active = config.model.reg.wide_extensions_active
     sample_to_archive(
         output_dir=bundle.directory / sampling_output_name(args.num_samples, parameters),
         plan=plan,
@@ -116,14 +117,14 @@ def main() -> None:
         reg_token_mode=config.model.reg.token_mode if config.model.reg.enabled else "disabled",
         reg_pool_size=config.model.reg.pool_size,
         reg_x0_conditioning=(
-            config.model.reg.x0_conditioning if config.model.reg.enabled else False
+            config.model.reg.x0_conditioning if wide_extensions_active else False
         ),
         reg_continuation_tokens=(
-            config.model.reg.continuation_tokens if config.model.reg.enabled else None
+            config.model.reg.continuation_tokens if wide_extensions_active else None
         ),
         reg_patch_reprojection_enabled=(
             config.model.reg.patch_reprojection.enabled
-            if config.model.reg.enabled
+            if wide_extensions_active
             else False
         ),
         reg_patch_reprojection_source=config.model.reg.patch_reprojection.source,
