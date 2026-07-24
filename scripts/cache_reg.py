@@ -62,7 +62,7 @@ def main() -> None:
             subset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=config.data.workers,
+            num_workers=2,
             pin_memory=torch.cuda.is_available(),
             persistent_workers=config.data.workers > 0,
             prefetch_factor=config.data.prefetch_factor if config.data.workers > 0 else None,

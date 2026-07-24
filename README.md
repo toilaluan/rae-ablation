@@ -263,9 +263,9 @@ same immutable labels, sample IDs, and noise seeds as standalone sampling. To ev
 
 ```bash
 uv run python scripts/eval.py \
-  --samples runs/baseline-p32/checkpoints/last/samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-1p0/samples.npz \
   --reference data/VIRTUAL_imagenet256_labeled.npz \
-  --output runs/baseline-p32/evaluation.json
+  --output runs/baseline-p32/evaluation.json \
+  --samples runs/baseline-p32/checkpoints/last/samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-1p0/samples.npz
 
 uv run python scripts/eval.py \
   --samples runs/reg-p32/checkpoints/last/samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-1p0/samples.npz \
