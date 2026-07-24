@@ -44,7 +44,8 @@ uv run ruff check .
 ```
 
 The ImageNet repository and revision are pinned in `configs/canonical.yaml`. Training reads it
-directly through Hugging Face Datasets; there is no feature-cache preparation step.
+directly through Hugging Face Datasets and extracts DINO targets online by default; an optional
+target-cache workflow is documented below.
 
 Download the ImageNet-256 ADM reference statistics once:
 
@@ -159,9 +160,10 @@ flipped `[0,1]` image is normalized for DINOv3 in REG runs and scaled to `[-1,1]
 
 ## Cache REG targets
 
-REPA-disabled runs can read precomputed REG targets and avoid loading DINOv3 during training. The
-cache stores BF16 CLS tokens for `token_mode=cls`, or CLS plus only the configured pooled tokens
-for `token_mode=cls_spatial`. Native 16×16 patch features and REPA targets are never saved.
+REG runs can read precomputed targets and avoid loading DINOv3 during training. The cache stores
+BF16 CLS tokens for `token_mode=cls`, or CLS plus only the configured pooled tokens for
+`token_mode=cls_spatial`. When REPA is enabled, it also stores normalized BF16 patch targets
+resized to the configured JiT grid; the native 16×16 DINO patch map is not saved.
 
 Cached runs deliberately disable horizontal flipping, so use the same zero flip probability when
 building and training:
@@ -174,7 +176,7 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/cache_reg.py \
 
 uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --config configs/canonical.yaml \
-  --reg --no-repa \
+  --reg \
   --override reg_cache.enabled=true \
   --override train.horizontal_flip_probability=0 \
   --output runs/reg-cached-p32 \
@@ -182,10 +184,30 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --wandb
 ```
 
-Use matching `model.reg.token_mode` and `model.reg.pool_size` overrides in both commands. Caches
-live under `data/reg-tokens/<fingerprint>/`, are resumable under `torchrun`, and are rejected when
-their dataset, DINO model, token configuration, environment, shape, or completion state differs.
-REPA-enabled runs continue to extract DINO features online because REPA requires spatial targets.
+For a smaller REG-only cache, disable REPA in both commands:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/cache_reg.py \
+  --config configs/canonical.yaml \
+  --override model.reg.repa_enabled=false \
+  --override train.horizontal_flip_probability=0
+
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/canonical.yaml \
+  --reg --no-repa \
+  --override reg_cache.enabled=true \
+  --override train.horizontal_flip_probability=0 \
+  --output runs/reg-no-repa-cached-p32 \
+  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
+  --wandb
+```
+
+Use matching `model.patch_size`, `model.reg.repa_enabled`, `model.reg.token_mode`, and
+`model.reg.pool_size` overrides in both commands. Caches live under
+`data/reg-tokens/<fingerprint>/`, are resumable under `torchrun`, and are rejected when their
+dataset, DINO model, target-grid/token configuration, environment, shape, or completion state
+differs. REPA storage scales quadratically with the JiT grid: the canonical 8×8 BF16 targets use
+about 126 GB for 1.28 million images. Schema-v1 REG-only caches must be rebuilt.
 
 Resume standard REG with the same model overrides and REG variant:
 

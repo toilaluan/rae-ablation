@@ -269,7 +269,7 @@ class ExperimentConfig:
             raise ValueError("train.timestep_scale must be finite and positive")
         if not 0 <= self.train.horizontal_flip_probability <= 1:
             raise ValueError("train.horizontal_flip_probability must be in [0, 1]")
-        cache_active = self.reg_cache.enabled and reg.enabled and not reg.repa_enabled
+        cache_active = self.reg_cache.enabled and reg.enabled
         if cache_active and self.train.horizontal_flip_probability != 0:
             raise ValueError(
                 "cached REG training requires train.horizontal_flip_probability=0"

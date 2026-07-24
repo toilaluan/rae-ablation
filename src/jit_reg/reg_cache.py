@@ -15,9 +15,11 @@ import torch
 from torch import Tensor
 
 from .config import ExperimentConfig
+from .reg import REGTargets
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 TOKEN_FILE = "tokens.bf16"
+REPA_FILE = "repa.bf16"
 COMPLETION_FILE = "completion.u8"
 MANIFEST_FILE = "manifest.json"
 
@@ -56,6 +58,12 @@ def cache_spec(config: ExperimentConfig, dataset_size: int) -> dict[str, Any]:
             "pool_size": reg.pool_size if reg.token_mode == "cls_spatial" else None,
             "num_tokens": reg.num_tokens,
             "dtype": "bfloat16",
+            "repa": {
+                "enabled": reg.repa_enabled,
+                "grid_size": config.model.grid_size if reg.repa_enabled else None,
+                "num_tokens": config.model.grid_size**2 if reg.repa_enabled else None,
+                "dtype": "bfloat16" if reg.repa_enabled else None,
+            },
         },
         "environment": {
             "timm": importlib.metadata.version("timm"),
@@ -74,7 +82,7 @@ def cache_path(config: ExperimentConfig, dataset_size: int) -> Path:
     return Path(config.reg_cache.directory) / cache_fingerprint(spec)
 
 
-def _shape(spec: dict[str, Any]) -> tuple[int, int, int]:
+def _token_shape(spec: dict[str, Any]) -> tuple[int, int, int]:
     dataset = spec["dataset"]
     target = spec["target"]
     return (
@@ -84,13 +92,29 @@ def _shape(spec: dict[str, Any]) -> tuple[int, int, int]:
     )
 
 
+def _repa_shape(spec: dict[str, Any]) -> tuple[int, int, int] | None:
+    dataset = spec["dataset"]
+    target = spec["target"]
+    repa = target["repa"]
+    if not repa["enabled"]:
+        return None
+    return (
+        int(dataset["dataset_size"]),
+        int(repa["num_tokens"]),
+        int(target["feature_dim"]),
+    )
+
+
 def _manifest(spec: dict[str, Any], *, complete: bool) -> dict[str, Any]:
+    repa_shape = _repa_shape(spec)
     return {
         "fingerprint": cache_fingerprint(spec),
         "complete": complete,
         "spec": spec,
-        "shape": list(_shape(spec)),
+        "shape": list(_token_shape(spec)),
         "token_file": TOKEN_FILE,
+        "repa_shape": list(repa_shape) if repa_shape is not None else None,
+        "repa_file": REPA_FILE if repa_shape is not None else None,
         "completion_file": COMPLETION_FILE,
     }
 
@@ -117,15 +141,26 @@ def _validate_manifest(
         raise ValueError(f"REG cache manifest is incompatible: {directory}")
     if require_complete and not manifest["complete"]:
         raise ValueError(f"REG cache is incomplete: {directory}")
-    shape = _shape(expected_spec)
-    expected_token_bytes = int(np.prod(shape, dtype=np.int64)) * 2
+    token_shape = _token_shape(expected_spec)
+    expected_token_bytes = int(np.prod(token_shape, dtype=np.int64)) * 2
     token_path = directory / TOKEN_FILE
     completion_path = directory / COMPLETION_FILE
     if not token_path.is_file() or token_path.stat().st_size != expected_token_bytes:
         raise ValueError(f"REG cache token file has the wrong size: {token_path}")
-    if not completion_path.is_file() or completion_path.stat().st_size != shape[0]:
+    repa_shape = _repa_shape(expected_spec)
+    if repa_shape is not None:
+        expected_repa_bytes = int(np.prod(repa_shape, dtype=np.int64)) * 2
+        repa_path = directory / REPA_FILE
+        if not repa_path.is_file() or repa_path.stat().st_size != expected_repa_bytes:
+            raise ValueError(f"REG cache REPA file has the wrong size: {repa_path}")
+    if not completion_path.is_file() or completion_path.stat().st_size != token_shape[0]:
         raise ValueError(f"REG cache completion file has the wrong size: {completion_path}")
-    completion = np.memmap(completion_path, mode="r", dtype=np.uint8, shape=(shape[0],))
+    completion = np.memmap(
+        completion_path,
+        mode="r",
+        dtype=np.uint8,
+        shape=(token_shape[0],),
+    )
     if require_complete and np.any(completion != 1):
         raise ValueError(f"REG cache completion bitmap is incomplete: {directory}")
     return manifest
@@ -151,13 +186,24 @@ class REGTokenCacheWriter:
     def __init__(self, directory: str | Path, spec: dict[str, Any]) -> None:
         self.directory = Path(directory)
         self.spec = spec
-        self.shape = _shape(spec)
+        self.shape = _token_shape(spec)
+        self.repa_shape = _repa_shape(spec)
         _validate_manifest(self.directory, spec, require_complete=False)
         self.tokens = np.memmap(
             self.directory / TOKEN_FILE,
             mode="r+",
             dtype=np.uint16,
             shape=self.shape,
+        )
+        self.repa = (
+            np.memmap(
+                self.directory / REPA_FILE,
+                mode="r+",
+                dtype=np.uint16,
+                shape=self.repa_shape,
+            )
+            if self.repa_shape is not None
+            else None
         )
         self.completion = np.memmap(
             self.directory / COMPLETION_FILE,
@@ -174,12 +220,23 @@ class REGTokenCacheWriter:
         if manifest_path.exists():
             manifest = _validate_manifest(directory, spec, require_complete=False)
             return bool(manifest["complete"])
-        shape = _shape(spec)
+        shape = _token_shape(spec)
         tokens = np.memmap(
             directory / TOKEN_FILE,
             mode="w+",
             dtype=np.uint16,
             shape=shape,
+        )
+        repa_shape = _repa_shape(spec)
+        repa = (
+            np.memmap(
+                directory / REPA_FILE,
+                mode="w+",
+                dtype=np.uint16,
+                shape=repa_shape,
+            )
+            if repa_shape is not None
+            else None
         )
         completion = np.memmap(
             directory / COMPLETION_FILE,
@@ -189,6 +246,8 @@ class REGTokenCacheWriter:
         )
         completion[:] = 0
         tokens.flush()
+        if repa is not None:
+            repa.flush()
         completion.flush()
         _json_atomic(manifest_path, _manifest(spec, complete=False))
         return False
@@ -199,13 +258,32 @@ class REGTokenCacheWriter:
         pending = np.flatnonzero(np.asarray(self.completion) == 0)
         return pending[rank::world_size]
 
-    def write(self, indices: Tensor, tokens: Tensor) -> None:
+    def write(self, indices: Tensor, targets: REGTargets) -> None:
         positions = indices.detach().cpu().numpy().astype(np.int64, copy=False)
+        if positions.ndim != 1:
+            raise ValueError("REG cache indices must have shape [B]")
+        if np.any(positions < 0) or np.any(positions >= self.shape[0]):
+            raise IndexError("REG cache index is out of range")
         expected = (len(positions), self.shape[1], self.shape[2])
-        if tuple(tokens.shape) != expected:
+        if tuple(targets.reg_tokens.shape) != expected:
             raise ValueError(f"cached REG tokens must have shape {expected}")
+        repa_bits = None
+        if self.repa_shape is None:
+            if targets.repa is not None:
+                raise ValueError("REPA targets were provided for a REPA-disabled cache")
+        else:
+            expected_repa = (len(positions), self.repa_shape[1], self.repa_shape[2])
+            if targets.repa is None or tuple(targets.repa.shape) != expected_repa:
+                raise ValueError(f"cached REPA targets must have shape {expected_repa}")
+            repa_bits = (
+                targets.repa.detach()
+                .to(device="cpu", dtype=torch.bfloat16)
+                .contiguous()
+                .view(torch.uint16)
+                .numpy()
+            )
         bits = (
-            tokens.detach()
+            targets.reg_tokens.detach()
             .to(device="cpu", dtype=torch.bfloat16)
             .contiguous()
             .view(torch.uint16)
@@ -213,6 +291,10 @@ class REGTokenCacheWriter:
         )
         self.tokens[positions] = bits
         self.tokens.flush()
+        if repa_bits is not None:
+            assert self.repa is not None
+            self.repa[positions] = repa_bits
+            self.repa.flush()
         self.completion[positions] = 1
         self.completion.flush()
 
@@ -232,19 +314,35 @@ class REGTokenCache:
             require_complete=True,
         )
         self.fingerprint = str(self.manifest["fingerprint"])
-        self.shape = _shape(self.spec)
+        self.shape = _token_shape(self.spec)
+        self.repa_shape = _repa_shape(self.spec)
         self._tokens = np.memmap(
             self.directory / TOKEN_FILE,
             mode="r",
             dtype=np.uint16,
             shape=self.shape,
         )
+        self._repa = (
+            np.memmap(
+                self.directory / REPA_FILE,
+                mode="r",
+                dtype=np.uint16,
+                shape=self.repa_shape,
+            )
+            if self.repa_shape is not None
+            else None
+        )
 
-    def lookup(self, indices: Tensor) -> Tensor:
+    def lookup(self, indices: Tensor) -> REGTargets:
         positions = indices.detach().cpu().numpy().astype(np.int64, copy=False)
         if positions.ndim != 1:
             raise ValueError("REG cache indices must have shape [B]")
         if np.any(positions < 0) or np.any(positions >= self.shape[0]):
             raise IndexError("REG cache index is out of range")
         bits = np.asarray(self._tokens[positions]).copy()
-        return torch.from_numpy(bits).view(torch.bfloat16)
+        reg_tokens = torch.from_numpy(bits).view(torch.bfloat16)
+        repa = None
+        if self._repa is not None:
+            repa_bits = np.asarray(self._repa[positions]).copy()
+            repa = torch.from_numpy(repa_bits).view(torch.bfloat16)
+        return REGTargets(reg_tokens, repa)

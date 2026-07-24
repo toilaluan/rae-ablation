@@ -109,11 +109,7 @@ def main() -> None:
         torch.manual_seed(streams.initialization.initial_seed())
         model = SiT(config.model).to(device)
     dataset = load_imagenet(config.data, config.model.image_size)
-    cache_active = (
-        config.reg_cache.enabled
-        and config.model.reg.enabled
-        and not config.model.reg.repa_enabled
-    )
+    cache_active = config.reg_cache.enabled and config.model.reg.enabled
     reg_cache = REGTokenCache(config, len(dataset)) if cache_active else None
     fingerprint = data_fingerprint(config.data, config.model.image_size)
     plan_path = Path(config.validation.plan_path)

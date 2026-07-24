@@ -22,7 +22,7 @@ from jit_reg.reg_cache import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Precompute configured DINO REG tokens without full spatial features"
+        description="Precompute configured DINO REG and REPA targets"
     )
     parser.add_argument("--config", type=Path, default=Path("configs/canonical.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
@@ -36,7 +36,6 @@ def main() -> None:
     if args.batch_size < 1 or args.log_interval < 1:
         raise ValueError("cache batch size and log interval must be positive")
     config = load_config(args.config, args.override)
-    config.model.reg.repa_enabled = False
     rank, world_size, device = initialize_distributed()
     dataset = load_imagenet(config.data, config.model.image_size)
     directory = cache_path(config, len(dataset))
@@ -87,8 +86,8 @@ def main() -> None:
                     dtype=torch.bfloat16,
                     enabled=device.type == "cuda",
                 ):
-                    tokens = extractor.targets(pixels, config.model.grid_size).reg_tokens
-                writer.write(indices, tokens)
+                    targets = extractor.targets(pixels, config.model.grid_size)
+                writer.write(indices, targets)
                 processed += indices.numel()
                 if rank == 0 and batch_index % args.log_interval == 0:
                     elapsed = max(time.perf_counter() - started, 1e-9)

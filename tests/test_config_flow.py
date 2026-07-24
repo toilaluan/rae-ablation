@@ -145,6 +145,12 @@ def test_repa_off_and_cache_configuration() -> None:
         config.validate()
     config.train.horizontal_flip_probability = 0
     config.validate()
+    config.model.reg.repa_enabled = True
+    config.model.reg.repa_block = 2
+    config.validate()
+    config.train.horizontal_flip_probability = 0.5
+    with pytest.raises(ValueError, match="horizontal_flip_probability=0"):
+        config.validate()
 
 
 def test_reg_token_mode_and_pool_size_rejection() -> None:

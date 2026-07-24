@@ -243,18 +243,32 @@ class _TinyTarget(nn.Module):
 class _TinyCache:
     fingerprint = "tiny-cache"
 
-    def lookup(self, indices: torch.Tensor) -> torch.Tensor:
-        return torch.zeros(indices.numel(), 1, 8, dtype=torch.bfloat16)
+    def __init__(self, repa_enabled: bool, grid_size: int) -> None:
+        self.repa_enabled = repa_enabled
+        self.grid_size = grid_size
+
+    def lookup(self, indices: torch.Tensor) -> REGTargets:
+        count = indices.numel()
+        repa = (
+            torch.ones(count, self.grid_size**2, 8, dtype=torch.bfloat16)
+            if self.repa_enabled
+            else None
+        )
+        return REGTargets(
+            torch.zeros(count, 1, 8, dtype=torch.bfloat16),
+            repa,
+        )
 
 
 @pytest.mark.parametrize(
-    ("reg_variant", "token_mode", "cached"),
+    ("reg_variant", "token_mode", "cached", "repa_enabled"),
     [
-        ("disabled", "cls", False),
-        ("standard", "cls", False),
-        ("standard", "cls_spatial", False),
-        ("wide_intermediate", "cls_spatial", False),
-        ("standard", "cls", True),
+        ("disabled", "cls", False, False),
+        ("standard", "cls", False, True),
+        ("standard", "cls_spatial", False, True),
+        ("wide_intermediate", "cls_spatial", False, True),
+        ("standard", "cls", True, False),
+        ("standard", "cls", True, True),
     ],
 )
 def test_one_step_pixel_training_smoke(
@@ -262,6 +276,7 @@ def test_one_step_pixel_training_smoke(
     reg_variant: str,
     token_mode: str,
     cached: bool,
+    repa_enabled: bool,
 ) -> None:
     reg_enabled = reg_variant != "disabled"
     wide = reg_variant == "wide_intermediate"
@@ -276,7 +291,7 @@ def test_one_step_pixel_training_smoke(
         num_classes=2,
         reg=REGConfig(
             enabled=reg_enabled,
-            repa_enabled=not cached,
+            repa_enabled=repa_enabled,
             feature_dim=8,
             token_mode=token_mode,
             pool_size=2,
@@ -323,7 +338,11 @@ def test_one_step_pixel_training_smoke(
         reg_encoder=(
             _TinyTarget(token_mode) if reg_enabled and not cached else None
         ),  # type: ignore[arg-type]
-        reg_cache=_TinyCache() if cached else None,  # type: ignore[arg-type]
+        reg_cache=(
+            _TinyCache(config.model.reg.repa_enabled, config.model.grid_size)
+            if cached
+            else None
+        ),  # type: ignore[arg-type]
     )
     assert state.global_step == 1
     assert (tmp_path / "checkpoints" / "epoch-0001" / "training.pt").is_file()

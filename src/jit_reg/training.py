@@ -112,8 +112,6 @@ def train(
     target_sources = int(reg_encoder is not None) + int(reg_cache is not None)
     if config.model.reg.enabled != (target_sources == 1):
         raise ValueError("REG requires exactly one online or cached target source")
-    if reg_cache is not None and config.model.reg.repa_enabled:
-        raise ValueError("cached REG targets cannot provide REPA")
     optimizer.zero_grad()
 
     for epoch_index in range(state.epoch, config.train.epochs):
@@ -163,9 +161,14 @@ def train(
             reg_noise = None
             noisy_reg = None
             if reg_cache is not None:
+                cached_targets = reg_cache.lookup(indices)
                 targets = REGTargets(
-                    reg_cache.lookup(indices).to(device=device, dtype=torch.float32),
-                    None,
+                    cached_targets.reg_tokens.to(device=device, dtype=torch.float32),
+                    (
+                        cached_targets.repa.to(device=device, dtype=torch.float32)
+                        if cached_targets.repa is not None
+                        else None
+                    ),
                 )
             elif reg_encoder is not None:
                 with torch.autocast(
