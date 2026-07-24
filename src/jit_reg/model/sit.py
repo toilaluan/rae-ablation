@@ -293,10 +293,18 @@ class SiT(nn.Module):
         if config.reg.cls_predictor == "wide_intermediate":
             if not config.reg.enabled:
                 raise ValueError("wide-intermediate CLS predictor requires REG")
-            if not 1 <= config.reg.cls_head_block < config.depth:
-                raise ValueError("wide-intermediate CLS head must be before the final block")
-        elif config.reg.x0_conditioning or config.reg.continuation_tokens is not None:
-            raise ValueError("wide REG extensions require the wide-intermediate predictor")
+            if (
+                config.reg.cls_head_block != -1
+                and not 1 <= config.reg.cls_head_block < config.depth
+            ):
+                raise ValueError(
+                    "wide-intermediate CLS head must use -1 or be before the final block"
+                )
+        else:
+            if config.reg.cls_head_block < 1:
+                raise ValueError("REG CLS head block must be positive")
+            if config.reg.x0_conditioning or config.reg.continuation_tokens is not None:
+                raise ValueError("wide REG extensions require the wide-intermediate predictor")
         if config.reg.continuation_tokens is not None and config.reg.continuation_tokens < 1:
             raise ValueError("continuation token count must be positive")
         patch_reprojection = config.reg.patch_reprojection
@@ -307,6 +315,13 @@ class SiT(nn.Module):
         if patch_reprojection.intermediate_size < 1:
             raise ValueError("REG patch-reprojection intermediate size must be positive")
         self.config = config
+        self._terminal_wide_head = (
+            config.reg.cls_predictor == "wide_intermediate"
+            and config.reg.cls_head_block == -1
+        )
+        self._cls_head_block = (
+            config.depth if self._terminal_wide_head else config.reg.cls_head_block
+        )
         self.grid_size = config.image_size // config.patch_size
         self.patch_projection = nn.Conv2d(
             config.in_channels,
@@ -356,12 +371,13 @@ class SiT(nn.Module):
                 )
                 self.cls_clean_projection = (
                     nn.Linear(config.reg.feature_dim, config.hidden_size)
-                    if config.reg.continuation_tokens is None
+                    if not self._terminal_wide_head
+                    and config.reg.continuation_tokens is None
                     else None
                 )
                 self.reg_x0_conditioning_projection = (
                     nn.Linear(config.reg.feature_dim, config.hidden_size)
-                    if config.reg.x0_conditioning
+                    if not self._terminal_wide_head and config.reg.x0_conditioning
                     else None
                 )
                 self.reg_continuation_projection = (
@@ -369,7 +385,8 @@ class SiT(nn.Module):
                         config.reg.cls_head_hidden_size,
                         config.reg.continuation_tokens * config.hidden_size,
                     )
-                    if config.reg.continuation_tokens is not None
+                    if not self._terminal_wide_head
+                    and config.reg.continuation_tokens is not None
                     else None
                 )
                 reprojection_source_size = (
@@ -387,7 +404,7 @@ class SiT(nn.Module):
                         config.hidden_size,
                         patch_reprojection.include_timestep,
                     )
-                    if patch_reprojection.enabled
+                    if not self._terminal_wide_head and patch_reprojection.enabled
                     else None
                 )
             self.repa_projection: REPAProjection | None = (
@@ -548,7 +565,7 @@ class SiT(nn.Module):
                 and index == self.config.reg.repa_block
             ):
                 repa = self.repa_projection(sequence[:, patch_start:])
-            if self.cls_predictor is not None and index == self.config.reg.cls_head_block:
+            if self.cls_predictor is not None and index == self._cls_head_block:
                 if self._checkpointing():
                     predicted_output = checkpoint(
                         self.cls_predictor,
@@ -563,38 +580,39 @@ class SiT(nn.Module):
                         conditioning,
                     )
                 reg, cls_latent = predicted_output
-                image_tokens = sequence[:, patch_start:]
-                if self.reg_patch_reprojection is not None:
-                    patch = self.config.patch_size
-                    raw_patches = F.unfold(
-                        noisy_image,
-                        kernel_size=patch,
-                        stride=patch,
-                    ).transpose(1, 2)
-                    reprojection_source = (
-                        reg[:, 0]
-                        if self.config.reg.patch_reprojection.source == "x0_cls"
-                        else cls_latent
-                    )
-                    image_tokens = image_tokens + self.reg_patch_reprojection(
-                        raw_patches,
-                        reprojection_source,
-                        timestep_conditioning,
-                    )
-                if self.reg_x0_conditioning_projection is not None:
-                    conditioning = conditioning + self.reg_x0_conditioning_projection(reg[:, 0])
-                if self.reg_continuation_projection is not None:
-                    continuation_count = self.config.reg.continuation_tokens
-                    assert continuation_count is not None
-                    continuation = self.reg_continuation_projection(cls_latent).reshape(
-                        batch, continuation_count, self.config.hidden_size
-                    )
-                    sequence = torch.cat((continuation, image_tokens), dim=1)
-                    patch_start = continuation_count
-                else:
-                    assert self.cls_clean_projection is not None
-                    clean_reg = self._add_reg_positions(self.cls_clean_projection(reg))
-                    sequence = torch.cat((clean_reg, image_tokens), dim=1)
+                if not self._terminal_wide_head:
+                    image_tokens = sequence[:, patch_start:]
+                    if self.reg_patch_reprojection is not None:
+                        patch = self.config.patch_size
+                        raw_patches = F.unfold(
+                            noisy_image,
+                            kernel_size=patch,
+                            stride=patch,
+                        ).transpose(1, 2)
+                        reprojection_source = (
+                            reg[:, 0]
+                            if self.config.reg.patch_reprojection.source == "x0_cls"
+                            else cls_latent
+                        )
+                        image_tokens = image_tokens + self.reg_patch_reprojection(
+                            raw_patches,
+                            reprojection_source,
+                            timestep_conditioning,
+                        )
+                    if self.reg_x0_conditioning_projection is not None:
+                        conditioning = conditioning + self.reg_x0_conditioning_projection(reg[:, 0])
+                    if self.reg_continuation_projection is not None:
+                        continuation_count = self.config.reg.continuation_tokens
+                        assert continuation_count is not None
+                        continuation = self.reg_continuation_projection(cls_latent).reshape(
+                            batch, continuation_count, self.config.hidden_size
+                        )
+                        sequence = torch.cat((continuation, image_tokens), dim=1)
+                        patch_start = continuation_count
+                    else:
+                        assert self.cls_clean_projection is not None
+                        clean_reg = self._add_reg_positions(self.cls_clean_projection(reg))
+                        sequence = torch.cat((clean_reg, image_tokens), dim=1)
 
         patch_tokens = sequence[:, patch_start:]
         image = self._unpatchify(self.final_layer(patch_tokens, conditioning))

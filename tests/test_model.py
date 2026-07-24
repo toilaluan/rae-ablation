@@ -245,6 +245,125 @@ def test_wide_reg_predicts_and_reinjects_after_repa(token_mode: str) -> None:
     assert output.repa is not None and output.repa.shape == (2, 16, 8)
 
 
+def test_terminal_wide_reg_predicts_after_last_block_without_image_feedback() -> None:
+    config = tiny_config(
+        reg=True,
+        reg_variant="wide_intermediate",
+        token_mode="cls_spatial",
+    )
+    config.reg.cls_head_block = -1
+    config.reg.x0_conditioning = True
+    config.reg.continuation_tokens = 3
+    config.reg.patch_reprojection.enabled = True
+    model = SiT(config)
+
+    assert model.cls_predictor is not None
+    assert model.cls_clean_projection is None
+    assert model.reg_x0_conditioning_projection is None
+    assert model.reg_continuation_projection is None
+    assert model.reg_patch_reprojection is None
+    state = model.state_dict()
+    ignored_prefixes = (
+        "cls_clean_projection.",
+        "reg_x0_conditioning_projection.",
+        "reg_continuation_projection.",
+        "reg_patch_reprojection.",
+    )
+    assert not any(key.startswith(ignored_prefixes) for key in state)
+
+    predicted_reg = torch.arange(1, 9, dtype=torch.float32)
+    with torch.no_grad():
+        model.cls_predictor.output.projection.bias.copy_(predicted_reg)
+    seen: dict[str, torch.Tensor] = {}
+
+    def capture_last_block(
+        _module: nn.Module,
+        _inputs: tuple[object, ...],
+        output: torch.Tensor,
+    ) -> None:
+        seen["last_block"] = output.detach().clone()
+
+    def capture_predictor(_module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        seen["predictor_reg"] = inputs[0].detach().clone()
+
+    def capture_final(_module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        seen["final_tokens"] = inputs[0].detach().clone()
+        seen["final_conditioning"] = inputs[1].detach().clone()
+
+    last_hook = model.blocks[-1].register_forward_hook(capture_last_block)
+    predictor_hook = model.cls_predictor.register_forward_pre_hook(capture_predictor)
+    final_hook = model.final_layer.register_forward_pre_hook(capture_final)
+    image = torch.randn(2, 3, 32, 32)
+    timestep = torch.tensor([0.2, 0.7])
+    labels = torch.tensor([1, 2])
+    output = model(
+        image,
+        timestep,
+        labels,
+        noisy_reg=torch.randn(2, model.num_reg_tokens, 8),
+    )
+    last_hook.remove()
+    predictor_hook.remove()
+    final_hook.remove()
+
+    torch.testing.assert_close(
+        seen["predictor_reg"],
+        seen["last_block"][:, : model.num_reg_tokens],
+    )
+    torch.testing.assert_close(
+        seen["final_tokens"],
+        seen["last_block"][:, model.num_reg_tokens :],
+    )
+    base_conditioning = model.timestep_embedding(timestep) + model.class_embedding(labels)
+    torch.testing.assert_close(seen["final_conditioning"], base_conditioning)
+    assert output.reg is not None
+    torch.testing.assert_close(
+        output.reg,
+        predicted_reg.view(1, 1, -1).expand(2, model.num_reg_tokens, -1),
+    )
+
+
+def test_terminal_wide_reg_is_gradient_isolated_from_image_loss() -> None:
+    config = tiny_config(reg=True, reg_variant="wide_intermediate")
+    config.reg.cls_head_block = -1
+    model = SiT(config)
+    assert model.cls_predictor is not None
+    with torch.no_grad():
+        nn.init.normal_(model.final_layer.projection.weight)
+        nn.init.normal_(model.cls_predictor.output.projection.weight)
+
+    inputs = (
+        torch.randn(2, 3, 32, 32),
+        torch.rand(2),
+        torch.tensor([1, 2]),
+    )
+    noisy_reg = torch.randn(2, model.num_reg_tokens, 8)
+    output = model(*inputs, noisy_reg=noisy_reg)
+    output.image.square().mean().backward()
+    assert all(parameter.grad is None for parameter in model.cls_predictor.parameters())
+
+    model.zero_grad(set_to_none=True)
+    seen: dict[str, torch.Tensor] = {}
+
+    def retain_last_block(
+        _module: nn.Module,
+        _inputs: tuple[object, ...],
+        block_output: torch.Tensor,
+    ) -> None:
+        block_output.retain_grad()
+        seen["last_block"] = block_output
+
+    hook = model.blocks[-1].register_forward_hook(retain_last_block)
+    output = model(*inputs, noisy_reg=noisy_reg)
+    hook.remove()
+    assert output.reg is not None
+    output.reg.square().mean().backward()
+    assert model.cls_predictor.output.projection.weight.grad is not None
+    assert torch.count_nonzero(model.cls_predictor.output.projection.weight.grad) > 0
+    assert seen["last_block"].grad is not None
+    assert torch.count_nonzero(seen["last_block"].grad) > 0
+
+
 def test_wide_reg_image_and_reg_losses_backpropagate_through_clean_path() -> None:
     model = SiT(
         tiny_config(

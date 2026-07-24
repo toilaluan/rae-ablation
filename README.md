@@ -22,6 +22,12 @@ latent into a configurable number of continuation REG tokens. A third optional b
 predicted x₀ or the wide CLS latent to gate a fresh projection of the raw noisy 32×32×3 patches
 back into the image-token stream. Standard REG remains the default.
 
+Set `model.reg.cls_head_block=-1` to move the wide REG predictor after the final SiT transformer
+block. In this terminal mode the predictor is auxiliary: it predicts REG x₀ for the REG objective
+but does not feed the image prediction. Clean REG reinjection, continuation tokens, x₀
+conditioning, and patch reprojection are not allocated or applied, even if their configuration
+values are present.
+
 ## Environment
 
 Python 3.12 is required.
@@ -306,4 +312,5 @@ uv run python scripts/train.py \
 
 Add `--reg --override model.reg.repa_block=2` to smoke-test standard REG with the two-block model.
 For wide-intermediate REG, add `--reg-widehead`, set `model.reg.repa_block=1`, and set
-`model.reg.cls_head_block=1`; the intermediate head must run before the final block.
+`model.reg.cls_head_block=1`; an intermediate head must run before the final block. Use
+`model.reg.cls_head_block=-1` for the auxiliary terminal-head mode.

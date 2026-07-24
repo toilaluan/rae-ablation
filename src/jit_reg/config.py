@@ -198,8 +198,6 @@ class ExperimentConfig:
             raise ValueError("model.reg.token_mode must be cls or cls_spatial")
         if reg.pool_size > 16:
             raise ValueError("model.reg.pool_size cannot exceed the native 16x16 feature grid")
-        if reg.cls_head_block < 1:
-            raise ValueError("model.reg.cls_head_block must be positive")
         if reg.cls_head_mlp_ratio <= 0:
             raise ValueError("model.reg.cls_head_mlp_ratio must be positive")
         if reg.cls_predictor not in {"standard", "wide_intermediate"}:
@@ -209,19 +207,23 @@ class ExperimentConfig:
         if reg.cls_predictor == "wide_intermediate":
             if not reg.enabled:
                 raise ValueError("wide_intermediate CLS predictor requires REG")
-            if not 1 <= reg.cls_head_block < m.depth:
+            if reg.cls_head_block != -1 and not 1 <= reg.cls_head_block < m.depth:
                 raise ValueError(
-                    "model.reg.cls_head_block must be at least 1 and before model.depth"
+                    "model.reg.cls_head_block must be -1 or at least 1 "
+                    "and before model.depth"
                 )
-        elif (
-            reg.x0_conditioning
-            or reg.continuation_tokens is not None
-            or reg.patch_reprojection.enabled
-        ):
-            raise ValueError(
-                "REG x0 conditioning, continuation tokens, and patch reprojection "
-                "require wide_intermediate"
-            )
+        else:
+            if reg.cls_head_block < 1:
+                raise ValueError("model.reg.cls_head_block must be positive")
+            if (
+                reg.x0_conditioning
+                or reg.continuation_tokens is not None
+                or reg.patch_reprojection.enabled
+            ):
+                raise ValueError(
+                    "REG x0 conditioning, continuation tokens, and patch reprojection "
+                    "require wide_intermediate"
+                )
         if reg.continuation_tokens is not None and reg.continuation_tokens < 1:
             raise ValueError("model.reg.continuation_tokens must be positive or null")
         if reg.patch_reprojection.source not in {"x0_cls", "wide_cls"}:

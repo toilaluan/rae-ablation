@@ -66,10 +66,19 @@ def test_wide_reg_configuration_modes_and_head_rejection() -> None:
         config.validate()
     config.model.reg.enabled = True
     config.validate()
-    for block in (0, config.model.depth):
+    config.model.reg.cls_head_block = -1
+    config.model.reg.x0_conditioning = True
+    config.model.reg.continuation_tokens = 3
+    config.model.reg.patch_reprojection.enabled = True
+    config.validate()
+    for block in (-2, 0, config.model.depth):
         config.model.reg.cls_head_block = block
         with pytest.raises(ValueError, match="cls_head_block"):
             config.validate()
+    config.model.reg.cls_head_block = -1
+    config.model.reg.cls_predictor = "standard"
+    with pytest.raises(ValueError, match="positive"):
+        config.validate()
     config.model.reg.cls_predictor = "unknown"
     with pytest.raises(ValueError, match="cls_predictor"):
         config.validate()
