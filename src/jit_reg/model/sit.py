@@ -300,20 +300,14 @@ class SiT(nn.Module):
                 raise ValueError(
                     "wide-intermediate CLS head must use -1 or be before the final block"
                 )
-        else:
-            if config.reg.cls_head_block < 1:
-                raise ValueError("REG CLS head block must be positive")
-            if config.reg.x0_conditioning or config.reg.continuation_tokens is not None:
-                raise ValueError("wide REG extensions require the wide-intermediate predictor")
-        if config.reg.continuation_tokens is not None and config.reg.continuation_tokens < 1:
-            raise ValueError("continuation token count must be positive")
         patch_reprojection = config.reg.patch_reprojection
-        if patch_reprojection.enabled and config.reg.cls_predictor != "wide_intermediate":
-            raise ValueError("REG patch reprojection requires the wide-intermediate predictor")
-        if patch_reprojection.source not in {"x0_cls", "wide_cls"}:
-            raise ValueError("unknown REG patch-reprojection source")
-        if patch_reprojection.intermediate_size < 1:
-            raise ValueError("REG patch-reprojection intermediate size must be positive")
+        if config.reg.cls_predictor == "wide_intermediate":
+            if config.reg.continuation_tokens is not None and config.reg.continuation_tokens < 1:
+                raise ValueError("continuation token count must be positive")
+            if patch_reprojection.source not in {"x0_cls", "wide_cls"}:
+                raise ValueError("unknown REG patch-reprojection source")
+            if patch_reprojection.intermediate_size < 1:
+                raise ValueError("REG patch-reprojection intermediate size must be positive")
         self.config = config
         self._terminal_wide_head = (
             config.reg.cls_predictor == "wide_intermediate"

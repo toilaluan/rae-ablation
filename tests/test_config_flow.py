@@ -77,22 +77,35 @@ def test_wide_reg_configuration_modes_and_head_rejection() -> None:
             config.validate()
     config.model.reg.cls_head_block = -1
     config.model.reg.cls_predictor = "standard"
-    with pytest.raises(ValueError, match="positive"):
-        config.validate()
+    config.validate()
     config.model.reg.cls_predictor = "unknown"
     with pytest.raises(ValueError, match="cls_predictor"):
         config.validate()
 
 
-def test_wide_reg_extensions_are_opt_in_and_wide_only() -> None:
+def test_standard_reg_ignores_wide_only_configuration() -> None:
+    config = ExperimentConfig()
+    config.model.reg.enabled = True
+    config.model.reg.cls_head_block = -2
+    config.model.reg.cls_head_hidden_size = 0
+    config.model.reg.cls_head_depth = 0
+    config.model.reg.cls_head_mlp_ratio = 0
+    config.model.reg.x0_conditioning = True
+    config.model.reg.continuation_tokens = 0
+    config.model.reg.patch_reprojection.enabled = True
+    config.model.reg.patch_reprojection.source = "unknown"
+    config.model.reg.patch_reprojection.intermediate_size = 0
+    config.validate()
+
+
+def test_wide_reg_extensions_are_validated_when_active() -> None:
     config = ExperimentConfig()
     assert not config.model.reg.x0_conditioning
     assert config.model.reg.continuation_tokens is None
     assert not config.model.reg.patch_reprojection.enabled
     assert config.model.reg.patch_reprojection.intermediate_size == 2048
     config.model.reg.x0_conditioning = True
-    with pytest.raises(ValueError, match="wide_intermediate"):
-        config.validate()
+    config.validate()
     config.model.reg.enabled = True
     config.model.reg.cls_predictor = "wide_intermediate"
     config.model.reg.continuation_tokens = 3
@@ -105,16 +118,14 @@ def test_wide_reg_extensions_are_opt_in_and_wide_only() -> None:
 def test_patch_reprojection_configuration_validation() -> None:
     config = ExperimentConfig()
     config.model.reg.patch_reprojection.enabled = True
-    with pytest.raises(ValueError, match="wide_intermediate"):
-        config.validate()
+    config.model.reg.patch_reprojection.source = "unknown"
+    config.model.reg.patch_reprojection.intermediate_size = 0
+    config.validate()
     config.model.reg.enabled = True
     config.model.reg.cls_predictor = "wide_intermediate"
-    config.validate()
-    config.model.reg.patch_reprojection.source = "unknown"
     with pytest.raises(ValueError, match="source"):
         config.validate()
     config.model.reg.patch_reprojection.source = "wide_cls"
-    config.model.reg.patch_reprojection.intermediate_size = 0
     with pytest.raises(ValueError, match="intermediate_size"):
         config.validate()
 

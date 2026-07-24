@@ -28,6 +28,9 @@ but does not feed the image prediction. Clean REG reinjection, continuation toke
 conditioning, and patch reprojection are not allocated or applied, even if their configuration
 values are present.
 
+The standard REG predictor also always runs after the final SiT block. It ignores
+`cls_head_block` and all wide-only extension settings rather than validating or allocating them.
+
 ## Environment
 
 Python 3.12 is required.

@@ -188,8 +188,6 @@ class ExperimentConfig:
                 reg.pool_size,
                 reg.repa_block,
                 reg.repa_hidden_size,
-                reg.cls_head_hidden_size,
-                reg.cls_head_depth,
             )
             < 1
         ):
@@ -198,8 +196,6 @@ class ExperimentConfig:
             raise ValueError("model.reg.token_mode must be cls or cls_spatial")
         if reg.pool_size > 16:
             raise ValueError("model.reg.pool_size cannot exceed the native 16x16 feature grid")
-        if reg.cls_head_mlp_ratio <= 0:
-            raise ValueError("model.reg.cls_head_mlp_ratio must be positive")
         if reg.cls_predictor not in {"standard", "wide_intermediate"}:
             raise ValueError("model.reg.cls_predictor must be standard or wide_intermediate")
         if reg.enabled and reg.repa_enabled and reg.repa_block > m.depth:
@@ -207,33 +203,25 @@ class ExperimentConfig:
         if reg.cls_predictor == "wide_intermediate":
             if not reg.enabled:
                 raise ValueError("wide_intermediate CLS predictor requires REG")
+            if min(reg.cls_head_hidden_size, reg.cls_head_depth) < 1:
+                raise ValueError("model.reg wide CLS head dimensions must be positive")
+            if reg.cls_head_mlp_ratio <= 0:
+                raise ValueError("model.reg.cls_head_mlp_ratio must be positive")
             if reg.cls_head_block != -1 and not 1 <= reg.cls_head_block < m.depth:
                 raise ValueError(
                     "model.reg.cls_head_block must be -1 or at least 1 "
                     "and before model.depth"
                 )
-        else:
-            if reg.cls_head_block < 1:
-                raise ValueError("model.reg.cls_head_block must be positive")
-            if (
-                reg.x0_conditioning
-                or reg.continuation_tokens is not None
-                or reg.patch_reprojection.enabled
-            ):
+            if reg.continuation_tokens is not None and reg.continuation_tokens < 1:
+                raise ValueError("model.reg.continuation_tokens must be positive or null")
+            if reg.patch_reprojection.source not in {"x0_cls", "wide_cls"}:
                 raise ValueError(
-                    "REG x0 conditioning, continuation tokens, and patch reprojection "
-                    "require wide_intermediate"
+                    "model.reg.patch_reprojection.source must be x0_cls or wide_cls"
                 )
-        if reg.continuation_tokens is not None and reg.continuation_tokens < 1:
-            raise ValueError("model.reg.continuation_tokens must be positive or null")
-        if reg.patch_reprojection.source not in {"x0_cls", "wide_cls"}:
-            raise ValueError(
-                "model.reg.patch_reprojection.source must be x0_cls or wide_cls"
-            )
-        if reg.patch_reprojection.intermediate_size < 1:
-            raise ValueError(
-                "model.reg.patch_reprojection.intermediate_size must be positive"
-            )
+            if reg.patch_reprojection.intermediate_size < 1:
+                raise ValueError(
+                    "model.reg.patch_reprojection.intermediate_size must be positive"
+                )
         if reg.cls_loss_weight < 0 or reg.repa_loss_weight < 0:
             raise ValueError("model.reg loss weights cannot be negative")
         if self.train.optimizer.kind not in {"adamw", "muon"}:

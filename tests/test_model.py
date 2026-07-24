@@ -178,11 +178,21 @@ def test_spatial_reg_adds_learned_positions_and_projects_only_image_tokens() -> 
 
 
 def test_standard_reg_has_original_state_and_no_wide_allocations() -> None:
-    model = SiT(tiny_config(reg=True))
+    config = tiny_config(reg=True)
+    config.reg.cls_head_block = -2
+    config.reg.x0_conditioning = True
+    config.reg.continuation_tokens = 0
+    config.reg.patch_reprojection.enabled = True
+    config.reg.patch_reprojection.source = "unknown"
+    config.reg.patch_reprojection.intermediate_size = 0
+    model = SiT(config)
     state = model.state_dict()
     assert model.cls_final_layer is not None
     assert model.cls_predictor is None
     assert model.cls_clean_projection is None
+    assert model.reg_x0_conditioning_projection is None
+    assert model.reg_continuation_projection is None
+    assert model.reg_patch_reprojection is None
     assert any(key.startswith("cls_final_layer.") for key in state)
     assert not any(
         key.startswith("cls_predictor.") or key.startswith("cls_clean_projection.") for key in state
