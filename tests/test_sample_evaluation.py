@@ -85,6 +85,12 @@ def test_sample_archive_is_atomic_balanced_resumable_and_records_jit_metadata(
     parameters = SamplingParameters(batch_size=2, sampling_steps=3, log_interval=1)
     with pytest.raises(RuntimeError, match="interrupted"):
         _sample(tmp_path, interrupted, parameters=parameters)
+    legacy_manifest_path = tmp_path / "samples.json"
+    legacy_manifest = json.loads(legacy_manifest_path.read_text())
+    legacy_manifest["schema_version"] = 8
+    legacy_manifest["sampling"].pop("solver")
+    legacy_manifest["sampling"].pop("sampling_nfe")
+    legacy_manifest_path.write_text(json.dumps(legacy_manifest))
     resumed_positions: list[int] = []
 
     def resumed(
@@ -101,7 +107,7 @@ def test_sample_archive_is_atomic_balanced_resumable_and_records_jit_metadata(
     with zipfile.ZipFile(archive) as values:
         assert values.getinfo("arr_0.npy").compress_type == zipfile.ZIP_STORED
     manifest = json.loads((tmp_path / "samples.json").read_text())
-    assert manifest["complete"] and manifest["schema_version"] == 8
+    assert manifest["complete"] and manifest["schema_version"] == 9
     assert manifest["patch_size"] == 32 and manifest["jit_grid_size"] == 8
     assert manifest["model_variant"] == "SiT-B/32" and not manifest["reg_enabled"]
     assert manifest["reg_variant"] == "disabled"
@@ -114,7 +120,14 @@ def test_sample_archive_is_atomic_balanced_resumable_and_records_jit_metadata(
         "intermediate_size": None,
         "include_timestep": None,
     }
-    assert manifest["sampling"]["cfg_interval"] == [0.0, 1.0]
+    assert manifest["sampling"] == {
+        "solver": "euler",
+        "sampling_steps": 3,
+        "sampling_nfe": 3,
+        "guidance_scale": 1.78,
+        "timestep_shift": 1.0,
+        "cfg_interval": [0.0, 0.9],
+    }
     preview = np.asarray(Image.open(tmp_path / "preview.png"))
     assert preview[0, [0, 256, 512, 768], 0].tolist() == [0, 1, 2, 3]
     assert not list(tmp_path.glob(".samples-*.npy"))
@@ -183,6 +196,12 @@ def test_sampling_resume_rejects_reg_variant_mismatch(tmp_path: Path) -> None:
         4,
         SamplingParameters(sampling_steps=4, timestep_shift=0.125),
     )
+    heun = SamplingParameters(sampling_steps=3, solver="heun")
+    assert heun.sampling_nfe == 5
+    assert sampling_output_name(4, heun).startswith("samples-heun-")
+    assert sampling_output_name(4, first) != sampling_output_name(4, heun)
+    with pytest.raises(ValueError, match="solver"):
+        SamplingParameters(solver="unknown").validate()
 
 
 def test_standard_sampling_ignores_wide_only_metadata(tmp_path: Path) -> None:
@@ -320,7 +339,7 @@ def test_online_validation_writes_shared_artifacts(
 
     monkeypatch.setattr(runtime, "SiT", TinyModel)
     monkeypatch.setattr(runtime, "compile_model_regions", lambda model, config: model)
-    monkeypatch.setattr(runtime, "euler_sample", lambda model, noise, labels, **kwargs: noise)
+    monkeypatch.setattr(runtime, "ode_sample", lambda model, noise, labels, **kwargs: noise)
     monkeypatch.setattr(runtime, "evaluate_npz", lambda *args, **kwargs: {"FID": 12.5})
     config = ExperimentConfig()
     config.model.num_classes = 2
@@ -337,11 +356,17 @@ def test_online_validation_writes_shared_artifacts(
         final=False,
         output_root=tmp_path,
         reference_npz=tmp_path / "reference.npz",
-        sampling=SamplingParameters(batch_size=1, sampling_steps=1, log_interval=1),
+        sampling=SamplingParameters(
+            batch_size=1,
+            sampling_steps=2,
+            solver="heun",
+            log_interval=1,
+        ),
         eval_batch_size=1,
         eval_log_interval=1,
     )
     assert metrics["validation/FID-5K"] == 12.5
+    assert metrics["validation/sampling_nfe"] == 3
     assert (output / "samples.npz").exists()
     evaluation = json.loads((output / "evaluation.json").read_text())
     assert evaluation["validation_plan_hash"] == plan.plan_hash

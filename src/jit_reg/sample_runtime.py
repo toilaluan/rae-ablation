@@ -24,15 +24,26 @@ from .validation import ValidationPlan
 class SamplingParameters:
     batch_size: int = 32
     sampling_steps: int = 50
+    solver: str = "euler"
     guidance_scale: float = 1.78
     timestep_shift: float = 1.0
     cfg_start: float = 0.0
-    cfg_end: float = 1.0
+    cfg_end: float = 0.9
     log_interval: int = 10
+
+    @property
+    def sampling_nfe(self) -> int:
+        if self.solver == "euler":
+            return self.sampling_steps
+        if self.solver == "heun":
+            return 2 * self.sampling_steps - 1
+        raise ValueError("sampling solver must be euler or heun")
 
     def validate(self) -> None:
         if self.batch_size < 1 or self.sampling_steps < 1 or self.log_interval < 1:
             raise ValueError("sampling batch size, steps, and log interval must be positive")
+        if self.solver not in {"euler", "heun"}:
+            raise ValueError("sampling solver must be euler or heun")
         if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
             raise ValueError("timestep shift must be finite and positive")
         if not math.isfinite(self.guidance_scale):
@@ -53,7 +64,7 @@ def sampling_output_name(sample_count: int, parameters: SamplingParameters) -> s
     if sample_count < 1:
         raise ValueError("sample count must be positive")
     return (
-        f"samples-euler-n{sample_count}-steps{parameters.sampling_steps}"
+        f"samples-{parameters.solver}-n{sample_count}-steps{parameters.sampling_steps}"
         f"-cfg{_float_slug(parameters.guidance_scale)}"
         f"-shift{_float_slug(parameters.timestep_shift)}"
         f"-window{_float_slug(parameters.cfg_start)}-{_float_slug(parameters.cfg_end)}"
@@ -159,7 +170,7 @@ def _manifest_base(
     counts = torch.bincount(labels, minlength=num_classes)
     ids_digest = hashlib.sha256(sample_ids.numpy().tobytes()).hexdigest()
     return {
-        "schema_version": 8,
+        "schema_version": 9,
         "checkpoint_sha256": checkpoint_hash,
         "validation_plan_hash": plan.plan_hash,
         "sample_ids_sha256": ids_digest,
@@ -198,7 +209,9 @@ def _manifest_base(
         "image_shape": [image_size, image_size, 3],
         "image_dtype": "uint8",
         "sampling": {
+            "solver": parameters.solver,
             "sampling_steps": parameters.sampling_steps,
+            "sampling_nfe": parameters.sampling_nfe,
             "guidance_scale": parameters.guidance_scale,
             "timestep_shift": parameters.timestep_shift,
             "cfg_interval": [parameters.cfg_start, parameters.cfg_end],
@@ -224,7 +237,18 @@ def _initialize_or_resume(
     output_dir.mkdir(parents=True, exist_ok=True)
     if paths["manifest"].exists():
         existing = json.loads(paths["manifest"].read_text())
-        comparable = {key: existing.get(key) for key in base}
+        normalized = dict(existing)
+        if existing.get("schema_version") == 8:
+            sampling = existing.get("sampling")
+            if isinstance(sampling, dict) and "solver" not in sampling:
+                normalized_sampling = dict(sampling)
+                normalized_sampling["solver"] = "euler"
+                normalized_sampling["sampling_nfe"] = normalized_sampling.get(
+                    "sampling_steps"
+                )
+                normalized["sampling"] = normalized_sampling
+                normalized["schema_version"] = 9
+        comparable = {key: normalized.get(key) for key in base}
         if comparable != base:
             raise ValueError("existing sampling manifest does not match this request")
         if existing.get("complete"):
@@ -446,9 +470,11 @@ def sample_to_archive(
         status = "complete" if state[0] else "resuming" if state[1] else "new"
         print(
             f"sampling configuration: samples={sample_count} classes={num_classes} "
-            f"batch_size={parameters.batch_size} steps={parameters.sampling_steps} "
+            f"batch_size={parameters.batch_size} solver={parameters.solver} "
+            f"steps={parameters.sampling_steps} nfe={parameters.sampling_nfe} "
             f"guidance={parameters.guidance_scale:g} "
-            f"timestep_shift={parameters.timestep_shift:g}"
+            f"timestep_shift={parameters.timestep_shift:g} "
+            f"cfg_interval=[{parameters.cfg_start:g}, {parameters.cfg_end:g}]"
         )
         print(f"sampling state: {status}, completed={state[1]}/{sample_count}")
     if state[0]:

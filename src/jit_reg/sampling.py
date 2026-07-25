@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import math
 from itertools import pairwise
-from typing import NamedTuple, overload
+from typing import Literal, NamedTuple, overload
 
 import torch
 from torch import Tensor, nn
 
 from .objective import shift_timestep
 
+Solver = Literal["euler", "heun"]
 
-class EulerSample(NamedTuple):
+
+class ODESample(NamedTuple):
     image: Tensor
     reg: Tensor
+
+
+EulerSample = ODESample
 
 
 def class_balanced_labels(sample_count: int, num_classes: int) -> Tensor:
@@ -28,7 +33,7 @@ def _guided(conditional: Tensor, unconditional: Tensor, scale: float) -> Tensor:
 
 
 @overload
-def euler_sample(
+def ode_sample(
     model: nn.Module,
     noise: Tensor,
     labels: Tensor,
@@ -37,13 +42,14 @@ def euler_sample(
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
-    cfg_interval: tuple[float, float] = (0.0, 1.0),
+    cfg_interval: tuple[float, float] = (0.0, 0.9),
+    solver: Solver = "euler",
     num_classes: int | None = None,
 ) -> Tensor: ...
 
 
 @overload
-def euler_sample(
+def ode_sample(
     model: nn.Module,
     noise: Tensor,
     labels: Tensor,
@@ -52,13 +58,14 @@ def euler_sample(
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
-    cfg_interval: tuple[float, float] = (0.0, 1.0),
+    cfg_interval: tuple[float, float] = (0.0, 0.9),
+    solver: Solver = "euler",
     num_classes: int | None = None,
-) -> EulerSample: ...
+) -> ODESample: ...
 
 
 @torch.inference_mode()
-def euler_sample(
+def ode_sample(
     model: nn.Module,
     noise: Tensor,
     labels: Tensor,
@@ -67,10 +74,11 @@ def euler_sample(
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
-    cfg_interval: tuple[float, float] = (0.0, 1.0),
+    cfg_interval: tuple[float, float] = (0.0, 0.9),
+    solver: Solver = "euler",
     num_classes: int | None = None,
-) -> Tensor | EulerSample:
-    """Integrate clean predictions from noise to data with batched standard CFG."""
+) -> Tensor | ODESample:
+    """Integrate clean predictions from noise to data with Euler or Heun."""
     if steps < 1:
         raise ValueError("sampling steps must be positive")
     if not math.isfinite(timestep_shift) or timestep_shift <= 0:
@@ -80,6 +88,8 @@ def euler_sample(
     cfg_start, cfg_end = cfg_interval
     if not (0 <= cfg_start <= cfg_end <= 1):
         raise ValueError("CFG interval must satisfy 0 <= start <= end <= 1")
+    if solver not in {"euler", "heun"}:
+        raise ValueError("solver must be euler or heun")
     if labels.shape != (noise.shape[0],):
         raise ValueError("labels must have shape [B]")
     if reg_noise is not None and reg_noise.shape[0] != noise.shape[0]:
@@ -96,43 +106,151 @@ def euler_sample(
     combined_labels = torch.cat((labels, null_labels))
     u = torch.linspace(0, 1, steps + 1, device=noise.device, dtype=torch.float32)
     schedule = shift_timestep(u, timestep_shift)
-    for current, following in pairwise(schedule):
-        timestep = current.expand(2 * noise.shape[0])
-        combined_image = torch.cat((x, x)).to(noise.dtype)
-        combined_reg = None
-        if reg_state is not None:
-            combined_reg = torch.cat((reg_state, reg_state)).to(reg_noise.dtype)
+
+    def predict_clean(
+        image_state: Tensor,
+        current_reg_state: Tensor | None,
+        timestep_value: Tensor,
+    ) -> tuple[Tensor, Tensor | None]:
+        use_cfg = cfg_start <= float(timestep_value) <= cfg_end
+        if use_cfg:
+            model_image = torch.cat((image_state, image_state)).to(noise.dtype)
+            model_labels = combined_labels
+            model_timestep = timestep_value.expand(2 * noise.shape[0])
+            model_reg = (
+                torch.cat((current_reg_state, current_reg_state)).to(reg_noise.dtype)
+                if current_reg_state is not None and reg_noise is not None
+                else None
+            )
+        else:
+            model_image = image_state.to(noise.dtype)
+            model_labels = labels
+            model_timestep = timestep_value.expand(noise.shape[0])
+            model_reg = (
+                current_reg_state.to(reg_noise.dtype)
+                if current_reg_state is not None and reg_noise is not None
+                else None
+            )
         output = model(
-            combined_image,
-            timestep,
-            combined_labels,
-            noisy_reg=combined_reg,
+            model_image,
+            model_timestep,
+            model_labels,
+            noisy_reg=model_reg,
             return_repa=False,
         )
-        conditional_image, unconditional_image = output.image.float().chunk(2)
-        use_cfg = cfg_start <= float(current) <= cfg_end
-        image_prediction = (
-            _guided(conditional_image, unconditional_image, guidance_scale)
-            if use_cfg
-            else conditional_image
-        )
-        denominator = (1 - current).clamp_min(0.05)
-        x = x + (following - current) * (image_prediction - x) / denominator
-
-        if reg_state is not None:
+        if use_cfg:
+            conditional_image, unconditional_image = output.image.float().chunk(2)
+            image_prediction = _guided(
+                conditional_image, unconditional_image, guidance_scale
+            )
+        else:
+            image_prediction = output.image.float()
+        reg_prediction = None
+        if current_reg_state is not None:
             if output.reg is None:
                 raise RuntimeError("REG sampling requires a model REG-token prediction")
-            conditional_reg, unconditional_reg = output.reg.float().chunk(2)
-            reg_prediction = (
-                _guided(conditional_reg, unconditional_reg, guidance_scale)
-                if use_cfg
-                else conditional_reg
-            )
+            if use_cfg:
+                conditional_reg, unconditional_reg = output.reg.float().chunk(2)
+                reg_prediction = _guided(
+                    conditional_reg, unconditional_reg, guidance_scale
+                )
+            else:
+                reg_prediction = output.reg.float()
+        return image_prediction, reg_prediction
+
+    for step_index, (current, following) in enumerate(pairwise(schedule)):
+        image_prediction, reg_prediction = predict_clean(x, reg_state, current)
+        denominator = (1 - current).clamp_min(0.05)
+        step_size = following - current
+        image_velocity = (image_prediction - x) / denominator
+        predicted_x = x + step_size * image_velocity
+
+        predicted_reg = None
+        reg_velocity = None
+        if reg_state is not None:
+            if reg_prediction is None:
+                raise RuntimeError("REG sampling requires a model REG-token prediction")
             reg_denominator = (1 - current).clamp_min(0.05)
-            reg_state = (
-                reg_state
-                + (following - current) * (reg_prediction - reg_state) / reg_denominator
+            reg_velocity = (reg_prediction - reg_state) / reg_denominator
+            predicted_reg = reg_state + step_size * reg_velocity
+
+        if solver == "heun" and step_index < steps - 1:
+            corrected_image, corrected_reg = predict_clean(
+                predicted_x, predicted_reg, following
             )
+            corrected_denominator = (1 - following).clamp_min(0.05)
+            corrected_image_velocity = (
+                corrected_image - predicted_x
+            ) / corrected_denominator
+            x = x + 0.5 * step_size * (image_velocity + corrected_image_velocity)
+            if reg_state is not None:
+                if predicted_reg is None or reg_velocity is None or corrected_reg is None:
+                    raise RuntimeError(
+                        "REG sampling requires a model REG-token prediction"
+                    )
+                corrected_reg_velocity = (
+                    corrected_reg - predicted_reg
+                ) / corrected_denominator
+                reg_state = reg_state + 0.5 * step_size * (
+                    reg_velocity + corrected_reg_velocity
+                )
+        else:
+            x = predicted_x
+            reg_state = predicted_reg
     if reg_state is None:
         return x
-    return EulerSample(x, reg_state)
+    return ODESample(x, reg_state)
+
+
+def euler_sample(
+    model: nn.Module,
+    noise: Tensor,
+    labels: Tensor,
+    *,
+    reg_noise: Tensor | None = None,
+    steps: int = 50,
+    guidance_scale: float = 1.78,
+    timestep_shift: float = 1.0,
+    cfg_interval: tuple[float, float] = (0.0, 0.9),
+    num_classes: int | None = None,
+) -> Tensor | ODESample:
+    """Compatibility wrapper for Euler integration."""
+    return ode_sample(
+        model,
+        noise,
+        labels,
+        reg_noise=reg_noise,
+        steps=steps,
+        guidance_scale=guidance_scale,
+        timestep_shift=timestep_shift,
+        cfg_interval=cfg_interval,
+        solver="euler",
+        num_classes=num_classes,
+    )
+
+
+def heun_sample(
+    model: nn.Module,
+    noise: Tensor,
+    labels: Tensor,
+    *,
+    reg_noise: Tensor | None = None,
+    steps: int = 50,
+    guidance_scale: float = 1.78,
+    timestep_shift: float = 1.0,
+    cfg_interval: tuple[float, float] = (0.0, 0.9),
+    num_classes: int | None = None,
+) -> Tensor | ODESample:
+    """Compatibility wrapper for Heun integration with a final Euler step."""
+    return ode_sample(
+        model,
+        noise,
+        labels,
+        reg_noise=reg_noise,
+        steps=steps,
+        guidance_scale=guidance_scale,
+        timestep_shift=timestep_shift,
+        cfg_interval=cfg_interval,
+        solver="heun",
+        num_classes=num_classes,
+    )

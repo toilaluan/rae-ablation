@@ -16,7 +16,13 @@ from jit_reg.objective import (
     shift_timestep,
 )
 from jit_reg.optim import learning_rate_at_epoch
-from jit_reg.sampling import EulerSample, euler_sample
+from jit_reg.sampling import (
+    EulerSample,
+    ODESample,
+    euler_sample,
+    heun_sample,
+    ode_sample,
+)
 
 
 def test_structured_config_and_unknown_key() -> None:
@@ -355,6 +361,114 @@ def test_euler_uses_one_schedule_for_image_and_reg() -> None:
     torch.testing.assert_close(model.times[1], torch.full((2,), 1 / 9))
     assert torch.equal(result.image, torch.full_like(result.image, 2))
     assert torch.equal(result.reg, torch.full_like(result.reg, 3))
+
+
+class _KnownVelocityModel(nn.Module):
+    class Config:
+        num_classes = 10
+
+    config = Config()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.times: list[torch.Tensor] = []
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        timestep: torch.Tensor,
+        _labels: torch.Tensor,
+        noisy_reg: torch.Tensor | None = None,
+        return_repa: bool = False,
+    ) -> SiTOutput:
+        del return_repa
+        self.times.append(timestep.detach().clone())
+        image_delta = ((1 - timestep) * timestep).view(-1, 1, 1, 1)
+        reg = None
+        if noisy_reg is not None:
+            reg_delta = (2 * (1 - timestep) * timestep).view(-1, 1, 1)
+            reg = noisy_reg + reg_delta
+        return SiTOutput(image + image_delta, reg)
+
+
+def test_heun_corrects_nonfinal_steps_and_uses_euler_at_endpoint() -> None:
+    model = _KnownVelocityModel()
+    result = ode_sample(
+        model,
+        torch.zeros(1, 1, 1, 1),
+        torch.tensor([2]),
+        reg_noise=torch.zeros(1, 1, 1),
+        steps=2,
+        guidance_scale=1,
+        solver="heun",
+    )
+    assert isinstance(result, ODESample)
+    assert len(model.times) == 3
+    assert [float(value[0]) for value in model.times] == [0.0, 0.5, 0.5]
+    assert all(value.shape == (2,) for value in model.times)
+    torch.testing.assert_close(result.image, torch.full_like(result.image, 0.375))
+    torch.testing.assert_close(result.reg, torch.full_like(result.reg, 0.75))
+
+    one_step_model = _KnownVelocityModel()
+    one_step = heun_sample(
+        one_step_model,
+        torch.zeros(1, 1, 1, 1),
+        torch.tensor([2]),
+        steps=1,
+        guidance_scale=1,
+    )
+    assert torch.equal(one_step, torch.zeros_like(one_step))
+    assert len(one_step_model.times) == 1
+
+
+class _RecordingBatchModel(_CFGModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_sizes: list[int] = []
+        self.seen_null_label: list[bool] = []
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        timestep: torch.Tensor,
+        labels: torch.Tensor,
+        noisy_reg: torch.Tensor | None = None,
+        return_repa: bool = False,
+    ) -> SiTOutput:
+        self.batch_sizes.append(image.shape[0])
+        self.seen_null_label.append(bool(torch.any(labels == self.config.num_classes)))
+        return super().forward(
+            image,
+            timestep,
+            labels,
+            noisy_reg=noisy_reg,
+            return_repa=return_repa,
+        )
+
+
+def test_cfg_interval_uses_conditional_only_batches_outside_window() -> None:
+    model = _RecordingBatchModel()
+    ode_sample(
+        model,
+        torch.zeros(1, 1, 1, 1),
+        torch.tensor([2]),
+        steps=4,
+        guidance_scale=2,
+        cfg_interval=(0.0, 0.5),
+    )
+    assert model.batch_sizes == [2, 2, 2, 1]
+    assert model.seen_null_label == [True, True, True, False]
+
+
+def test_sampling_rejects_unknown_solver() -> None:
+    with pytest.raises(ValueError, match="solver"):
+        ode_sample(
+            _CFGModel(),
+            torch.zeros(1, 1, 1, 1),
+            torch.tensor([2]),
+            solver="unknown",  # type: ignore[arg-type]
+        )
+
 
 @pytest.mark.parametrize(
     ("epoch", "expected"),

@@ -51,10 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-npz", type=Path, required=True)
     parser.add_argument("--eval-batch-size", type=int, default=32)
     parser.add_argument("--eval-sampling-steps", type=int, default=50)
+    parser.add_argument("--eval-solver", choices=("euler", "heun"), default="euler")
     parser.add_argument("--eval-guidance-scale", type=float, default=1.78)
     parser.add_argument("--eval-timestep-shift", type=float, default=1.0)
     parser.add_argument("--eval-cfg-start", type=float, default=0.0)
-    parser.add_argument("--eval-cfg-end", type=float, default=1.0)
+    parser.add_argument("--eval-cfg-end", type=float, default=0.9)
     parser.add_argument("--eval-log-interval", type=int, default=10)
     return parser
 
@@ -91,6 +92,7 @@ def main() -> None:
     sampling = SamplingParameters(
         batch_size=args.eval_batch_size,
         sampling_steps=args.eval_sampling_steps,
+        solver=args.eval_solver,
         guidance_scale=args.eval_guidance_scale,
         timestep_shift=args.eval_timestep_shift,
         cfg_start=args.eval_cfg_start,
@@ -161,7 +163,9 @@ def main() -> None:
     logged_config["online_validation"] = {
         "reference_npz": str(args.reference_npz),
         "batch_size": sampling.batch_size,
+        "solver": sampling.solver,
         "sampling_steps": sampling.sampling_steps,
+        "sampling_nfe": sampling.sampling_nfe,
         "guidance_scale": sampling.guidance_scale,
         "timestep_shift": sampling.timestep_shift,
         "cfg_interval": [sampling.cfg_start, sampling.cfg_end],

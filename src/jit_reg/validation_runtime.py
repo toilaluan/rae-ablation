@@ -13,7 +13,7 @@ from .model.compile import compile_model_regions
 from .model.sit import SiT
 from .rng import preserving_global_rng
 from .sample_runtime import SamplingParameters, sample_to_archive, state_dict_sha256
-from .sampling import EulerSample, euler_sample
+from .sampling import ODESample, ode_sample
 from .validation import ValidationPlan, noise_for_samples
 
 
@@ -81,7 +81,7 @@ def validate_ema(
             else None
         )
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            generated = euler_sample(
+            generated = ode_sample(
                 execution_model,
                 noise,
                 batch_labels,
@@ -90,9 +90,10 @@ def validate_ema(
                 guidance_scale=sampling.guidance_scale,
                 timestep_shift=sampling.timestep_shift,
                 cfg_interval=(sampling.cfg_start, sampling.cfg_end),
+                solver=sampling.solver,
                 num_classes=config.model.num_classes,
             )
-        image = generated.image if isinstance(generated, EulerSample) else generated
+        image = generated.image if isinstance(generated, ODESample) else generated
         return image.float().add(1).div(2)
 
     digest = state_dict_sha256(ema.state_dict()) if rank == 0 else None
@@ -152,7 +153,7 @@ def validate_ema(
         suffix = "50K" if final else "5K"
         metrics[f"validation/FID-{suffix}"] = raw["FID"]
         metrics["validation/images_per_second"] = count / max(time.perf_counter() - started, 1e-9)
-        metrics["validation/sampling_nfe"] = float(sampling.sampling_steps)
+        metrics["validation/sampling_nfe"] = float(sampling.sampling_nfe)
         metrics["validation/peak_memory_gib"] = (
             torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0
         )

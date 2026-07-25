@@ -31,6 +31,9 @@ values are present.
 The standard REG predictor also always runs after the final SiT block. It ignores
 `cls_head_block` and all wide-only extension settings rather than validating or allocating them.
 
+See [`configs/exp.md`](configs/exp.md) for a concise explanation of the intermediate semantic
+prediction experiment, its relationship to baseline/REG/REPA, and a SiT-B/16 FLOP comparison.
+
 ## Environment
 
 Python 3.12 is required.
@@ -253,11 +256,13 @@ The baseline minimizes image velocity MSE. REG adds `0.03 × REG-state velocity 
 unweighted `train/reg_x0_mse` and `train/reg_x0_cosine`; these diagnostics do not change the
 objective weights.
 
-Sampling uses 50-step Euler integration and batched conditional/null-label CFG. Scale `1` selects
-the conditional prediction. CFG defaults to the full trajectory and can be restricted with
-`--cfg-start` and `--cfg-end`. REG sampling deterministically initializes and jointly integrates
-the image and configured REG state with the same schedule. `--timestep-shift` controls that shared
-schedule.
+Sampling defaults to 50-step Euler integration and also supports Heun with `--solver heun`.
+Heun applies trapezoidal correction before using Euler for the final step, so it requires
+`2 × steps - 1` model evaluations. Scale `1` selects the conditional prediction. CFG defaults
+to the shifted-time interval `[0.0, 0.9]` and can be changed with `--cfg-start` and `--cfg-end`;
+outside that inclusive interval, sampling uses a conditional-only model batch. REG sampling
+deterministically initializes and jointly integrates the image and configured REG state with the
+same solver and schedule. `--timestep-shift` controls that shared schedule.
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
@@ -267,16 +272,18 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
   --checkpoint-dir runs/reg-p32/checkpoints/last
 
 uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
+  --solver heun \
   --timestep-shift 0.125 \
   --checkpoint-dir runs/reg-widehead-p32/checkpoints/last
 ```
 
 Generation is rank-partitioned and resumable. It writes an ADM-compatible `samples.npz`, a
 preview, and a manifest beneath the resolved epoch checkpoint. The child directory name records
-sample count, Euler steps, CFG scale, timestep shift, and CFG interval, for example
-`samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-1p0`. Its manifest also records model and
-REG settings, checkpoint hash, validation-plan hash, and sampler parameters. Resuming rejects
-incompatible settings, and checkpoint retention protects epochs containing sampling outputs.
+the solver, sample count, integration steps, CFG scale, timestep shift, and CFG interval, for
+example `samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-0p9`. Its manifest also records
+model and REG settings, checkpoint hash, validation-plan hash, solver, and actual NFE. Resuming
+rejects incompatible settings, and checkpoint retention protects epochs containing sampling
+outputs.
 
 ## Matched wide-head experiment
 
@@ -296,10 +303,10 @@ same immutable labels, sample IDs, and noise seeds as standalone sampling. To ev
 uv run python scripts/eval.py \
   --reference data/VIRTUAL_imagenet256_labeled.npz \
   --output runs/baseline-p32/evaluation.json \
-  --samples runs/baseline-p32/checkpoints/last/samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-1p0/samples.npz
+  --samples runs/baseline-p32/checkpoints/last/samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-0p9/samples.npz
 
 uv run python scripts/eval.py \
-  --samples runs/reg-p32/checkpoints/last/samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-1p0/samples.npz \
+  --samples runs/reg-p32/checkpoints/last/samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-0p9/samples.npz \
   --reference data/VIRTUAL_imagenet256_labeled.npz \
   --output runs/reg-p32/evaluation.json
 

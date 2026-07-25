@@ -16,7 +16,7 @@ from jit_reg.sample_runtime import (
     sample_to_archive,
     sampling_output_name,
 )
-from jit_reg.sampling import EulerSample, euler_sample
+from jit_reg.sampling import ODESample, ode_sample
 from jit_reg.validation import noise_for_samples
 
 torch._dynamo.config.cache_size_limit = 1000
@@ -30,10 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-samples", type=int, default=50_000)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--sampling-steps", type=int, default=50)
+    parser.add_argument("--solver", choices=("euler", "heun"), default="euler")
     parser.add_argument("--guidance-scale", type=float, default=1.78)
     parser.add_argument("--timestep-shift", type=float, default=1.0)
     parser.add_argument("--cfg-start", type=float, default=0.0)
-    parser.add_argument("--cfg-end", type=float, default=1.0)
+    parser.add_argument("--cfg-end", type=float, default=0.9)
     parser.add_argument("--log-interval", type=int, default=10)
     return parser
 
@@ -45,6 +46,7 @@ def main() -> None:
     parameters = SamplingParameters(
         batch_size=args.batch_size,
         sampling_steps=args.sampling_steps,
+        solver=args.solver,
         guidance_scale=args.guidance_scale,
         timestep_shift=args.timestep_shift,
         cfg_start=args.cfg_start,
@@ -88,7 +90,7 @@ def main() -> None:
             else None
         )
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            generated = euler_sample(
+            generated = ode_sample(
                 execution_model,
                 noise,
                 batch_labels,
@@ -97,9 +99,10 @@ def main() -> None:
                 guidance_scale=parameters.guidance_scale,
                 timestep_shift=parameters.timestep_shift,
                 cfg_interval=(parameters.cfg_start, parameters.cfg_end),
+                solver=parameters.solver,
                 num_classes=config.model.num_classes,
             )
-        image = generated.image if isinstance(generated, EulerSample) else generated
+        image = generated.image if isinstance(generated, ODESample) else generated
         return image.float().add(1).div(2)
 
     wide_extensions_active = config.model.reg.wide_extensions_active
