@@ -129,14 +129,34 @@ class SiTBlock(nn.Module):
     def forward(
         self,
         x: Tensor,
-        conditioning: Tensor,
+        image_conditioning: Tensor,
         height: int,
         width: int,
         patch_start: int,
+        reg_conditioning: Tensor | None = None,
     ) -> Tensor:
-        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = self.modulation(
-            conditioning
-        ).chunk(6, dim=-1)
+        image_parameters = self.modulation(image_conditioning).chunk(6, dim=-1)
+        if patch_start:
+            if reg_conditioning is None:
+                raise ValueError("REG prefix requires REG block conditioning")
+            reg_parameters = self.modulation(reg_conditioning).chunk(6, dim=-1)
+            parameters = tuple(
+                torch.cat(
+                    (
+                        reg_value[:, None].expand(-1, patch_start, -1),
+                        image_value[:, None].expand(
+                            -1, x.shape[1] - patch_start, -1
+                        ),
+                    ),
+                    dim=1,
+                )
+                for reg_value, image_value in zip(
+                    reg_parameters, image_parameters, strict=True
+                )
+            )
+        else:
+            parameters = image_parameters
+        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = parameters
         attended = self.attention(
             _modulate(self.norm1(x), shift_a, scale_a),
             height,
@@ -194,7 +214,6 @@ class WideREGResidualLayer(nn.Module):
 
 class WideREGOutput(NamedTuple):
     x0: Tensor
-    cls_latent: Tensor
 
 
 class WideREGPredictor(nn.Module):
@@ -221,50 +240,11 @@ class WideREGPredictor(nn.Module):
         conditioning = self.conditioning_projection(conditioning)
         for layer in self.layers:
             x = layer(x, conditioning)
-        return WideREGOutput(self.output(x, conditioning), x[:, 0])
-
-
-class REGPatchReprojection(nn.Module):
-    """Conditionally recover raw noisy-patch features at the REG prediction block."""
-
-    def __init__(
-        self,
-        patch_size: int,
-        channels: int,
-        source_size: int,
-        timestep_size: int,
-        intermediate_size: int,
-        output_size: int,
-        include_timestep: bool,
-    ) -> None:
-        super().__init__()
-        self.value_projection = nn.Linear(
-            patch_size * patch_size * channels,
-            intermediate_size,
-        )
-        self.source_projection = nn.Linear(source_size, intermediate_size)
-        self.timestep_projection = (
-            nn.Linear(timestep_size, intermediate_size) if include_timestep else None
-        )
-        self.output_projection = nn.Linear(intermediate_size, output_size)
-        self.residual_scale = nn.Parameter(torch.tensor(1e-3))
-
-    def forward(
-        self,
-        raw_patches: Tensor,
-        source: Tensor,
-        timestep_conditioning: Tensor,
-    ) -> Tensor:
-        gate = self.source_projection(source)
-        if self.timestep_projection is not None:
-            gate = gate + self.timestep_projection(timestep_conditioning)
-        value = self.value_projection(raw_patches)
-        projected = self.output_projection(F.silu(gate).unsqueeze(1) * value)
-        return self.residual_scale.to(projected.dtype) * projected
+        return WideREGOutput(self.output(x, conditioning))
 
 
 class SiT(nn.Module):
-    """Pixel-space, class-conditional SiT with optional REG token entanglement."""
+    """Pixel-space SiT with independent REG denoising and REPA alignment."""
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -278,44 +258,25 @@ class SiT(nn.Module):
             raise ValueError("hidden size must be divisible by number of heads")
         if (config.hidden_size // config.num_heads) % 4:
             raise ValueError("attention head dimension must be divisible by four")
-        if (
-            config.reg.enabled
-            and config.reg.repa_enabled
-            and not 1 <= config.reg.repa_block <= config.depth
-        ):
-            raise ValueError("REG REPA block must be within model depth")
-        if config.reg.token_mode not in {"cls", "cls_spatial"}:
+        features = config.features
+        reg = features.reg
+        repa = features.repa
+        if reg.enabled and reg.token_mode not in {"cls", "cls_spatial"}:
             raise ValueError("unknown REG token mode")
-        if not 1 <= config.reg.pool_size <= 16:
+        if reg.enabled and not 1 <= reg.pool_size <= 16:
             raise ValueError("REG pool size must be within the native 16x16 feature grid")
-        if config.reg.cls_predictor not in {"standard", "wide_intermediate"}:
-            raise ValueError("unknown REG CLS predictor")
-        if config.reg.cls_predictor == "wide_intermediate":
-            if not config.reg.enabled:
-                raise ValueError("wide-intermediate CLS predictor requires REG")
-            if (
-                config.reg.cls_head_block != -1
-                and not 1 <= config.reg.cls_head_block < config.depth
-            ):
-                raise ValueError(
-                    "wide-intermediate CLS head must use -1 or be before the final block"
-                )
-        patch_reprojection = config.reg.patch_reprojection
-        if config.reg.cls_predictor == "wide_intermediate":
-            if config.reg.continuation_tokens is not None and config.reg.continuation_tokens < 1:
-                raise ValueError("continuation token count must be positive")
-            if patch_reprojection.source not in {"x0_cls", "wide_cls"}:
-                raise ValueError("unknown REG patch-reprojection source")
-            if patch_reprojection.intermediate_size < 1:
-                raise ValueError("REG patch-reprojection intermediate size must be positive")
+        if reg.enabled and reg.head.kind not in {"standard", "wide_mlp"}:
+            raise ValueError("unknown REG head kind")
+        if reg.enabled and reg.early_prediction.block is not None and not (
+            1 <= reg.early_prediction.block < config.depth
+        ):
+            raise ValueError("early REG prediction block must be before the final block")
+        if repa.enabled and not 1 <= repa.block <= config.depth:
+            raise ValueError("REPA block must be within model depth")
+        if repa.enabled and repa.token_scope == "image_and_reg" and not reg.enabled:
+            raise ValueError("REPA image_and_reg scope requires REG")
         self.config = config
-        self._terminal_wide_head = (
-            config.reg.cls_predictor == "wide_intermediate"
-            and config.reg.cls_head_block == -1
-        )
-        self._cls_head_block = (
-            config.depth if self._terminal_wide_head else config.reg.cls_head_block
-        )
+        self._reg_prediction_block = reg.early_prediction.block
         self.grid_size = config.image_size // config.patch_size
         self.patch_projection = nn.Conv2d(
             config.in_channels,
@@ -337,89 +298,56 @@ class SiT(nn.Module):
         )
         patch_values = config.patch_size * config.patch_size * config.in_channels
         self.final_layer = FinalLayer(config.hidden_size, patch_values)
-        if config.reg.enabled:
-            self.cls_input: nn.Linear | None = nn.Linear(config.reg.feature_dim, config.hidden_size)
-            if config.reg.token_mode == "cls_spatial":
+        feature_dim = features.encoder.feature_dim
+        if reg.enabled:
+            self.reg_input: nn.Linear | None = nn.Linear(feature_dim, config.hidden_size)
+            if reg.token_mode == "cls_spatial":
                 self.reg_position_embedding = nn.Parameter(
-                    torch.empty(1, config.reg.pool_size**2, config.hidden_size)
+                    torch.empty(1, reg.pool_size**2, config.hidden_size)
                 )
             else:
                 self.register_parameter("reg_position_embedding", None)
-            if config.reg.cls_predictor == "standard":
-                self.cls_final_layer: FinalLayer | None = FinalLayer(
-                    config.hidden_size, config.reg.feature_dim
+            if reg.head.kind == "standard":
+                self.reg_head: nn.Module | None = FinalLayer(
+                    config.hidden_size, feature_dim
                 )
-                self.cls_predictor: WideREGPredictor | None = None
-                self.cls_clean_projection: nn.Linear | None = None
-                self.reg_x0_conditioning_projection: nn.Linear | None = None
-                self.reg_continuation_projection: nn.Linear | None = None
-                self.reg_patch_reprojection: REGPatchReprojection | None = None
             else:
-                self.cls_final_layer = None
-                self.cls_predictor = WideREGPredictor(
+                self.reg_head = WideREGPredictor(
                     config.hidden_size,
-                    config.reg.cls_head_hidden_size,
-                    config.reg.feature_dim,
-                    config.reg.cls_head_depth,
-                    config.reg.cls_head_mlp_ratio,
+                    reg.head.hidden_size,
+                    feature_dim,
+                    reg.head.depth,
+                    reg.head.mlp_ratio,
                 )
-                self.cls_clean_projection = (
-                    nn.Linear(config.reg.feature_dim, config.hidden_size)
-                    if not self._terminal_wide_head
-                    and config.reg.continuation_tokens is None
-                    else None
-                )
-                self.reg_x0_conditioning_projection = (
-                    nn.Linear(config.reg.feature_dim, config.hidden_size)
-                    if not self._terminal_wide_head and config.reg.x0_conditioning
-                    else None
-                )
-                self.reg_continuation_projection = (
+            self.reg_reinjection: nn.Sequential | None = (
+                nn.Sequential(
                     nn.Linear(
-                        config.reg.cls_head_hidden_size,
-                        config.reg.continuation_tokens * config.hidden_size,
-                    )
-                    if not self._terminal_wide_head
-                    and config.reg.continuation_tokens is not None
-                    else None
-                )
-                reprojection_source_size = (
-                    config.reg.feature_dim
-                    if patch_reprojection.source == "x0_cls"
-                    else config.reg.cls_head_hidden_size
-                )
-                self.reg_patch_reprojection = (
-                    REGPatchReprojection(
-                        config.patch_size,
-                        config.in_channels,
-                        reprojection_source_size,
+                        feature_dim,
+                        reg.early_prediction.projection_hidden_size,
+                    ),
+                    nn.GELU(),
+                    nn.Linear(
+                        reg.early_prediction.projection_hidden_size,
                         config.hidden_size,
-                        patch_reprojection.intermediate_size,
-                        config.hidden_size,
-                        patch_reprojection.include_timestep,
-                    )
-                    if not self._terminal_wide_head and patch_reprojection.enabled
-                    else None
+                    ),
                 )
-            self.repa_projection: REPAProjection | None = (
-                REPAProjection(
-                    config.hidden_size,
-                    config.reg.repa_hidden_size,
-                    config.reg.feature_dim,
-                )
-                if config.reg.repa_enabled
+                if self._reg_prediction_block is not None
                 else None
             )
         else:
-            self.cls_input = None
+            self.reg_input = None
             self.register_parameter("reg_position_embedding", None)
-            self.cls_final_layer = None
-            self.cls_predictor = None
-            self.cls_clean_projection = None
-            self.reg_x0_conditioning_projection = None
-            self.reg_continuation_projection = None
-            self.reg_patch_reprojection = None
-            self.repa_projection = None
+            self.reg_head = None
+            self.reg_reinjection = None
+        self.repa_projection: REPAProjection | None = (
+            REPAProjection(
+                config.hidden_size,
+                repa.projection_hidden_size,
+                feature_dim,
+            )
+            if repa.enabled
+            else None
+        )
         self.gradient_checkpointing = config.gradient_checkpointing
         self._initialize_weights()
 
@@ -429,7 +357,8 @@ class SiT(nn.Module):
 
     @property
     def num_reg_tokens(self) -> int:
-        return self.config.reg.num_tokens if self.config.reg.enabled else 0
+        reg = self.config.features.reg
+        return reg.num_tokens if reg.enabled else 0
 
     def _initialize_weights(self) -> None:
         def initialize(module: nn.Module) -> None:
@@ -449,15 +378,15 @@ class SiT(nn.Module):
         for block in self.blocks:
             nn.init.zeros_(block.modulation[-1].weight)
             nn.init.zeros_(block.modulation[-1].bias)
-        if self.cls_predictor is not None:
-            for layer in self.cls_predictor.layers:
+        if isinstance(self.reg_head, WideREGPredictor):
+            for layer in self.reg_head.layers:
                 nn.init.zeros_(layer.modulation[-1].weight)
                 nn.init.zeros_(layer.modulation[-1].bias)
         final_layers = [self.final_layer]
-        if self.cls_final_layer is not None:
-            final_layers.append(self.cls_final_layer)
-        if self.cls_predictor is not None:
-            final_layers.append(self.cls_predictor.output)
+        if isinstance(self.reg_head, FinalLayer):
+            final_layers.append(self.reg_head)
+        if isinstance(self.reg_head, WideREGPredictor):
+            final_layers.append(self.reg_head.output)
         for layer in final_layers:
             nn.init.zeros_(layer.modulation[-1].weight)
             nn.init.zeros_(layer.modulation[-1].bias)
@@ -490,6 +419,7 @@ class SiT(nn.Module):
         timestep: Tensor,
         labels: Tensor,
         noisy_reg: Tensor | None = None,
+        reg_timestep: Tensor | None = None,
         return_repa: bool = False,
     ) -> SiTOutput:
         expected = (
@@ -509,27 +439,36 @@ class SiT(nn.Module):
         if torch.any(labels < 0) or torch.any(labels > self.config.num_classes):
             raise ValueError("labels contain an invalid class index")
         class_conditioning = self.class_embedding(labels)
-        timestep_conditioning = self.timestep_embedding(timestep)
-        conditioning = timestep_conditioning + class_conditioning
+        image_conditioning = self.timestep_embedding(timestep) + class_conditioning
         sequence = self.patch_projection(noisy_image).flatten(2).transpose(1, 2)
         patch_start = 0
-        if self.config.reg.enabled:
+        reg_config = self.config.features.reg
+        reg_conditioning: Tensor | None = None
+        if reg_config.enabled:
             expected_reg = (
                 batch,
                 self.num_reg_tokens,
-                self.config.reg.feature_dim,
+                self.config.features.encoder.feature_dim,
             )
             if noisy_reg is None or tuple(noisy_reg.shape) != expected_reg:
                 raise ValueError(
                     "REG requires noisy_reg with shape "
-                    f"[B, {self.num_reg_tokens}, {self.config.reg.feature_dim}]"
+                    f"[B, {self.num_reg_tokens}, "
+                    f"{self.config.features.encoder.feature_dim}]"
                 )
-            assert self.cls_input is not None
-            reg_tokens = self._add_reg_positions(self.cls_input(noisy_reg))
+            if reg_timestep is None or reg_timestep.shape != (batch,):
+                raise ValueError("REG requires reg_timestep with shape [B]")
+            reg_conditioning = (
+                self.timestep_embedding(reg_timestep) + class_conditioning
+            )
+            assert self.reg_input is not None
+            reg_tokens = self._add_reg_positions(self.reg_input(noisy_reg))
             sequence = torch.cat((reg_tokens, sequence), dim=1)
             patch_start = self.num_reg_tokens
-        elif noisy_reg is not None:
-            raise ValueError("noisy_reg is only valid when model.reg.enabled is true")
+        elif noisy_reg is not None or reg_timestep is not None:
+            raise ValueError(
+                "noisy_reg and reg_timestep are only valid when REG is enabled"
+            )
 
         reg: Tensor | None = None
         repa: Tensor | None = None
@@ -538,82 +477,61 @@ class SiT(nn.Module):
                 sequence = checkpoint(
                     block,
                     sequence,
-                    conditioning,
+                    image_conditioning,
                     self.grid_size,
                     self.grid_size,
                     patch_start,
+                    reg_conditioning,
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
             else:
                 sequence = block(
                     sequence,
-                    conditioning,
+                    image_conditioning,
                     self.grid_size,
                     self.grid_size,
                     patch_start,
+                    reg_conditioning,
                 )
             if (
                 return_repa
                 and self.repa_projection is not None
-                and index == self.config.reg.repa_block
+                and index == self.config.features.repa.block
             ):
-                repa = self.repa_projection(sequence[:, patch_start:])
-            if self.cls_predictor is not None and index == self._cls_head_block:
+                repa_tokens = (
+                    sequence
+                    if self.config.features.repa.token_scope == "image_and_reg"
+                    else sequence[:, patch_start:]
+                )
+                repa = self.repa_projection(repa_tokens)
+            if self.reg_head is not None and index == self._reg_prediction_block:
+                assert reg_conditioning is not None
                 if self._checkpointing():
-                    predicted_output = checkpoint(
-                        self.cls_predictor,
+                    predicted = checkpoint(
+                        self.reg_head,
                         sequence[:, :patch_start],
-                        conditioning,
+                        reg_conditioning,
                         use_reentrant=False,
                         preserve_rng_state=False,
                     )
                 else:
-                    predicted_output = self.cls_predictor(
+                    predicted = self.reg_head(
                         sequence[:, :patch_start],
-                        conditioning,
+                        reg_conditioning,
                     )
-                reg, cls_latent = predicted_output
-                if not self._terminal_wide_head:
-                    image_tokens = sequence[:, patch_start:]
-                    if self.reg_patch_reprojection is not None:
-                        patch = self.config.patch_size
-                        raw_patches = F.unfold(
-                            noisy_image,
-                            kernel_size=patch,
-                            stride=patch,
-                        ).transpose(1, 2)
-                        reprojection_source = (
-                            reg[:, 0]
-                            if self.config.reg.patch_reprojection.source == "x0_cls"
-                            else cls_latent
-                        )
-                        image_tokens = image_tokens + self.reg_patch_reprojection(
-                            raw_patches,
-                            reprojection_source,
-                            timestep_conditioning,
-                        )
-                    if self.reg_x0_conditioning_projection is not None:
-                        conditioning = conditioning + self.reg_x0_conditioning_projection(reg[:, 0])
-                    if self.reg_continuation_projection is not None:
-                        continuation_count = self.config.reg.continuation_tokens
-                        assert continuation_count is not None
-                        continuation = self.reg_continuation_projection(cls_latent).reshape(
-                            batch, continuation_count, self.config.hidden_size
-                        )
-                        sequence = torch.cat((continuation, image_tokens), dim=1)
-                        patch_start = continuation_count
-                    else:
-                        assert self.cls_clean_projection is not None
-                        clean_reg = self._add_reg_positions(self.cls_clean_projection(reg))
-                        sequence = torch.cat((clean_reg, image_tokens), dim=1)
+                reg = predicted.x0 if isinstance(predicted, WideREGOutput) else predicted
+                assert self.reg_reinjection is not None
+                clean_reg = self._add_reg_positions(self.reg_reinjection(reg))
+                sequence = torch.cat((clean_reg, sequence[:, patch_start:]), dim=1)
 
         patch_tokens = sequence[:, patch_start:]
-        image = self._unpatchify(self.final_layer(patch_tokens, conditioning))
-        if patch_start and self.cls_predictor is None:
-            assert self.cls_final_layer is not None
-            reg = self.cls_final_layer(
+        image = self._unpatchify(self.final_layer(patch_tokens, image_conditioning))
+        if patch_start and reg is None:
+            assert self.reg_head is not None and reg_conditioning is not None
+            predicted = self.reg_head(
                 sequence[:, :patch_start],
-                conditioning,
+                reg_conditioning,
             )
+            reg = predicted.x0 if isinstance(predicted, WideREGOutput) else predicted
         return SiTOutput(image=image, reg=reg, repa=repa)

@@ -16,15 +16,16 @@ from torch.utils.data.distributed import DistributedSampler
 from .checkpoint import EMA, CheckpointManager, should_checkpoint
 from .config import ExperimentConfig
 from .data import random_horizontal_flip
+from .feature_cache import FeatureCache
 from .model.sit import classifier_free_labels
 from .objective import (
     jit_losses,
     noisy_interpolate,
+    sample_reg_timesteps,
     sample_timesteps,
 )
 from .optim import CompositeOptimizer, learning_rate_at_epoch, set_learning_rate
-from .reg import DINOv3FeatureExtractor, REGTargets
-from .reg_cache import REGTokenCache
+from .reg import DINOv3FeatureExtractor, FeatureTargets, repa_target_for_scope
 from .rng import RNGStreams
 from .validation import should_validate
 from .wandb_utils import RunLogger
@@ -96,8 +97,8 @@ def train(
     validation_plan_hash: str,
     validation_plan_path: str | Path,
     logger: RunLogger,
-    reg_encoder: DINOv3FeatureExtractor | None = None,
-    reg_cache: REGTokenCache | None = None,
+    feature_encoder: DINOv3FeatureExtractor | None = None,
+    feature_cache: FeatureCache | None = None,
     state: TrainState | None = None,
     validation_callback: ValidationCallback | None = None,
 ) -> TrainState:
@@ -109,9 +110,11 @@ def train(
         config.train.micro_batch_size * world_size
     ):
         raise ValueError("global batch size must divide micro batch size * world size exactly")
-    target_sources = int(reg_encoder is not None) + int(reg_cache is not None)
-    if config.model.reg.enabled != (target_sources == 1):
-        raise ValueError("REG requires exactly one online or cached target source")
+    target_sources = int(feature_encoder is not None) + int(feature_cache is not None)
+    if config.model.features.enabled != (target_sources == 1):
+        raise ValueError(
+            "active REG/REPA features require exactly one online or cached target source"
+        )
     optimizer.zero_grad()
 
     for epoch_index in range(state.epoch, config.train.epochs):
@@ -119,8 +122,8 @@ def train(
         if sampler is not None:
             sampler.set_epoch(epoch_index)
         execution_model.train()
-        if reg_encoder is not None:
-            reg_encoder.eval()
+        if feature_encoder is not None:
+            feature_encoder.eval()
         epoch_started = time.perf_counter()
         step_started = epoch_started
         last_compute_end = epoch_started
@@ -160,31 +163,44 @@ def train(
             targets = None
             reg_noise = None
             noisy_reg = None
-            if reg_cache is not None:
-                cached_targets = reg_cache.lookup(indices)
-                targets = REGTargets(
-                    cached_targets.reg_tokens.to(device=device, dtype=torch.float32),
+            reg_timesteps = None
+            reg_ratios = None
+            if feature_cache is not None:
+                cached_targets = feature_cache.lookup(indices)
+                targets = FeatureTargets(
+                    (
+                        cached_targets.reg.to(device=device, dtype=torch.float32)
+                        if cached_targets.reg is not None
+                        else None
+                    ),
                     (
                         cached_targets.repa.to(device=device, dtype=torch.float32)
                         if cached_targets.repa is not None
                         else None
                     ),
                 )
-            elif reg_encoder is not None:
+            elif feature_encoder is not None:
                 with torch.autocast(
                     device_type=device.type,
                     dtype=torch.bfloat16,
                     enabled=device.type == "cuda",
                 ):
-                    targets = reg_encoder.targets(pixels, config.model.grid_size)
-            if targets is not None:
+                    targets = feature_encoder.targets(pixels, config.model.grid_size)
+            if targets is not None and targets.reg is not None:
+                timing = config.model.features.reg.timestep
+                reg_timesteps, reg_ratios = sample_reg_timesteps(
+                    timesteps,
+                    timing.train_ratio_min,
+                    timing.train_ratio_max,
+                    streams.reg_timesteps,
+                )
                 reg_noise = torch.randn(
-                    targets.reg_tokens.shape,
+                    targets.reg.shape,
                     device=device,
                     dtype=torch.float32,
                     generator=streams.reg_noise,
                 )
-                noisy_reg = noisy_interpolate(targets.reg_tokens, reg_noise, timesteps)
+                noisy_reg = noisy_interpolate(targets.reg, reg_noise, reg_timesteps)
 
             update = (batch_index + 1) % accumulation == 0
             sync_context = (
@@ -203,20 +219,30 @@ def train(
                         timesteps,
                         model_labels,
                         noisy_reg=noisy_reg,
-                        return_repa=targets is not None and targets.repa is not None,
+                        reg_timestep=reg_timesteps,
+                        return_repa=config.model.features.repa.enabled,
                     )
+                repa_target = (
+                    repa_target_for_scope(
+                        targets,
+                        config.model.features.repa.token_scope,
+                    )
+                    if targets is not None and config.model.features.repa.enabled
+                    else None
+                )
                 losses = jit_losses(
                     clean,
                     image_noise,
                     timesteps,
                     output.image,
-                    clean_reg=targets.reg_tokens if targets is not None else None,
+                    clean_reg=targets.reg if targets is not None else None,
                     reg_noise=reg_noise,
                     reg_prediction=output.reg,
+                    reg_timestep=reg_timesteps,
                     repa_prediction=output.repa,
-                    repa_target=targets.repa if targets is not None else None,
-                    reg_weight=config.model.reg.cls_loss_weight,
-                    repa_weight=config.model.reg.repa_loss_weight,
+                    repa_target=repa_target,
+                    reg_weight=config.model.features.reg.loss_weight,
+                    repa_weight=config.model.features.repa.loss_weight,
                 )
                 (losses.total / accumulation).backward()
             last_compute_end = time.perf_counter()
@@ -249,6 +275,14 @@ def train(
                     "train/reg_x0_cosine": losses.reg_x0_cosine.item(),
                     "train/repa_loss": losses.repa.item(),
                     "train/image_timestep_mean": timesteps.mean().item(),
+                    "train/reg_timestep_mean": (
+                        reg_timesteps.mean().item()
+                        if reg_timesteps is not None
+                        else 0.0
+                    ),
+                    "train/reg_timestep_ratio_mean": (
+                        reg_ratios.mean().item() if reg_ratios is not None else 0.0
+                    ),
                     "train/lr": lr,
                     "train/lr_adamw": lr,
                     "train/lr_muon": lr if config.train.optimizer.kind == "muon" else 0.0,
@@ -299,9 +333,14 @@ def train(
             should_checkpoint(state.epoch, config.train.epochs, config.checkpoint.interval)
             or final_epoch
         ):
-            fid = validation_metrics.get("validation/FID-50K")
-            if fid is None:
-                fid = validation_metrics.get("validation/FID-5K")
+            fid = next(
+                (
+                    value
+                    for name, value in validation_metrics.items()
+                    if name.startswith("validation/FID-")
+                ),
+                None,
+            )
             path = checkpoint_manager.save(
                 completed_epoch=state.epoch,
                 global_step=state.global_step,
@@ -315,8 +354,8 @@ def train(
                 last_completed_validation_epoch=state.last_completed_validation_epoch,
                 wandb_run_id=logger.run_id,
                 resolved_config=config.as_dict(),
-                reg_cache_fingerprint=(
-                    reg_cache.fingerprint if reg_cache is not None else None
+                feature_cache_fingerprints=(
+                    feature_cache.fingerprints if feature_cache is not None else None
                 ),
                 fid=fid,
             )

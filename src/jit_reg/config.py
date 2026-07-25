@@ -6,38 +6,53 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+CONFIG_SCHEMA_VERSION = 2
+
+
+def _positive(name: str, *values: int | float) -> None:
+    if any(value <= 0 for value in values):
+        raise ValueError(f"{name} must be positive")
+
 
 @dataclass
-class PatchReprojectionConfig:
-    enabled: bool = False
-    source: str = "x0_cls"
-    intermediate_size: int = 2048
-    include_timestep: bool = True
+class EncoderConfig:
+    model_name: str = "vit_base_patch16_dinov3.lvd1689m"
+    feature_dim: int = 768
+    register_tokens: int = 4
+
+
+@dataclass
+class REGHeadConfig:
+    kind: str = "standard"
+    hidden_size: int = 2048
+    depth: int = 2
+    mlp_ratio: float = 4.0
+
+
+@dataclass
+class REGEarlyPredictionConfig:
+    block: int | None = None
+    projection_hidden_size: int = 2048
+
+
+@dataclass
+class REGTimestepConfig:
+    train_ratio_min: float = 1.0
+    train_ratio_max: float = 1.0
+    sample_ratio: float = 1.0
 
 
 @dataclass
 class REGConfig:
     enabled: bool = False
-    repa_enabled: bool = True
-    model_name: str = "vit_base_patch16_dinov3.lvd1689m"
-    feature_dim: int = 768
-    register_tokens: int = 4
     token_mode: str = "cls"
     pool_size: int = 4
-    repa_block: int = 4
-    repa_hidden_size: int = 2048
-    cls_predictor: str = "standard"
-    cls_head_block: int = 4
-    cls_head_hidden_size: int = 2048
-    cls_head_depth: int = 2
-    cls_head_mlp_ratio: float = 4.0
-    x0_conditioning: bool = False
-    continuation_tokens: int | None = None
-    patch_reprojection: PatchReprojectionConfig = field(
-        default_factory=PatchReprojectionConfig
+    loss_weight: float = 0.03
+    head: REGHeadConfig = field(default_factory=REGHeadConfig)
+    timestep: REGTimestepConfig = field(default_factory=REGTimestepConfig)
+    early_prediction: REGEarlyPredictionConfig = field(
+        default_factory=REGEarlyPredictionConfig
     )
-    cls_loss_weight: float = 0.03
-    repa_loss_weight: float = 0.5
 
     @property
     def num_tokens(self) -> int:
@@ -47,19 +62,31 @@ class REGConfig:
             return 1 + self.pool_size**2
         raise ValueError(f"unknown REG token mode: {self.token_mode}")
 
+
+@dataclass
+class REPAConfig:
+    enabled: bool = False
+    block: int = 4
+    projection_hidden_size: int = 2048
+    loss_weight: float = 0.5
+    token_scope: str = "image"
+
+
+@dataclass
+class FeaturesConfig:
+    encoder: EncoderConfig = field(default_factory=EncoderConfig)
+    reg: REGConfig = field(default_factory=REGConfig)
+    repa: REPAConfig = field(default_factory=REPAConfig)
+
     @property
-    def wide_extensions_active(self) -> bool:
-        return (
-            self.enabled
-            and self.cls_predictor == "wide_intermediate"
-            and self.cls_head_block != -1
-        )
+    def enabled(self) -> bool:
+        return self.reg.enabled or self.repa.enabled
 
 
 @dataclass
 class ModelConfig:
     image_size: int = 256
-    patch_size: int = 32
+    patch_size: int = 16
     in_channels: int = 3
     hidden_size: int = 768
     depth: int = 12
@@ -69,7 +96,7 @@ class ModelConfig:
     class_dropout_prob: float = 0.1
     gradient_checkpointing: bool = False
     variant: str = "SiT-B"
-    reg: REGConfig = field(default_factory=REGConfig)
+    features: FeaturesConfig = field(default_factory=FeaturesConfig)
 
     @property
     def grid_size(self) -> int:
@@ -100,9 +127,11 @@ class DataConfig:
 
 
 @dataclass
-class REGCacheConfig:
+class FeatureCacheConfig:
     enabled: bool = False
-    directory: str = "data/reg-tokens"
+    directory: str = "data/features"
+    batch_size: int = 128
+    log_interval: int = 10
 
 
 @dataclass
@@ -131,9 +160,30 @@ class TrainConfig:
 
 
 @dataclass
+class SamplingConfig:
+    num_samples: int = 50_000
+    batch_size: int = 32
+    sampling_steps: int = 50
+    solver: str = "euler"
+    guidance_scale: float = 1.78
+    timestep_shift: float = 1.0
+    cfg_start: float = 0.0
+    cfg_end: float = 0.9
+    log_interval: int = 10
+
+
+@dataclass
+class EvaluationConfig:
+    reference_npz: str = "data/VIRTUAL_imagenet256_labeled.npz"
+    batch_size: int = 32
+    device: str = "auto"
+    log_interval: int = 10
+
+
+@dataclass
 class ValidationConfig:
     interval: int = 5
-    periodic_samples: int = 5_000
+    periodic_samples: int = 10_000
     final_samples: int = 50_000
     plan_path: str = "validation-plan.pt"
     validate_now: bool = False
@@ -161,25 +211,40 @@ class WandbConfig:
 
 @dataclass
 class ExperimentConfig:
+    schema_version: int = CONFIG_SCHEMA_VERSION
     data: DataConfig = field(default_factory=DataConfig)
-    reg_cache: REGCacheConfig = field(default_factory=REGCacheConfig)
+    feature_cache: FeatureCacheConfig = field(default_factory=FeatureCacheConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     compile: CompileConfig = field(default_factory=CompileConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    sampling: SamplingConfig = field(default_factory=SamplingConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
 
     def validate(self) -> None:
+        if self.schema_version != CONFIG_SCHEMA_VERSION:
+            raise ValueError(
+                f"configuration schema version {self.schema_version!r} is unsupported; "
+                f"schema_version: {CONFIG_SCHEMA_VERSION} is required (clean break; migration "
+                "is not supported)"
+            )
         m = self.model
-        if m.image_size < 1 or m.patch_size < 1:
-            raise ValueError("model.image_size and model.patch_size must be positive")
+        _positive(
+            "model dimensions",
+            m.image_size,
+            m.patch_size,
+            m.hidden_size,
+            m.depth,
+            m.num_heads,
+            m.num_classes,
+            m.mlp_ratio,
+        )
         if m.image_size % m.patch_size:
             raise ValueError("model.image_size must be exactly divisible by model.patch_size")
         if m.in_channels != 3:
             raise ValueError("model.in_channels must be 3 for RGB pixel training")
-        if min(m.hidden_size, m.depth, m.num_heads, m.num_classes) < 1 or m.mlp_ratio <= 0:
-            raise ValueError("model dimensions must be positive")
         if m.hidden_size % m.num_heads:
             raise ValueError("model.hidden_size must be divisible by model.num_heads")
         if (m.hidden_size // m.num_heads) % 4:
@@ -188,50 +253,77 @@ class ExperimentConfig:
             raise ValueError("model.class_dropout_prob must be in [0, 1)")
         if not m.variant:
             raise ValueError("model.variant cannot be empty")
-        reg = m.reg
-        if (
-            min(
-                reg.feature_dim,
-                reg.register_tokens,
-                reg.pool_size,
-                reg.repa_block,
-                reg.repa_hidden_size,
+
+        features = m.features
+        # A true baseline does not depend on DINO, feature timing, or cache settings.
+        if features.enabled:
+            encoder = features.encoder
+            _positive(
+                "model.features.encoder dimensions",
+                encoder.feature_dim,
+                encoder.register_tokens,
             )
-            < 1
-        ):
-            raise ValueError("model.reg dimensions must be positive")
-        if reg.token_mode not in {"cls", "cls_spatial"}:
-            raise ValueError("model.reg.token_mode must be cls or cls_spatial")
-        if reg.pool_size > 16:
-            raise ValueError("model.reg.pool_size cannot exceed the native 16x16 feature grid")
-        if reg.cls_predictor not in {"standard", "wide_intermediate"}:
-            raise ValueError("model.reg.cls_predictor must be standard or wide_intermediate")
-        if reg.enabled and reg.repa_enabled and reg.repa_block > m.depth:
-            raise ValueError("model.reg.repa_block must be within model.depth")
-        if reg.cls_predictor == "wide_intermediate":
-            if not reg.enabled:
-                raise ValueError("wide_intermediate CLS predictor requires REG")
-            if min(reg.cls_head_hidden_size, reg.cls_head_depth) < 1:
-                raise ValueError("model.reg wide CLS head dimensions must be positive")
-            if reg.cls_head_mlp_ratio <= 0:
-                raise ValueError("model.reg.cls_head_mlp_ratio must be positive")
-            if reg.cls_head_block != -1 and not 1 <= reg.cls_head_block < m.depth:
+            if not encoder.model_name:
+                raise ValueError("model.features.encoder.model_name cannot be empty")
+        if features.reg.enabled:
+            reg = features.reg
+            if reg.token_mode not in {"cls", "cls_spatial"}:
+                raise ValueError("model.features.reg.token_mode must be cls or cls_spatial")
+            if reg.pool_size < 1 or reg.pool_size > 16:
                 raise ValueError(
-                    "model.reg.cls_head_block must be -1 or at least 1 "
-                    "and before model.depth"
+                    "model.features.reg.pool_size must be within the native 16x16 grid"
                 )
-            if reg.continuation_tokens is not None and reg.continuation_tokens < 1:
-                raise ValueError("model.reg.continuation_tokens must be positive or null")
-            if reg.patch_reprojection.source not in {"x0_cls", "wide_cls"}:
+            if reg.loss_weight < 0:
+                raise ValueError("model.features.reg.loss_weight cannot be negative")
+            if reg.head.kind not in {"standard", "wide_mlp"}:
                 raise ValueError(
-                    "model.reg.patch_reprojection.source must be x0_cls or wide_cls"
+                    "model.features.reg.head.kind must be standard or wide_mlp"
                 )
-            if reg.patch_reprojection.intermediate_size < 1:
+            if reg.head.kind == "wide_mlp":
+                _positive(
+                    "model.features.reg.head dimensions",
+                    reg.head.hidden_size,
+                    reg.head.depth,
+                    reg.head.mlp_ratio,
+                )
+            block = reg.early_prediction.block
+            if block is not None and not 1 <= block < m.depth:
                 raise ValueError(
-                    "model.reg.patch_reprojection.intermediate_size must be positive"
+                    "model.features.reg.early_prediction.block must be null or before "
+                    "model.depth"
                 )
-        if reg.cls_loss_weight < 0 or reg.repa_loss_weight < 0:
-            raise ValueError("model.reg loss weights cannot be negative")
+            if block is not None:
+                _positive(
+                    "model.features.reg.early_prediction.projection_hidden_size",
+                    reg.early_prediction.projection_hidden_size,
+                )
+            timing = reg.timestep
+            values = (
+                timing.train_ratio_min,
+                timing.train_ratio_max,
+                timing.sample_ratio,
+            )
+            if any(not math.isfinite(value) or value <= 0 for value in values):
+                raise ValueError("REG timestep ratios must be finite and positive")
+            if timing.train_ratio_min > timing.train_ratio_max:
+                raise ValueError("REG train timestep ratio minimum cannot exceed maximum")
+        if features.repa.enabled:
+            repa = features.repa
+            if not 1 <= repa.block <= m.depth:
+                raise ValueError("model.features.repa.block must be within model.depth")
+            if repa.projection_hidden_size < 1:
+                raise ValueError(
+                    "model.features.repa.projection_hidden_size must be positive"
+                )
+            if repa.loss_weight < 0:
+                raise ValueError("model.features.repa.loss_weight cannot be negative")
+            if repa.token_scope not in {"image", "image_and_reg"}:
+                raise ValueError(
+                    "model.features.repa.token_scope must be image or image_and_reg"
+                )
+            if repa.token_scope == "image_and_reg" and not features.reg.enabled:
+                raise ValueError("REPA image_and_reg token scope requires REG")
+
         if self.train.optimizer.kind not in {"adamw", "muon"}:
             raise ValueError("optimizer.kind must be adamw or muon")
         if self.wandb.mode not in {"online", "offline", "disabled"}:
@@ -269,55 +361,105 @@ class ExperimentConfig:
             raise ValueError("train.timestep_scale must be finite and positive")
         if not 0 <= self.train.horizontal_flip_probability <= 1:
             raise ValueError("train.horizontal_flip_probability must be in [0, 1]")
-        cache_active = self.reg_cache.enabled and reg.enabled
-        if cache_active and self.train.horizontal_flip_probability != 0:
-            raise ValueError(
-                "cached REG training requires train.horizontal_flip_probability=0"
+        if features.enabled:
+            if not self.feature_cache.directory:
+                raise ValueError("feature_cache.directory cannot be empty")
+            _positive(
+                "feature-cache batch size and log interval",
+                self.feature_cache.batch_size,
+                self.feature_cache.log_interval,
             )
-        if not self.reg_cache.directory:
-            raise ValueError("reg_cache.directory cannot be empty")
+            if (
+                self.feature_cache.enabled
+                and self.train.horizontal_flip_probability != 0
+            ):
+                raise ValueError(
+                    "cached feature training requires train.horizontal_flip_probability=0"
+                )
         if self.checkpoint.keep_last_n < 0:
             raise ValueError("checkpoint.keep_last_n cannot be negative")
+        self._validate_sampling()
+        if self.evaluation.batch_size < 1 or self.evaluation.log_interval < 1:
+            raise ValueError("evaluation batch size and log interval must be positive")
+        if not self.evaluation.reference_npz or not self.evaluation.device:
+            raise ValueError("evaluation reference_npz and device cannot be empty")
+
+    def _validate_sampling(self) -> None:
+        sampling = self.sampling
+        _positive(
+            "sampling counts",
+            sampling.num_samples,
+            sampling.batch_size,
+            sampling.sampling_steps,
+            sampling.log_interval,
+        )
+        if sampling.solver not in {"euler", "heun"}:
+            raise ValueError("sampling.solver must be euler or heun")
+        if sampling.num_samples % self.model.num_classes:
+            raise ValueError("sampling.num_samples must be class balanced")
+        if not math.isfinite(sampling.guidance_scale):
+            raise ValueError("sampling.guidance_scale must be finite")
+        if not math.isfinite(sampling.timestep_shift) or sampling.timestep_shift <= 0:
+            raise ValueError("sampling.timestep_shift must be finite and positive")
+        if not 0 <= sampling.cfg_start <= sampling.cfg_end <= 1:
+            raise ValueError("sampling CFG interval must satisfy 0 <= start <= end <= 1")
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
-def load_config(
-    path: str | Path | None = None, overrides: list[str] | None = None
-) -> ExperimentConfig:
-    """Load a structured OmegaConf config and reject unknown keys."""
+def _require_v2(values: Any, source: str | Path) -> dict[str, Any]:
+    if not isinstance(values, dict):
+        raise ValueError(f"{source} must contain a configuration object")
+    version = values.get("schema_version")
+    if version != CONFIG_SCHEMA_VERSION:
+        raise ValueError(
+            f"{source} uses unsupported configuration schema {version!r}; "
+            f"schema_version: {CONFIG_SCHEMA_VERSION} is required (clean break; old configs "
+            "and checkpoints cannot be migrated)"
+        )
+    return values
+
+
+def _structured_config(values: dict[str, Any]) -> ExperimentConfig:
     from omegaconf import OmegaConf
 
-    schema = OmegaConf.structured(ExperimentConfig)
-    cfg = schema
-    if path is not None:
-        cfg = OmegaConf.merge(cfg, OmegaConf.load(path))
-    if overrides:
-        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
-    OmegaConf.set_struct(cfg, True)
-    result = OmegaConf.to_object(cfg)
+    try:
+        cfg = OmegaConf.merge(OmegaConf.structured(ExperimentConfig), values)
+        OmegaConf.set_struct(cfg, True)
+        result = OmegaConf.to_object(cfg)
+    except Exception as error:
+        raise ValueError(f"invalid schema-v2 configuration: {error}") from error
     if not isinstance(result, ExperimentConfig):
         raise TypeError("configuration did not resolve to ExperimentConfig")
     result.validate()
     return result
 
 
-def load_checkpoint_config(path: str | Path) -> ExperimentConfig:
-    """Load a saved resolved config while migrating known removed fields."""
-    values = json.loads(Path(path).read_text())
-    if not isinstance(values, dict):
-        raise ValueError("checkpoint config must be a JSON object")
-    train = values.get("train")
-    if isinstance(train, dict):
-        train.pop("reg_relative_timestep_shift_min", None)
-        train.pop("reg_relative_timestep_shift_max", None)
+def load_config(
+    path: str | Path | None = None, overrides: list[str] | None = None
+) -> ExperimentConfig:
+    """Load schema-v2 structured YAML and reject old or unknown fields."""
     from omegaconf import OmegaConf
 
-    cfg = OmegaConf.merge(OmegaConf.structured(ExperimentConfig), values)
-    OmegaConf.set_struct(cfg, True)
-    result = OmegaConf.to_object(cfg)
-    if not isinstance(result, ExperimentConfig):
-        raise TypeError("checkpoint configuration did not resolve to ExperimentConfig")
-    result.validate()
-    return result
+    values: dict[str, Any] = {"schema_version": CONFIG_SCHEMA_VERSION}
+    if path is not None:
+        loaded = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
+        values = _require_v2(loaded, path)
+    if overrides:
+        override_values = OmegaConf.to_container(
+            OmegaConf.from_dotlist(overrides), resolve=True
+        )
+        if not isinstance(override_values, dict):
+            raise ValueError("configuration overrides must form an object")
+        values = OmegaConf.to_container(
+            OmegaConf.merge(values, override_values), resolve=True
+        )
+        assert isinstance(values, dict)
+    return _structured_config(values)
+
+
+def load_checkpoint_config(path: str | Path) -> ExperimentConfig:
+    """Load a resolved v2 checkpoint config; legacy checkpoints are rejected."""
+    values = _require_v2(json.loads(Path(path).read_text()), path)
+    return _structured_config(values)

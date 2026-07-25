@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 import torch
@@ -28,6 +29,36 @@ def sample_timesteps(
 ) -> Tensor:
     normal = torch.randn(batch_size, generator=generator, device=device, dtype=torch.float32)
     return (loc + scale * normal).sigmoid()
+
+
+def sample_reg_timesteps(
+    image_timestep: Tensor,
+    ratio_min: float,
+    ratio_max: float,
+    generator: torch.Generator,
+) -> tuple[Tensor, Tensor]:
+    """Draw a log-uniform relative schedule and shift image time for REG."""
+    if (
+        not math.isfinite(ratio_min)
+        or not math.isfinite(ratio_max)
+        or ratio_min <= 0
+        or ratio_max < ratio_min
+    ):
+        raise ValueError("REG timestep ratios must be finite, positive, and ordered")
+    if ratio_min == ratio_max:
+        ratio = torch.full_like(image_timestep, ratio_min, dtype=torch.float32)
+    else:
+        uniform = torch.rand(
+            image_timestep.shape,
+            generator=generator,
+            device=image_timestep.device,
+            dtype=torch.float32,
+        )
+        log_ratio = math.log(ratio_min) + uniform * (
+            math.log(ratio_max) - math.log(ratio_min)
+        )
+        ratio = log_ratio.exp()
+    return shift_timestep(image_timestep, ratio), ratio
 
 
 def _expand(timestep: Tensor, like: Tensor) -> Tensor:
@@ -76,6 +107,7 @@ def jit_losses(
     clean_reg: Tensor | None = None,
     reg_noise: Tensor | None = None,
     reg_prediction: Tensor | None = None,
+    reg_timestep: Tensor | None = None,
     repa_prediction: Tensor | None = None,
     repa_target: Tensor | None = None,
     reg_weight: float = 0.03,
@@ -85,15 +117,21 @@ def jit_losses(
         clean_image, image_noise, timestep, image_prediction
     )
     zero = image_loss.new_zeros(())
-    reg_values = (clean_reg, reg_noise, reg_prediction)
+    reg_values = (clean_reg, reg_noise, reg_prediction, reg_timestep)
     if any(value is not None for value in reg_values):
         if not all(value is not None for value in reg_values):
             raise ValueError(
-                "clean REG tokens, REG noise, and REG prediction must be provided together"
+                "clean REG tokens, REG noise, REG prediction, and REG timestep "
+                "must be provided together"
             )
-        assert clean_reg is not None and reg_noise is not None and reg_prediction is not None
+        assert (
+            clean_reg is not None
+            and reg_noise is not None
+            and reg_prediction is not None
+            and reg_timestep is not None
+        )
         reg_loss = clean_prediction_velocity_loss(
-            clean_reg, reg_noise, timestep, reg_prediction
+            clean_reg, reg_noise, reg_timestep, reg_prediction
         )
         reg_x0_mse = F.mse_loss(reg_prediction.float(), clean_reg.float())
         reg_x0_cosine = F.cosine_similarity(

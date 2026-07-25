@@ -1,38 +1,61 @@
-# JiT + REG
+# JiT with independent REG and REPA
 
-`jit-reg` trains a class-conditional SiT directly on ImageNet-256 RGB pixels with the JiT
-clean-image objective. The canonical baseline is SiT-B/32: 256×256 images are projected into an
-8×8 patch grid, processed by a 12-block adaLN-Zero transformer, and predicted directly back into
-pixels. Patch size is configurable whenever it divides the image size exactly.
+`jit-reg` trains a class-conditional SiT-B/16 directly on ImageNet-256 pixels. REG
+jointly denoises DINOv3 representation tokens; REPA aligns an intermediate SiT
+sequence with frozen DINOv3 targets. Either feature can be enabled independently,
+and disabling both leaves the baseline model and objective unchanged.
 
-Optional standard REG adds a jointly diffused DINOv3 feature state and optional block-4 REPA
-alignment.
-The default `model.reg.token_mode=cls` state contains one CLS token. The opt-in `cls_spatial` mode
-also adaptively pools the normalized 16×16 patch map to a configurable grid (4×4 by default),
-applies parameter-free LayerNorm to each pooled token, and gives those tokens learned absolute
-positions inside SiT. The frozen `vit_base_patch16_dinov3.lvd1689m` target is loaded only for REG
-training and its four register tokens are discarded. REPA aligns only SiT image-patch tokens with
-DINO patch features resized to the JiT grid. Sampling a REG checkpoint does not load DINOv3.
+This repository uses configuration schema v2. Schema-v1 configs, checkpoints,
+feature caches, and sampling manifests are intentionally incompatible and must be
+rebuilt.
 
-The opt-in wide-intermediate REG ablation predicts the complete clean REG state x₀ after block 4
-with two conditioned, 2048-wide SwiGLU residual layers. By default, the prediction is projected
-back to the SiT hidden size and replaces the hidden REG prefix before blocks 5–12. Two additional
-ablations can project predicted CLS x₀ into downstream conditioning and project the final wide CLS
-latent into a configurable number of continuation REG tokens. A third optional branch uses
-predicted x₀ or the wide CLS latent to gate a fresh projection of the raw noisy 32×32×3 patches
-back into the image-token stream. Standard REG remains the default.
+## Presets
 
-Set `model.reg.cls_head_block=-1` to move the wide REG predictor after the final SiT transformer
-block. In this terminal mode the predictor is auxiliary: it predicts REG x₀ for the REG objective
-but does not feed the image prediction. Clean REG reinjection, continuation tokens, x₀
-conditioning, and patch reprojection are not allocated or applied, even if their configuration
-values are present.
+- `configs/baseline-p16.yaml`: feature-free SiT-B/16 baseline.
+- `configs/reg-repa-p16.yaml`: paper-style one-CLS REG plus block-4,
+  full-sequence REPA; equal image and REG time.
+- `configs/early-reg-p16.yaml`: CLS plus pooled 4×4 spatial REG, a block-4
+  2048-wide depth-2 head, FC–GELU–FC reinjection, and a log-uniform training
+  REG-time ratio from 0.5 to 1.0 (0.5 at sampling time).
 
-The standard REG predictor also always runs after the final SiT block. It ignores
-`cls_head_block` and all wide-only extension settings rather than validating or allocating them.
+The v2 feature configuration lives under `model.features`:
 
-See [`configs/exp.md`](configs/exp.md) for a concise explanation of the intermediate semantic
-prediction experiment, its relationship to baseline/REG/REPA, and a SiT-B/16 FLOP comparison.
+```yaml
+model:
+  features:
+    encoder:
+      model_name: vit_base_patch16_dinov3.lvd1689m
+      feature_dim: 768
+      register_tokens: 4
+    reg:
+      enabled: true
+      token_mode: cls
+      pool_size: 4
+      loss_weight: 0.03
+      head:
+        kind: standard       # standard | wide_mlp
+        hidden_size: 2048
+        depth: 2
+        mlp_ratio: 4.0
+      timestep:
+        train_ratio_min: 1.0
+        train_ratio_max: 1.0
+        sample_ratio: 1.0
+      early_prediction:
+        block: null          # null predicts after the final block
+        projection_hidden_size: 2048
+    repa:
+      enabled: true
+      block: 4
+      projection_hidden_size: 2048
+      loss_weight: 0.5
+      token_scope: image_and_reg  # image | image_and_reg
+```
+
+Every transformer block uses the same adaLN weights for both streams while applying
+image-time parameters to image tokens and REG-time parameters to REG tokens. REG
+heads predict clean x₀. The REG velocity objective is derived from that x₀ using
+REG time; the pixel objective uses image time.
 
 ## Environment
 
@@ -41,16 +64,13 @@ Python 3.12 is required.
 ```bash
 uv sync --extra dev
 uv run hf auth login
-uv run wandb login       # only for --wandb runs
+uv run wandb login
 uv run pytest -q
 uv run ruff check .
 ```
 
-The ImageNet repository and revision are pinned in `configs/canonical.yaml`. Training reads it
-directly through Hugging Face Datasets and extracts DINO targets online by default; an optional
-target-cache workflow is documented below.
-
-Download the ImageNet-256 ADM reference statistics once:
+Download the ImageNet-256 ADM reference statistics to the path configured by
+`evaluation.reference_npz`:
 
 ```bash
 mkdir -p data
@@ -59,290 +79,77 @@ curl -L \
   -o data/VIRTUAL_imagenet256_labeled.npz
 ```
 
-## Train
+## Training
 
-Baseline:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/canonical.yaml \
-  --output runs/baseline-p32 \
-  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
-  --wandb
-```
-
-REG + REPA:
+All feature and online-evaluation settings come from YAML. Structured overrides are
+the only command-line mechanism for changing them.
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/canonical.yaml \
-  --reg \
-  --output runs/reg-p32 \
-  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
-  --wandb
+  --config configs/baseline-p16.yaml \
+  --output runs/baseline-p16
+
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/reg-repa-p16.yaml \
+  --output runs/reg-repa-p16
+
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/early-reg-p16.yaml \
+  --output runs/early-reg-p16
 ```
 
-REG without REPA:
+For example, a REPA-only run can be selected without feature-specific CLI flags:
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/canonical.yaml \
-  --reg --no-repa \
-  --output runs/reg-no-repa-p32 \
-  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
-  --wandb
+  --config configs/baseline-p16.yaml \
+  --override model.features.repa.enabled=true \
+  --output runs/repa-p16
 ```
 
-REG with CLS plus a pooled 4×4 spatial feature map:
+## Independent feature caches
+
+The component builder creates only missing active components. REG and REPA live
+under separate fingerprints, so changing a head, loss, optimizer, REPA block, REG
+timing, sampling, evaluation, or the other feature does not invalidate a reusable
+component.
+
+Cached training disables random flips:
 
 ```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/canonical.yaml \
-  --reg \
-  --override model.reg.token_mode=cls_spatial \
-  --override model.reg.pool_size=4 \
-  --output runs/reg-spatial-p32 \
-  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
-  --wandb
-```
-
-Wide-intermediate REG + REPA (matched ablation):
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/canonical.yaml \
-  --reg-widehead \
-  --output runs/reg-widehead-p32 \
-  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
-  --wandb
-```
-
-Enable the two independent wide-head extensions with structured overrides:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/canonical.yaml \
-  --reg-widehead --no-repa \
-  --override model.reg.x0_conditioning=true \
-  --override model.reg.continuation_tokens=4 \
-  --output runs/reg-wide-extended-p32 \
-  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
-  --wandb
-```
-
-Enable conditional raw-patch reprojection with its default 2048-dimensional interaction:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/canonical.yaml \
-  --reg-widehead --no-repa \
-  --override model.reg.patch_reprojection.enabled=true \
-  --override model.reg.patch_reprojection.source=x0_cls \
-  --output runs/reg-patch-reprojection-p32 \
-  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
-  --wandb
-```
-
-At the intermediate REG head, this branch patchifies the original noisy image again, projects each
-raw patch into `model.reg.patch_reprojection.intermediate_size`, gates it with either predicted CLS
-x₀ or the final wide CLS latent (plus timestep conditioning by default), projects it to the SiT
-hidden size, and adds it to the existing image tokens with a learned residual scale initialized to
-`1e-3`. Set `source=wide_cls` to test the less constrained latent source.
-
-Change patch size with a structured override, for example
-`--override model.patch_size=16`. The canonical recipe is 80 epochs, global batch 1024, Muon,
-learning rate `2e-4` for 25 epochs followed by a 25-epoch linear decay to `2e-5`, EMA `0.9995`,
-10% classifier-free label dropout, and logit-normal image timesteps with location `-0.8` and
-scale `0.8`.
-
-REG and image states use the same sampled timestep for interpolation, velocity losses, transformer
-conditioning, validation, and sampling.
-
-Images are randomly flipped on the training device through a checkpointed RNG stream. The same
-flipped `[0,1]` image is normalized for DINOv3 in REG runs and scaled to `[-1,1]` for JiT.
-
-## Cache REG targets
-
-REG runs can read precomputed targets and avoid loading DINOv3 during training. The cache stores
-BF16 CLS tokens for `token_mode=cls`, or CLS plus only the configured pooled tokens for
-`token_mode=cls_spatial`. When REPA is enabled, it also stores normalized BF16 patch targets
-resized to the configured JiT grid; the native 16×16 DINO patch map is not saved.
-
-Cached runs deliberately disable horizontal flipping, so use the same zero flip probability when
-building and training:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/cache_reg.py \
-  --config configs/canonical.yaml \
-  --override model.reg.token_mode=cls \
+uv run torchrun --standalone --nproc-per-node=8 scripts/cache_features.py \
+  --config configs/reg-repa-p16.yaml \
   --override train.horizontal_flip_probability=0
 
 uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/canonical.yaml \
-  --reg \
-  --override reg_cache.enabled=true \
+  --config configs/reg-repa-p16.yaml \
+  --override feature_cache.enabled=true \
   --override train.horizontal_flip_probability=0 \
-  --output runs/reg-cached-p32 \
-  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
-  --wandb
+  --output runs/reg-repa-cached-p16
 ```
 
-For a smaller REG-only cache, disable REPA in both commands:
+Cache manifests record environment versions diagnostically, but only pinned
+dataset/preprocessing, encoder identity, component feature schema, and the
+component’s target layout participate in its fingerprint.
 
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/cache_reg.py \
-  --config configs/canonical.yaml \
-  --override model.reg.repa_enabled=false \
-  --override train.horizontal_flip_probability=0
+## Sampling and evaluation
 
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/canonical.yaml \
-  --reg --no-repa \
-  --override reg_cache.enabled=true \
-  --override train.horizontal_flip_probability=0 \
-  --output runs/reg-no-repa-cached-p32 \
-  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
-  --wandb
-```
-
-Use matching `model.patch_size`, `model.reg.repa_enabled`, `model.reg.token_mode`, and
-`model.reg.pool_size` overrides in both commands. Caches live under
-`data/reg-tokens/<fingerprint>/`, are resumable under `torchrun`, and are rejected when their
-dataset, DINO model, target-grid/token configuration, environment, shape, or completion state
-differs. REPA storage scales quadratically with the JiT grid: the canonical 8×8 BF16 targets use
-about 126 GB for 1.28 million images. Schema-v1 REG-only caches must be rebuilt.
-
-Resume standard REG with the same model overrides and REG variant:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/canonical.yaml \
-  --reg \
-  --output runs/reg-p32 \
-  --resume runs/reg-p32/checkpoints/last \
-  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
-  --validate-now --wandb
-```
-
-Resume the wide-intermediate variant with `--reg-widehead`:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/canonical.yaml \
-  --reg-widehead \
-  --output runs/reg-widehead-p32 \
-  --resume runs/reg-widehead-p32/checkpoints/last \
-  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
-  --validate-now --wandb
-```
-
-Checkpoints contain raw model and EMA weights, optimizer state, all explicit RNG streams, the
-pinned dataset/preprocessing and REG-cache fingerprints, resolved configuration, validation plan,
-lightweight metadata, and W&B identity. DINOv3 is outside model/EMA state. `last` and `best-fid`
-are resumable pointers.
-
-## Objective and sampling
-
-Time runs from noise to data:
-
-```text
-x_t = t*x + (1-t)*noise
-v_target = (x - x_t) / max(1-t, 0.05)
-v_pred   = (x_pred - x_t) / max(1-t, 0.05)
-```
-
-The baseline minimizes image velocity MSE. REG adds `0.03 × REG-state velocity MSE` and
-`0.5 × negative cosine REPA loss` over resized DINO patch targets. Both REG variants log
-unweighted `train/reg_x0_mse` and `train/reg_x0_cosine`; these diagnostics do not change the
-objective weights.
-
-Sampling defaults to 50-step Euler integration and also supports Heun with `--solver heun`.
-Heun applies trapezoidal correction before using Euler for the final step, so it requires
-`2 × steps - 1` model evaluations. Scale `1` selects the conditional prediction. CFG defaults
-to the shifted-time interval `[0.0, 0.9]` and can be changed with `--cfg-start` and `--cfg-end`;
-outside that inclusive interval, sampling uses a conditional-only model batch. REG sampling
-deterministically initializes and jointly integrates the image and configured REG state with the
-same solver and schedule. `--timestep-shift` controls that shared schedule.
+Standalone sampling inherits `sampling.*` from the checkpoint. Explicit sampling
+flags override individual defaults. REG checkpoints jointly integrate distinct
+image and REG schedules with Euler or Heun; CFG-window decisions use image time.
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --checkpoint-dir runs/baseline-p32/checkpoints/last
+  --checkpoint-dir runs/reg-repa-p16/checkpoints/last
 
 uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --checkpoint-dir runs/reg-p32/checkpoints/last
-
-uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
+  --checkpoint-dir runs/early-reg-p16/checkpoints/last \
   --solver heun \
-  --timestep-shift 0.125 \
-  --checkpoint-dir runs/reg-widehead-p32/checkpoints/last
+  --evaluate
 ```
 
-Generation is rank-partitioned and resumable. It writes an ADM-compatible `samples.npz`, a
-preview, and a manifest beneath the resolved epoch checkpoint. The child directory name records
-the solver, sample count, integration steps, CFG scale, timestep shift, and CFG interval, for
-example `samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-0p9`. Its manifest also records
-model and REG settings, checkpoint hash, validation-plan hash, solver, and actual NFE. Resuming
-rejects incompatible settings, and checkpoint retention protects epochs containing sampling
-outputs.
-
-## Matched wide-head experiment
-
-Use the standard and wide-intermediate commands above from scratch with the same data revision,
-seed, optimizer, loss weights, validation plan, and sampler settings. The canonical 80-epoch run
-performs periodic FID-5K and final FID-50K. Compare FID convergence and final FID alongside image
-and REG velocity losses, REG x₀ MSE/cosine, REPA loss, gradient norm, parameter count, throughput,
-and peak memory. Treat the ablation as successful only when matched final FID improves with stable
-training; otherwise keep standard REG as the default and record the wide head as a negative result.
-
-## Validate, evaluate, and compare
-
-Periodic and final validation are configured under `validation.*` and use the EMA model plus the
-same immutable labels, sample IDs, and noise seeds as standalone sampling. To evaluate an archive:
-
-```bash
-uv run python scripts/eval.py \
-  --reference data/VIRTUAL_imagenet256_labeled.npz \
-  --output runs/baseline-p32/evaluation.json \
-  --samples runs/baseline-p32/checkpoints/last/samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-0p9/samples.npz
-
-uv run python scripts/eval.py \
-  --samples runs/reg-p32/checkpoints/last/samples-euler-n50000-steps50-cfg1p78-shift1p0-window0p0-0p9/samples.npz \
-  --reference data/VIRTUAL_imagenet256_labeled.npz \
-  --output runs/reg-p32/evaluation.json
-
-uv run python scripts/compare.py \
-  runs/baseline-p32/evaluation.json \
-  runs/reg-p32/evaluation.json \
-  --output runs/comparison.json
-```
-
-Comparison is model-agnostic and requires matching validation-plan hashes.
-
-## Smoke workflow
-
-This checks the direct data path and a tiny baseline without compilation:
-
-```bash
-uv run python scripts/train.py \
-  --config configs/canonical.yaml \
-  --output /tmp/jit-reg-smoke \
-  --reference-npz data/VIRTUAL_imagenet256_labeled.npz \
-  --max-steps 2 \
-  --override data.max_samples=32 \
-  --override data.workers=0 \
-  --override model.hidden_size=64 \
-  --override model.depth=2 \
-  --override model.num_heads=4 \
-  --override compile.enabled=false \
-  --override train.global_batch_size=8 \
-  --override train.micro_batch_size=4 \
-  --override validation.interval=0 \
-  --override validation.periodic_samples=1000 \
-  --override validation.final_samples=1000 \
-  --eval-sampling-steps 2
-```
-
-Add `--reg --override model.reg.repa_block=2` to smoke-test standard REG with the two-block model.
-For wide-intermediate REG, add `--reg-widehead`, set `model.reg.repa_block=1`, and set
-`model.reg.cls_head_block=1`; an intermediate head must run before the final block. Use
-`model.reg.cls_head_block=-1` for the auxiliary terminal-head mode.
+`--evaluate` computes FID on rank zero using the checkpoint’s `evaluation.*`
+settings and writes `evaluation.json` beside `samples.npz`. Output names and
+manifests record the relative REG schedule and complete schema-v2 feature
+description. Sampling is rank-partitioned and resumable only from a compatible
+schema-v2 manifest.

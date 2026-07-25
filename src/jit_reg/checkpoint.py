@@ -24,6 +24,7 @@ def _contiguous(state: dict[str, object]) -> dict[str, Tensor]:
 
 @dataclass
 class ResumeState:
+    schema_version: int
     epoch: int
     global_step: int
     last_completed_validation_epoch: int | None
@@ -32,7 +33,7 @@ class ResumeState:
     validation_plan_hash: str
     optimizer: dict[str, Any]
     rng_streams: dict[str, Tensor]
-    reg_cache_fingerprint: str | None = None
+    feature_cache_fingerprints: dict[str, str] | None = None
 
 
 def should_checkpoint(completed_epoch: int, total_epochs: int, interval: int) -> bool:
@@ -87,7 +88,7 @@ class CheckpointManager:
         last_completed_validation_epoch: int | None,
         wandb_run_id: str | None,
         resolved_config: dict[str, Any],
-        reg_cache_fingerprint: str | None = None,
+        feature_cache_fingerprints: dict[str, str] | None = None,
         fid: float | None = None,
     ) -> Path:
         name = f"epoch-{completed_epoch:04d}"
@@ -100,6 +101,7 @@ class CheckpointManager:
         save_file(_contiguous(raw_state), str(temporary / "model.safetensors"))
         save_file(_contiguous(ema.state_dict()), str(temporary / "ema.safetensors"))
         training = {
+            "schema_version": 2,
             "epoch": completed_epoch,
             "global_step": global_step,
             "last_completed_validation_epoch": last_completed_validation_epoch,
@@ -108,7 +110,7 @@ class CheckpointManager:
             "validation_plan_hash": validation_plan_hash,
             "optimizer": optimizer_state,
             "rng_streams": rng_streams,
-            "reg_cache_fingerprint": reg_cache_fingerprint,
+            "feature_cache_fingerprints": feature_cache_fingerprints,
         }
         torch.save(training, temporary / "training.pt")
         (temporary / "config.json").write_text(
@@ -124,12 +126,12 @@ class CheckpointManager:
         (temporary / "metadata.json").write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "completed_epoch": completed_epoch,
                     "global_step": global_step,
                     "data_fingerprint": data_fingerprint,
                     "validation_plan_hash": validation_plan_hash,
-                    "reg_cache_fingerprint": reg_cache_fingerprint,
+                    "feature_cache_fingerprints": feature_cache_fingerprints,
                 },
                 indent=2,
                 sort_keys=True,
@@ -186,14 +188,31 @@ class CheckpointManager:
         ema: EMA,
         expected_data_fingerprint: str | None = None,
         expected_validation_plan_hash: str | None = None,
-        expected_reg_cache_fingerprint: str | None = None,
+        expected_feature_cache_fingerprints: dict[str, str] | None = None,
     ) -> ResumeState:
         path = Path(checkpoint)
         if not path.is_absolute():
             path = self.directory / path
+        metadata_path = path / "metadata.json"
+        if not metadata_path.is_file():
+            raise ValueError(
+                "checkpoint predates schema v2; old checkpoints are not supported"
+            )
+        metadata = json.loads(metadata_path.read_text())
+        if metadata.get("schema_version") != 2:
+            raise ValueError(
+                "checkpoint schema is incompatible; schema-v1 checkpoints cannot be migrated"
+            )
+        from .config import load_checkpoint_config
+
+        load_checkpoint_config(path / "config.json")
         model.load_state_dict(load_file(str(path / "model.safetensors")))
         ema.load_state_dict(load_file(str(path / "ema.safetensors")))
         state = torch.load(path / "training.pt", map_location="cpu", weights_only=False)
+        if state.get("schema_version") != 2:
+            raise ValueError(
+                "checkpoint training state is incompatible with schema v2"
+            )
         if expected_data_fingerprint and state["data_fingerprint"] != expected_data_fingerprint:
             raise ValueError("checkpoint dataset/preprocessing fingerprint mismatch")
         if (
@@ -201,11 +220,12 @@ class CheckpointManager:
             and state["validation_plan_hash"] != expected_validation_plan_hash
         ):
             raise ValueError("checkpoint validation-plan hash mismatch")
-        saved_cache_fingerprint = state.get("reg_cache_fingerprint")
-        if expected_reg_cache_fingerprint != saved_cache_fingerprint and (
-            expected_reg_cache_fingerprint is not None or saved_cache_fingerprint is not None
+        saved_cache_fingerprints = state.get("feature_cache_fingerprints")
+        if expected_feature_cache_fingerprints != saved_cache_fingerprints and (
+            expected_feature_cache_fingerprints is not None
+            or saved_cache_fingerprints is not None
         ):
-            raise ValueError("checkpoint REG-cache fingerprint mismatch")
+            raise ValueError("checkpoint feature-cache fingerprints mismatch")
         return ResumeState(**state)
 
     def export_ema(self, ema: EMA, path: str | Path) -> None:

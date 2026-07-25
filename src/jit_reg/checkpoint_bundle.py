@@ -3,9 +3,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-
-import torch
 
 from .config import ExperimentConfig, load_checkpoint_config
 from .validation import ValidationPlan, create_validation_plan
@@ -34,18 +31,16 @@ def resolve_checkpoint_directory(path: str | Path) -> Path:
 
 def _expected_plan_hash(directory: Path) -> str:
     metadata_path = directory / "metadata.json"
-    if metadata_path.is_file():
-        metadata = json.loads(metadata_path.read_text())
-        value = metadata.get("validation_plan_hash")
-    else:
-        state: dict[str, Any] = torch.load(
-            directory / "training.pt",
-            map_location="cpu",
-            weights_only=False,
-            mmap=True,
+    if not metadata_path.is_file():
+        raise ValueError(
+            "checkpoint predates schema v2; old checkpoints are not supported"
         )
-        value = state.get("validation_plan_hash")
-        del state
+    metadata = json.loads(metadata_path.read_text())
+    if metadata.get("schema_version") != 2:
+        raise ValueError(
+            "checkpoint schema is incompatible; schema-v1 checkpoints cannot be migrated"
+        )
+    value = metadata.get("validation_plan_hash")
     if not isinstance(value, str) or not value:
         raise ValueError("checkpoint has no validation-plan hash")
     return value

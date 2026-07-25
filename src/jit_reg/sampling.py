@@ -42,6 +42,7 @@ def ode_sample(
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
+    reg_timestep_ratio: float = 1.0,
     cfg_interval: tuple[float, float] = (0.0, 0.9),
     solver: Solver = "euler",
     num_classes: int | None = None,
@@ -58,6 +59,7 @@ def ode_sample(
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
+    reg_timestep_ratio: float = 1.0,
     cfg_interval: tuple[float, float] = (0.0, 0.9),
     solver: Solver = "euler",
     num_classes: int | None = None,
@@ -74,6 +76,7 @@ def ode_sample(
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
+    reg_timestep_ratio: float = 1.0,
     cfg_interval: tuple[float, float] = (0.0, 0.9),
     solver: Solver = "euler",
     num_classes: int | None = None,
@@ -83,6 +86,8 @@ def ode_sample(
         raise ValueError("sampling steps must be positive")
     if not math.isfinite(timestep_shift) or timestep_shift <= 0:
         raise ValueError("timestep shift must be finite and positive")
+    if not math.isfinite(reg_timestep_ratio) or reg_timestep_ratio <= 0:
+        raise ValueError("REG timestep ratio must be finite and positive")
     if not math.isfinite(guidance_scale):
         raise ValueError("guidance scale must be finite")
     cfg_start, cfg_end = cfg_interval
@@ -105,18 +110,25 @@ def ode_sample(
     null_labels = torch.full_like(labels, num_classes)
     combined_labels = torch.cat((labels, null_labels))
     u = torch.linspace(0, 1, steps + 1, device=noise.device, dtype=torch.float32)
-    schedule = shift_timestep(u, timestep_shift)
+    image_schedule = shift_timestep(u, timestep_shift)
+    reg_schedule = shift_timestep(image_schedule, reg_timestep_ratio)
 
     def predict_clean(
         image_state: Tensor,
         current_reg_state: Tensor | None,
-        timestep_value: Tensor,
+        image_timestep_value: Tensor,
+        reg_timestep_value: Tensor,
     ) -> tuple[Tensor, Tensor | None]:
-        use_cfg = cfg_start <= float(timestep_value) <= cfg_end
+        use_cfg = cfg_start <= float(image_timestep_value) <= cfg_end
         if use_cfg:
             model_image = torch.cat((image_state, image_state)).to(noise.dtype)
             model_labels = combined_labels
-            model_timestep = timestep_value.expand(2 * noise.shape[0])
+            model_timestep = image_timestep_value.expand(2 * noise.shape[0])
+            model_reg_timestep = (
+                reg_timestep_value.expand(2 * noise.shape[0])
+                if current_reg_state is not None
+                else None
+            )
             model_reg = (
                 torch.cat((current_reg_state, current_reg_state)).to(reg_noise.dtype)
                 if current_reg_state is not None and reg_noise is not None
@@ -125,19 +137,21 @@ def ode_sample(
         else:
             model_image = image_state.to(noise.dtype)
             model_labels = labels
-            model_timestep = timestep_value.expand(noise.shape[0])
+            model_timestep = image_timestep_value.expand(noise.shape[0])
+            model_reg_timestep = (
+                reg_timestep_value.expand(noise.shape[0])
+                if current_reg_state is not None
+                else None
+            )
             model_reg = (
                 current_reg_state.to(reg_noise.dtype)
                 if current_reg_state is not None and reg_noise is not None
                 else None
             )
-        output = model(
-            model_image,
-            model_timestep,
-            model_labels,
-            noisy_reg=model_reg,
-            return_repa=False,
-        )
+        model_kwargs = {"noisy_reg": model_reg, "return_repa": False}
+        if model_reg_timestep is not None:
+            model_kwargs["reg_timestep"] = model_reg_timestep
+        output = model(model_image, model_timestep, model_labels, **model_kwargs)
         if use_cfg:
             conditional_image, unconditional_image = output.image.float().chunk(2)
             image_prediction = _guided(
@@ -158,8 +172,14 @@ def ode_sample(
                 reg_prediction = output.reg.float()
         return image_prediction, reg_prediction
 
-    for step_index, (current, following) in enumerate(pairwise(schedule)):
-        image_prediction, reg_prediction = predict_clean(x, reg_state, current)
+    image_pairs = pairwise(image_schedule)
+    reg_pairs = pairwise(reg_schedule)
+    for step_index, ((current, following), (reg_current, reg_following)) in enumerate(
+        zip(image_pairs, reg_pairs, strict=True)
+    ):
+        image_prediction, reg_prediction = predict_clean(
+            x, reg_state, current, reg_current
+        )
         denominator = (1 - current).clamp_min(0.05)
         step_size = following - current
         image_velocity = (image_prediction - x) / denominator
@@ -170,13 +190,14 @@ def ode_sample(
         if reg_state is not None:
             if reg_prediction is None:
                 raise RuntimeError("REG sampling requires a model REG-token prediction")
-            reg_denominator = (1 - current).clamp_min(0.05)
+            reg_denominator = (1 - reg_current).clamp_min(0.05)
+            reg_step_size = reg_following - reg_current
             reg_velocity = (reg_prediction - reg_state) / reg_denominator
-            predicted_reg = reg_state + step_size * reg_velocity
+            predicted_reg = reg_state + reg_step_size * reg_velocity
 
         if solver == "heun" and step_index < steps - 1:
             corrected_image, corrected_reg = predict_clean(
-                predicted_x, predicted_reg, following
+                predicted_x, predicted_reg, following, reg_following
             )
             corrected_denominator = (1 - following).clamp_min(0.05)
             corrected_image_velocity = (
@@ -188,10 +209,11 @@ def ode_sample(
                     raise RuntimeError(
                         "REG sampling requires a model REG-token prediction"
                     )
+                corrected_reg_denominator = (1 - reg_following).clamp_min(0.05)
                 corrected_reg_velocity = (
                     corrected_reg - predicted_reg
-                ) / corrected_denominator
-                reg_state = reg_state + 0.5 * step_size * (
+                ) / corrected_reg_denominator
+                reg_state = reg_state + 0.5 * reg_step_size * (
                     reg_velocity + corrected_reg_velocity
                 )
         else:
@@ -211,6 +233,7 @@ def euler_sample(
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
+    reg_timestep_ratio: float = 1.0,
     cfg_interval: tuple[float, float] = (0.0, 0.9),
     num_classes: int | None = None,
 ) -> Tensor | ODESample:
@@ -223,6 +246,7 @@ def euler_sample(
         steps=steps,
         guidance_scale=guidance_scale,
         timestep_shift=timestep_shift,
+        reg_timestep_ratio=reg_timestep_ratio,
         cfg_interval=cfg_interval,
         solver="euler",
         num_classes=num_classes,
@@ -238,6 +262,7 @@ def heun_sample(
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
+    reg_timestep_ratio: float = 1.0,
     cfg_interval: tuple[float, float] = (0.0, 0.9),
     num_classes: int | None = None,
 ) -> Tensor | ODESample:
@@ -250,6 +275,7 @@ def heun_sample(
         steps=steps,
         guidance_scale=guidance_scale,
         timestep_shift=timestep_shift,
+        reg_timestep_ratio=reg_timestep_ratio,
         cfg_interval=cfg_interval,
         solver="heun",
         num_classes=num_classes,

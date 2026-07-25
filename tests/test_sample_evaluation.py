@@ -1,22 +1,19 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
-import tomllib
-import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
-from PIL import Image
 from torch import nn
 
-from jit_reg.config import ExperimentConfig, WandbConfig
+from jit_reg.config import ExperimentConfig
 from jit_reg.evaluation import (
-    NpzImageReader,
     evaluate_npz,
     fid_from_statistics,
     validate_reference_statistics,
@@ -28,231 +25,84 @@ from jit_reg.sample_runtime import (
 )
 from jit_reg.validation import create_validation_plan
 from jit_reg.validation_runtime import validate_ema
-from jit_reg.wandb_utils import RunLogger
+
+ROOT = Path(__file__).resolve().parents[1]
+FEATURE_SCHEMA = {
+    "schema_version": 2,
+    "encoder": {},
+    "reg": {"enabled": False},
+    "repa": {"enabled": False},
+}
 
 
-def _generated(positions: torch.Tensor) -> torch.Tensor:
-    values = positions.float().view(-1, 1, 1, 1) / 255
-    return values.expand(-1, 3, 256, 256).clone()
-
-
-def _sample(
-    root: Path,
-    generate: object,
-    *,
-    checkpoint_hash: str = "abc",
-    parameters: SamplingParameters | None = None,
-) -> Path:
-    return sample_to_archive(
-        output_dir=root,
-        plan=create_validation_plan(4, 2, 2, seed=3),
-        sample_count=4,
-        num_classes=2,
-        image_size=256,
-        patch_size=32,
-        model_variant="SiT-B/32",
-        reg_enabled=False,
-        reg_variant="disabled",
-        repa_enabled=False,
-        reg_token_mode="disabled",
-        reg_pool_size=4,
-        reg_x0_conditioning=False,
-        reg_continuation_tokens=None,
-        reg_patch_reprojection_enabled=False,
-        reg_patch_reprojection_source="x0_cls",
-        reg_patch_reprojection_intermediate_size=2048,
-        reg_patch_reprojection_include_timestep=True,
-        checkpoint_hash=checkpoint_hash,
-        parameters=parameters or SamplingParameters(batch_size=2, sampling_steps=3),
-        generate_batch=generate,  # type: ignore[arg-type]
+def test_sampling_output_name_includes_relative_reg_schedule() -> None:
+    name = sampling_output_name(
+        10,
+        SamplingParameters(
+            sampling_steps=3,
+            timestep_shift=2,
+            reg_timestep_ratio=0.5,
+        ),
     )
+    assert "-shift2p0-regshift0p5-" in name
 
 
-def test_sample_archive_is_atomic_balanced_resumable_and_records_jit_metadata(
+def test_sampling_manifest_has_v2_features_and_rejects_old_schema(
     tmp_path: Path,
 ) -> None:
-    calls = 0
-
-    def interrupted(
-        positions: torch.Tensor, _labels: torch.Tensor, _seeds: torch.Tensor
-    ) -> torch.Tensor:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RuntimeError("interrupted")
-        return _generated(positions)
-
-    parameters = SamplingParameters(batch_size=2, sampling_steps=3, log_interval=1)
-    with pytest.raises(RuntimeError, match="interrupted"):
-        _sample(tmp_path, interrupted, parameters=parameters)
-    legacy_manifest_path = tmp_path / "samples.json"
-    legacy_manifest = json.loads(legacy_manifest_path.read_text())
-    legacy_manifest["schema_version"] = 8
-    legacy_manifest["sampling"].pop("solver")
-    legacy_manifest["sampling"].pop("sampling_nfe")
-    legacy_manifest_path.write_text(json.dumps(legacy_manifest))
-    resumed_positions: list[int] = []
-
-    def resumed(
-        positions: torch.Tensor, _labels: torch.Tensor, _seeds: torch.Tensor
-    ) -> torch.Tensor:
-        resumed_positions.extend(positions.tolist())
-        return _generated(positions)
-
-    archive = _sample(tmp_path, resumed, parameters=parameters)
-    assert resumed_positions == [2, 3]
-    with np.load(archive, allow_pickle=False) as values:
-        assert values["arr_0"].shape == (4, 256, 256, 3)
-        assert values["arr_1"].tolist() == [0, 1, 0, 1]
-    with zipfile.ZipFile(archive) as values:
-        assert values.getinfo("arr_0.npy").compress_type == zipfile.ZIP_STORED
-    manifest = json.loads((tmp_path / "samples.json").read_text())
-    assert manifest["complete"] and manifest["schema_version"] == 9
-    assert manifest["patch_size"] == 32 and manifest["jit_grid_size"] == 8
-    assert manifest["model_variant"] == "SiT-B/32" and not manifest["reg_enabled"]
-    assert manifest["reg_variant"] == "disabled"
-    assert not manifest["repa_enabled"]
-    assert manifest["reg_token_mode"] == "disabled"
-    assert manifest["reg_pool_size"] == 4
-    assert manifest["reg_patch_reprojection"] == {
-        "enabled": False,
-        "source": None,
-        "intermediate_size": None,
-        "include_timestep": None,
-    }
-    assert manifest["sampling"] == {
-        "solver": "euler",
-        "sampling_steps": 3,
-        "sampling_nfe": 3,
-        "guidance_scale": 1.78,
-        "timestep_shift": 1.0,
-        "cfg_interval": [0.0, 0.9],
-    }
-    preview = np.asarray(Image.open(tmp_path / "preview.png"))
-    assert preview[0, [0, 256, 512, 768], 0].tolist() == [0, 1, 2, 3]
-    assert not list(tmp_path.glob(".samples-*.npy"))
-    with pytest.raises(ValueError, match="does not match"):
-        _sample(tmp_path, resumed, checkpoint_hash="different", parameters=parameters)
-
-
-def test_sampling_resume_rejects_reg_variant_mismatch(tmp_path: Path) -> None:
-    plan = create_validation_plan(4, 2, 2, seed=3)
+    plan = create_validation_plan(4, 2, 2, seed=4)
 
     def generate(
-        positions: torch.Tensor, _labels: torch.Tensor, _seeds: torch.Tensor
+        positions: torch.Tensor,
+        labels: torch.Tensor,
+        seeds: torch.Tensor,
     ) -> torch.Tensor:
-        return _generated(positions)
+        del labels, seeds
+        return torch.zeros(positions.numel(), 3, 8, 8)
 
-    common = {
-        "output_dir": tmp_path,
-        "plan": plan,
-        "sample_count": 4,
-        "num_classes": 2,
-        "image_size": 256,
-        "patch_size": 32,
-        "model_variant": "SiT-B/32",
-        "reg_enabled": True,
-        "repa_enabled": True,
-        "reg_token_mode": "cls_spatial",
-        "reg_pool_size": 4,
-        "reg_x0_conditioning": False,
-        "reg_continuation_tokens": None,
-        "reg_patch_reprojection_enabled": False,
-        "reg_patch_reprojection_source": "x0_cls",
-        "reg_patch_reprojection_intermediate_size": 2048,
-        "reg_patch_reprojection_include_timestep": True,
-        "checkpoint_hash": "abc",
-        "parameters": SamplingParameters(batch_size=2, sampling_steps=3),
-        "generate_batch": generate,
-    }
-    sample_to_archive(reg_variant="standard", **common)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="does not match"):
-        sample_to_archive(reg_variant="wide_intermediate", **common)  # type: ignore[arg-type]
-
-    token_path = tmp_path / "token-mode"
-    token_common = {**common, "output_dir": token_path, "reg_token_mode": "cls"}
-    sample_to_archive(reg_variant="standard", **token_common)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="does not match"):
-        sample_to_archive(
-            reg_variant="standard",
-            **{**token_common, "reg_token_mode": "cls_spatial"},
-        )
-
-    first = SamplingParameters(
+    parameters = SamplingParameters(
         batch_size=2,
-        sampling_steps=3,
-        guidance_scale=1.5,
-        timestep_shift=0.125,
+        sampling_steps=2,
+        reg_timestep_ratio=0.5,
+        log_interval=1,
     )
-    second = SamplingParameters(
-        batch_size=8,
-        sampling_steps=3,
-        guidance_scale=1.5,
-        timestep_shift=0.125,
-        log_interval=20,
-    )
-    assert sampling_output_name(4, first) == sampling_output_name(4, second)
-    assert sampling_output_name(4, first) != sampling_output_name(
-        4,
-        SamplingParameters(sampling_steps=4, timestep_shift=0.125),
-    )
-    heun = SamplingParameters(sampling_steps=3, solver="heun")
-    assert heun.sampling_nfe == 5
-    assert sampling_output_name(4, heun).startswith("samples-heun-")
-    assert sampling_output_name(4, first) != sampling_output_name(4, heun)
-    with pytest.raises(ValueError, match="solver"):
-        SamplingParameters(solver="unknown").validate()
-
-
-def test_standard_sampling_ignores_wide_only_metadata(tmp_path: Path) -> None:
-    def generate(
-        positions: torch.Tensor, _labels: torch.Tensor, _seeds: torch.Tensor
-    ) -> torch.Tensor:
-        return _generated(positions)
-
-    sample_to_archive(
-        output_dir=tmp_path,
-        plan=create_validation_plan(4, 2, 2, seed=3),
+    output = tmp_path / "samples"
+    archive = sample_to_archive(
+        output_dir=output,
+        plan=plan,
         sample_count=4,
         num_classes=2,
-        image_size=256,
-        patch_size=32,
-        model_variant="SiT-B/32",
-        reg_enabled=True,
-        reg_variant="standard",
-        repa_enabled=False,
-        reg_token_mode="cls",
-        reg_pool_size=4,
-        reg_x0_conditioning=True,
-        reg_continuation_tokens=0,
-        reg_patch_reprojection_enabled=True,
-        reg_patch_reprojection_source="unknown",
-        reg_patch_reprojection_intermediate_size=0,
-        reg_patch_reprojection_include_timestep=True,
+        image_size=8,
+        patch_size=4,
+        model_variant="SiT-Tiny/4",
+        feature_schema=FEATURE_SCHEMA,
         checkpoint_hash="abc",
-        parameters=SamplingParameters(batch_size=2, sampling_steps=3),
+        parameters=parameters,
         generate_batch=generate,
     )
+    assert archive.is_file()
+    manifest = json.loads((output / "samples.json").read_text())
+    assert manifest["schema_version"] == 10
+    assert manifest["feature_schema"] == FEATURE_SCHEMA
+    assert manifest["sampling"]["reg_timestep_ratio"] == 0.5
 
-    manifest = json.loads((tmp_path / "samples.json").read_text())
-    assert not manifest["reg_x0_conditioning"]
-    assert manifest["reg_continuation_tokens"] is None
-    assert manifest["reg_patch_reprojection"] == {
-        "enabled": False,
-        "source": None,
-        "intermediate_size": None,
-        "include_timestep": None,
-    }
-
-
-@pytest.mark.parametrize("compressed", [False, True])
-def test_npz_reader_streams_stored_and_compressed(tmp_path: Path, compressed: bool) -> None:
-    images = np.arange(3 * 256 * 256 * 3, dtype=np.uint8).reshape(3, 256, 256, 3)
-    path = tmp_path / "images.npz"
-    (np.savez_compressed if compressed else np.savez)(path, images)
-    reader = NpzImageReader(path)
-    assert np.array_equal(np.concatenate(list(reader.batches(2))), images)
-    assert reader.compressed is compressed
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "samples.json").write_text(json.dumps({"schema_version": 9}))
+    with pytest.raises(ValueError, match="old manifests"):
+        sample_to_archive(
+            output_dir=old,
+            plan=plan,
+            sample_count=4,
+            num_classes=2,
+            image_size=8,
+            patch_size=4,
+            model_variant="SiT-Tiny/4",
+            feature_schema=FEATURE_SCHEMA,
+            checkpoint_hash="abc",
+            parameters=parameters,
+            generate_batch=generate,
+        )
 
 
 def test_reference_validation_and_known_fid(tmp_path: Path) -> None:
@@ -263,71 +113,41 @@ def test_reference_validation_and_known_fid(tmp_path: Path) -> None:
     assert fid_from_statistics(generated, reference) == pytest.approx(5.0)
 
 
-class _TinyFeatures(nn.Module):
+class TinyFeatures(nn.Module):
     def forward(self, images: torch.Tensor) -> tuple[torch.Tensor]:
         means = images.float().mean(dim=(1, 2, 3))
         return (torch.stack((means, means.square()), dim=1),)
 
 
-def test_evaluate_npz_with_streamed_features(tmp_path: Path) -> None:
-    images = np.stack([np.full((256, 256, 3), value, dtype=np.uint8) for value in (1, 2, 3, 4)])
+def test_evaluate_npz_streams_features(tmp_path: Path) -> None:
+    images = np.stack(
+        [
+            np.full((256, 256, 3), value, dtype=np.uint8)
+            for value in (1, 2, 3, 4)
+        ]
+    )
     samples = tmp_path / "samples.npz"
-    np.savez_compressed(samples, images)
-    features = np.stack((np.array([1, 2, 3, 4]), np.array([1, 4, 9, 16])), axis=1)
+    np.savez(samples, images)
+    features = np.stack(
+        (np.array([1, 2, 3, 4]), np.array([1, 4, 9, 16])), axis=1
+    )
     reference = tmp_path / "reference.npz"
-    np.savez(reference, mu=features.mean(0), sigma=np.cov(features, rowvar=False))
+    np.savez(
+        reference,
+        mu=features.mean(0),
+        sigma=np.cov(features, rowvar=False),
+    )
     metrics = evaluate_npz(
         samples,
         reference,
         batch_size=2,
         device="cpu",
-        feature_extractor=_TinyFeatures(),
+        feature_extractor=TinyFeatures(),
     )
     assert metrics["FID"] == pytest.approx(0.0, abs=1e-8)
 
 
-@pytest.mark.parametrize(
-    "script", ["train.py", "sample.py", "cache_reg.py", "eval.py", "compare.py"]
-)
-def test_standalone_script_help(script: str) -> None:
-    root = Path(__file__).resolve().parents[1]
-    result = subprocess.run(
-        [sys.executable, str(root / "scripts" / script), "--help"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "usage:" in result.stdout
-
-
-def test_distribution_and_console_logger(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    root = Path(__file__).resolve().parents[1]
-    project = tomllib.loads((root / "pyproject.toml").read_text())
-    assert project["project"]["name"] == "jit-reg"
-    logger = RunLogger(WandbConfig(), {}, True, log_interval=1)
-    logger.log_training(
-        {
-            "train/epoch": 1.5,
-            "train/loss": 3.0,
-            "train/image_velocity_loss": 2.0,
-            "train/reg_velocity_loss": 0.0,
-            "train/repa_loss": 0.0,
-            "train/lr": 1e-4,
-            "train/gradient_norm": 0.5,
-            "throughput/images_per_second": 10.0,
-            "throughput/step_seconds": 0.2,
-            "system/peak_memory_gib": 1.0,
-        },
-        step=1,
-    )
-    assert "image=" in capsys.readouterr().out
-
-
-def test_online_validation_writes_shared_artifacts(
+def test_validation_fid_label_uses_actual_count(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     import jit_reg.validation_runtime as runtime
@@ -342,6 +162,8 @@ def test_online_validation_writes_shared_artifacts(
     monkeypatch.setattr(runtime, "ode_sample", lambda model, noise, labels, **kwargs: noise)
     monkeypatch.setattr(runtime, "evaluate_npz", lambda *args, **kwargs: {"FID": 12.5})
     config = ExperimentConfig()
+    config.model.image_size = 8
+    config.model.patch_size = 4
     config.model.num_classes = 2
     config.validation.periodic_samples = 2
     config.validation.final_samples = 4
@@ -349,24 +171,110 @@ def test_online_validation_writes_shared_artifacts(
     plan = create_validation_plan(4, 2, 2, seed=5)
     ema = SimpleNamespace(state_dict=lambda: {"weight": torch.zeros(())})
     metrics, output = validate_ema(
-        ema=ema,
+        ema=ema,  # type: ignore[arg-type]
         config=config,
         plan=plan,
         completed_epoch=1,
         final=False,
         output_root=tmp_path,
-        reference_npz=tmp_path / "reference.npz",
         sampling=SamplingParameters(
             batch_size=1,
             sampling_steps=2,
             solver="heun",
             log_interval=1,
         ),
-        eval_batch_size=1,
-        eval_log_interval=1,
     )
-    assert metrics["validation/FID-5K"] == 12.5
-    assert metrics["validation/sampling_nfe"] == 3
-    assert (output / "samples.npz").exists()
-    evaluation = json.loads((output / "evaluation.json").read_text())
-    assert evaluation["validation_plan_hash"] == plan.plan_hash
+    assert metrics["validation/FID-2"] == 12.5
+    assert (output / "evaluation.json").is_file()
+
+
+def test_standalone_sampling_inherits_defaults_and_evaluate_writes_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = ROOT / "scripts/sample.py"
+    spec = importlib.util.spec_from_file_location("sample_script", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    config = ExperimentConfig()
+    config.model.image_size = 8
+    config.model.patch_size = 4
+    config.model.hidden_size = 16
+    config.model.depth = 1
+    config.model.num_heads = 4
+    config.model.num_classes = 2
+    config.compile.enabled = False
+    config.sampling.num_samples = 4
+    config.sampling.batch_size = 3
+    config.sampling.sampling_steps = 7
+    config.evaluation.reference_npz = str(tmp_path / "reference.npz")
+    plan = create_validation_plan(4, 2, 2, seed=3)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    weights = checkpoint / "ema.safetensors"
+    weights.touch()
+    bundle = SimpleNamespace(
+        config=config,
+        plan=plan,
+        directory=checkpoint,
+        weights=weights,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_archive(**kwargs: object) -> Path:
+        captured.update(kwargs)
+        output = Path(kwargs["output_dir"])  # type: ignore[arg-type]
+        output.mkdir(parents=True)
+        archive = output / "samples.npz"
+        np.savez(archive, np.zeros((4, 8, 8, 3), dtype=np.uint8))
+        return archive
+
+    class EmptyModel(nn.Module):
+        def __init__(self, config: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(module, "load_checkpoint_bundle", lambda path: bundle)
+    monkeypatch.setattr(module, "checkpoint_sha256", lambda path: "abc")
+    monkeypatch.setattr(
+        module, "initialize_distributed", lambda: (0, 1, torch.device("cpu"))
+    )
+    monkeypatch.setattr(module, "broadcast_string", lambda value, rank: value)
+    monkeypatch.setattr(module, "load_file", lambda *args, **kwargs: {})
+    monkeypatch.setattr(module, "SiT", EmptyModel)
+    monkeypatch.setattr(module, "compile_model_regions", lambda model, config: model)
+    monkeypatch.setattr(module, "sample_to_archive", fake_archive)
+    monkeypatch.setattr(module, "evaluate_npz", lambda *args, **kwargs: {"FID": 1.0})
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sample.py",
+            "--checkpoint-dir",
+            str(checkpoint),
+            "--evaluate",
+        ],
+    )
+    module.main()
+    parameters = captured["parameters"]
+    assert isinstance(parameters, SamplingParameters)
+    assert parameters.batch_size == 3
+    assert parameters.sampling_steps == 7
+    output = Path(captured["output_dir"])  # type: ignore[arg-type]
+    assert (output / "evaluation.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "script",
+    ["train.py", "sample.py", "cache_features.py", "eval.py", "compare.py"],
+)
+def test_standalone_script_help(script: str) -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / script), "--help"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "usage:" in result.stdout

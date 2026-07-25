@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -8,115 +7,183 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from jit_reg.config import REGConfig
-from jit_reg.reg import (
-    DINOv3FeatureExtractor,
-    pool_spatial_features,
-    prepare_reg_targets,
-    resize_spatial_features,
+from jit_reg.model.sit import SiTOutput
+from jit_reg.objective import (
+    jit_losses,
+    noisy_interpolate,
+    sample_reg_timesteps,
+    shift_timestep,
 )
+from jit_reg.reg import (
+    FeatureTargets,
+    negative_cosine_repa_loss,
+    prepare_feature_targets,
+    repa_target_for_scope,
+)
+from jit_reg.sampling import ODESample, ode_sample
 
 
-class _FakeDINO(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(()))
-        self.seen: torch.Tensor | None = None
-
-    def forward_features(self, images: torch.Tensor) -> torch.Tensor:
-        self.seen = images.detach().clone()
-        tokens = torch.zeros(images.shape[0], 261, 8, device=images.device)
-        tokens[:, 0] = 3
-        tokens[:, 1:5] = 99
-        values = torch.arange(256, device=images.device).float()
-        tokens[:, 5:, 0] = values
-        tokens[:, 5:, 1] = 1
-        return tokens
-
-
-def test_dinov3_preprocessing_freezing_and_register_removal(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    encoder = _FakeDINO()
-    fake_timm = SimpleNamespace(
-        create_model=lambda name, pretrained: encoder,
-        data=SimpleNamespace(
-            resolve_model_data_config=lambda model: {
-                "input_size": (3, 256, 256),
-                "mean": (0.5, 0.5, 0.5),
-                "std": (0.25, 0.25, 0.25),
-            }
-        ),
+def test_optional_component_target_extraction() -> None:
+    cls = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+    spatial = torch.randn(2, 16, 8)
+    baseline = prepare_feature_targets(
+        cls, spatial, 2, include_reg=False, include_repa=False
     )
-    monkeypatch.setitem(sys.modules, "timm", fake_timm)
-    extractor = DINOv3FeatureExtractor(REGConfig(feature_dim=8))
-    cls, spatial = extractor.extract(torch.ones(2, 3, 128, 128))
-    assert cls.shape == (2, 8) and torch.all(cls == 3)
-    assert spatial.shape == (2, 256, 8)
-    assert spatial[0, 0, 0] == 0 and spatial[0, -1, 0] == 255
-    assert encoder.seen is not None
-    assert encoder.seen.shape == (2, 3, 256, 256)
-    torch.testing.assert_close(encoder.seen, torch.full_like(encoder.seen, 2))
-    assert not any(parameter.requires_grad for parameter in extractor.parameters())
-    extractor.train()
-    assert not extractor.training and not encoder.training
+    assert baseline == FeatureTargets(None, None)
 
-
-@pytest.mark.parametrize("target_grid", [16, 8, 4])
-def test_cls_reg_and_repa_targets_resize_to_any_jit_grid(target_grid: int) -> None:
-    spatial = torch.arange(256 * 8, dtype=torch.float32).reshape(1, 256, 8).add(1)
-    cls = torch.arange(8, dtype=torch.float32).reshape(1, 8).add(1)
-    targets = prepare_reg_targets(cls, spatial, target_grid)
-    assert torch.equal(targets.reg_tokens, cls[:, None])
-    assert targets.repa.shape == (1, target_grid**2, 8)
-    torch.testing.assert_close(targets.repa.norm(dim=-1), torch.ones(1, target_grid**2))
-    if target_grid == 16:
-        torch.testing.assert_close(targets.repa, F.normalize(spatial, dim=-1))
-    else:
-        expected = F.interpolate(
-            spatial.transpose(1, 2).reshape(1, 8, 16, 16),
-            size=(target_grid, target_grid),
-            mode="bicubic",
-            align_corners=False,
-            antialias=True,
-        ).flatten(2).transpose(1, 2)
-        torch.testing.assert_close(targets.repa, F.normalize(expected, dim=-1))
-
-
-def test_spatial_reg_targets_pool_to_four_by_four_and_layer_normalize() -> None:
-    spatial = torch.arange(256 * 8, dtype=torch.float32).reshape(1, 256, 8)
-    cls = torch.arange(8, dtype=torch.float32).reshape(1, 8)
-    pooled = pool_spatial_features(spatial, 4)
-    expected = F.adaptive_avg_pool2d(
-        spatial.transpose(1, 2).reshape(1, 8, 16, 16), (4, 4)
-    ).flatten(2).transpose(1, 2)
-    expected = F.layer_norm(expected, (8,))
-    torch.testing.assert_close(pooled, expected)
-    torch.testing.assert_close(pooled.mean(dim=-1), torch.zeros(1, 16), atol=1e-6, rtol=0)
-    torch.testing.assert_close(pooled.var(dim=-1, unbiased=False), torch.ones(1, 16))
-
-    targets = prepare_reg_targets(
-        cls, spatial, 8, token_mode="cls_spatial", pool_size=4
-    )
-    assert targets.reg_tokens.shape == (1, 17, 8)
-    torch.testing.assert_close(targets.reg_tokens[:, 0], cls)
-    torch.testing.assert_close(targets.reg_tokens[:, 1:], pooled)
-    assert targets.repa.shape == (1, 64, 8)
-
-
-def test_reg_targets_can_omit_repa_features() -> None:
-    targets = prepare_reg_targets(
-        torch.randn(2, 8),
-        torch.randn(2, 16, 8),
+    reg = prepare_feature_targets(
+        cls,
+        spatial,
         2,
+        include_reg=True,
+        token_mode="cls_spatial",
+        pool_size=2,
         include_repa=False,
     )
-    assert targets.reg_tokens.shape == (2, 1, 8)
-    assert targets.repa is None
+    assert reg.reg is not None and reg.reg.shape == (2, 5, 8)
+    assert reg.repa is None
+
+    repa = prepare_feature_targets(
+        cls, spatial, 2, include_reg=False, include_repa=True
+    )
+    assert repa.reg is None
+    assert repa.repa is not None and repa.repa.shape == (2, 4, 8)
+    assert torch.allclose(repa.repa.norm(dim=-1), torch.ones(2, 4))
 
 
-def test_spatial_feature_order_requires_a_square_grid() -> None:
-    with pytest.raises(ValueError, match="square"):
-        resize_spatial_features(torch.randn(1, 12, 8), 2)
-    with pytest.raises(ValueError, match="square"):
-        pool_spatial_features(torch.randn(1, 12, 8), 2)
+def test_repa_target_scopes() -> None:
+    targets = FeatureTargets(torch.randn(2, 1, 8), torch.randn(2, 4, 8))
+    assert repa_target_for_scope(targets, "image").shape == (2, 4, 8)
+    full = repa_target_for_scope(targets, "image_and_reg")
+    assert full is not None and full.shape == (2, 5, 8)
+    assert torch.equal(full[:, :1], targets.reg)
+
+
+def test_negative_cosine_repa_loss() -> None:
+    target = F.normalize(torch.randn(2, 4, 8), dim=-1)
+    assert negative_cosine_repa_loss(target, target) == pytest.approx(-1.0)
+
+
+def test_log_uniform_reg_timing_is_deterministic_and_equal_time_is_exact() -> None:
+    image_time = torch.linspace(0.1, 0.9, 8)
+    first = sample_reg_timesteps(
+        image_time, 0.5, 2.0, torch.Generator().manual_seed(7)
+    )
+    second = sample_reg_timesteps(
+        image_time, 0.5, 2.0, torch.Generator().manual_seed(7)
+    )
+    assert torch.equal(first[0], second[0])
+    assert torch.equal(first[1], second[1])
+    assert torch.all((first[1] >= 0.5) & (first[1] <= 2.0))
+    assert torch.allclose(first[0], shift_timestep(image_time, first[1]))
+
+    equal_time, ratio = sample_reg_timesteps(
+        image_time, 1.0, 1.0, torch.Generator().manual_seed(1)
+    )
+    assert torch.equal(equal_time, image_time)
+    assert torch.equal(ratio, torch.ones_like(image_time))
+
+
+def test_reg_velocity_loss_uses_reg_timestep() -> None:
+    clean_image = torch.zeros(1, 1)
+    image_noise = torch.zeros_like(clean_image)
+    image_time = torch.tensor([0.5])
+    clean_reg = torch.ones(1, 1)
+    reg_noise = torch.zeros_like(clean_reg)
+    reg_prediction = torch.zeros_like(clean_reg)
+    reg_time = torch.tensor([0.25])
+    losses = jit_losses(
+        clean_image,
+        image_noise,
+        image_time,
+        clean_image,
+        clean_reg=clean_reg,
+        reg_noise=reg_noise,
+        reg_prediction=reg_prediction,
+        reg_timestep=reg_time,
+        reg_weight=1,
+        repa_weight=0,
+    )
+    assert losses.image_velocity == 0
+    assert losses.reg_velocity == pytest.approx((1 / 0.75) ** 2)
+
+
+class RecordingCleanModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(num_classes=3)
+        self.calls: list[tuple[torch.Tensor, torch.Tensor | None, int]] = []
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        timestep: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        noisy_reg: torch.Tensor | None = None,
+        reg_timestep: torch.Tensor | None = None,
+        return_repa: bool = False,
+    ) -> SiTOutput:
+        del labels, return_repa
+        self.calls.append(
+            (
+                timestep.detach().cpu(),
+                reg_timestep.detach().cpu() if reg_timestep is not None else None,
+                image.shape[0],
+            )
+        )
+        return SiTOutput(
+            image=torch.full_like(image, 0.25),
+            reg=torch.full_like(noisy_reg, -0.5) if noisy_reg is not None else None,
+        )
+
+
+@pytest.mark.parametrize("solver", ["euler", "heun"])
+def test_sampler_jointly_integrates_dual_schedules_and_x0(solver: str) -> None:
+    model = RecordingCleanModel()
+    image_noise = torch.randn(1, 1, 2, 2)
+    reg_noise = torch.randn(1, 1, 3)
+    output = ode_sample(
+        model,
+        image_noise,
+        torch.tensor([1]),
+        reg_noise=reg_noise,
+        steps=2,
+        solver=solver,
+        guidance_scale=1,
+        timestep_shift=1,
+        reg_timestep_ratio=0.5,
+        cfg_interval=(1, 1),
+    )
+    assert isinstance(output, ODESample)
+    assert torch.allclose(output.image, torch.full_like(output.image, 0.25))
+    assert torch.allclose(output.reg, torch.full_like(output.reg, -0.5))
+    assert len(model.calls) == (2 if solver == "euler" else 3)
+    image_half = [call for call in model.calls if call[0][0] == pytest.approx(0.5)]
+    assert image_half
+    assert image_half[0][1] is not None
+    assert image_half[0][1][0] == pytest.approx(1 / 3)
+
+
+def test_cfg_window_uses_image_time_with_heterogeneous_reg_time() -> None:
+    model = RecordingCleanModel()
+    ode_sample(
+        model,
+        torch.randn(1, 1, 2, 2),
+        torch.tensor([1]),
+        reg_noise=torch.randn(1, 1, 3),
+        steps=2,
+        guidance_scale=2,
+        reg_timestep_ratio=0.1,
+        cfg_interval=(0.4, 0.6),
+    )
+    assert [call[2] for call in model.calls] == [1, 2]
+
+
+def test_noisy_interpolation_uses_its_own_timestep() -> None:
+    clean = torch.ones(2, 1)
+    noise = torch.zeros_like(clean)
+    assert torch.allclose(
+        noisy_interpolate(clean, noise, torch.tensor([0.25, 0.75])),
+        torch.tensor([[0.25], [0.75]]),
+    )

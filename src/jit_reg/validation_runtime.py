@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -38,17 +39,14 @@ def validate_ema(
     completed_epoch: int,
     final: bool,
     output_root: str | Path,
-    reference_npz: str | Path,
     sampling: SamplingParameters,
-    eval_batch_size: int = 64,
-    eval_log_interval: int = 10,
 ) -> tuple[dict[str, float], Path]:
     rank, _world_size = _distributed()
     device = torch.device(
         f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
     )
     count = config.validation.final_samples if final else config.validation.periodic_samples
-    name = "final-50k" if final else "periodic-5k"
+    name = f"{'final' if final else 'periodic'}-{count}"
     output = Path(output_root) / f"epoch-{completed_epoch:04d}-{name}"
     output.mkdir(parents=True, exist_ok=True)
 
@@ -56,6 +54,7 @@ def validate_ema(
     model.load_state_dict(ema.state_dict())
     model.eval()
     execution_model = compile_model_regions(model, config.compile)
+    reg = config.model.features.reg
 
     @torch.inference_mode()
     def generate_batch(
@@ -72,12 +71,12 @@ def validate_ema(
         reg_noise = (
             noise_for_samples(
                 noise_seeds,
-                (config.model.reg.num_tokens, config.model.reg.feature_dim),
+                (reg.num_tokens, config.model.features.encoder.feature_dim),
                 device,
                 dtype=dtype,
                 seed_offset=1_000_003,
             )
-            if config.model.reg.enabled
+            if reg.enabled
             else None
         )
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
@@ -89,6 +88,7 @@ def validate_ema(
                 steps=sampling.sampling_steps,
                 guidance_scale=sampling.guidance_scale,
                 timestep_shift=sampling.timestep_shift,
+                reg_timestep_ratio=sampling.reg_timestep_ratio,
                 cfg_interval=(sampling.cfg_start, sampling.cfg_end),
                 solver=sampling.solver,
                 num_classes=config.model.num_classes,
@@ -99,7 +99,6 @@ def validate_ema(
     digest = state_dict_sha256(ema.state_dict()) if rank == 0 else None
     digest = broadcast_string(digest, rank)
     started = time.perf_counter()
-    wide_extensions_active = config.model.reg.wide_extensions_active
     archive = sample_to_archive(
         output_dir=output,
         plan=plan,
@@ -108,29 +107,10 @@ def validate_ema(
         image_size=config.model.image_size,
         patch_size=config.model.patch_size,
         model_variant=config.model.model_variant,
-        reg_enabled=config.model.reg.enabled,
-        reg_variant=config.model.reg.cls_predictor if config.model.reg.enabled else "disabled",
-        repa_enabled=config.model.reg.enabled and config.model.reg.repa_enabled,
-        reg_token_mode=config.model.reg.token_mode if config.model.reg.enabled else "disabled",
-        reg_pool_size=config.model.reg.pool_size,
-        reg_x0_conditioning=(
-            config.model.reg.x0_conditioning if wide_extensions_active else False
-        ),
-        reg_continuation_tokens=(
-            config.model.reg.continuation_tokens if wide_extensions_active else None
-        ),
-        reg_patch_reprojection_enabled=(
-            config.model.reg.patch_reprojection.enabled
-            if wide_extensions_active
-            else False
-        ),
-        reg_patch_reprojection_source=config.model.reg.patch_reprojection.source,
-        reg_patch_reprojection_intermediate_size=(
-            config.model.reg.patch_reprojection.intermediate_size
-        ),
-        reg_patch_reprojection_include_timestep=(
-            config.model.reg.patch_reprojection.include_timestep
-        ),
+        feature_schema={
+            "schema_version": 2,
+            **asdict(config.model.features),
+        },
         checkpoint_hash=digest,
         parameters=sampling,
         generate_batch=generate_batch,
@@ -142,15 +122,20 @@ def validate_ema(
         torch.cuda.empty_cache()
     metrics: dict[str, float] = {}
     if rank == 0:
+        eval_device = (
+            device
+            if config.evaluation.device == "auto"
+            else torch.device(config.evaluation.device)
+        )
         raw = evaluate_npz(
             archive,
-            reference_npz,
-            batch_size=eval_batch_size,
-            device=device,
-            log_interval=eval_log_interval,
+            config.evaluation.reference_npz,
+            batch_size=config.evaluation.batch_size,
+            device=eval_device,
+            log_interval=config.evaluation.log_interval,
         )
         save_evaluation(output / "evaluation.json", raw, plan.plan_hash)
-        suffix = "50K" if final else "5K"
+        suffix = f"{count // 1000}K" if count % 1000 == 0 else str(count)
         metrics[f"validation/FID-{suffix}"] = raw["FID"]
         metrics["validation/images_per_second"] = count / max(time.perf_counter() - started, 1e-9)
         metrics["validation/sampling_nfe"] = float(sampling.sampling_nfe)

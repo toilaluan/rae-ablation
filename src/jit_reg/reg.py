@@ -7,11 +7,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .config import REGConfig
+from .config import FeaturesConfig
 
 
-class REGTargets(NamedTuple):
-    reg_tokens: Tensor
+class FeatureTargets(NamedTuple):
+    reg: Tensor | None
     repa: Tensor | None
 
 
@@ -55,28 +55,46 @@ def pool_spatial_features(spatial: Tensor, pool_size: int) -> Tensor:
     return F.layer_norm(pooled, (pooled.shape[-1],))
 
 
-def prepare_reg_targets(
+def prepare_feature_targets(
     cls: Tensor,
     spatial: Tensor,
     target_grid: int,
     *,
+    include_reg: bool = True,
     token_mode: str = "cls",
     pool_size: int = 4,
     include_repa: bool = True,
-) -> REGTargets:
+) -> FeatureTargets:
     if cls.ndim != 2 or spatial.ndim != 3:
         raise ValueError("CLS and spatial features must have shapes [B, D] and [B, N, D]")
     if cls.shape[0] != spatial.shape[0] or cls.shape[1] != spatial.shape[2]:
         raise ValueError("CLS and spatial feature dimensions do not match")
-    if token_mode == "cls":
-        reg_tokens = cls.float().unsqueeze(1)
-    elif token_mode == "cls_spatial":
-        pooled = pool_spatial_features(spatial, pool_size)
-        reg_tokens = torch.cat((cls.float().unsqueeze(1), pooled), dim=1)
-    else:
-        raise ValueError("token_mode must be cls or cls_spatial")
+    reg_tokens = None
+    if include_reg:
+        if token_mode == "cls":
+            reg_tokens = cls.float().unsqueeze(1)
+        elif token_mode == "cls_spatial":
+            pooled = pool_spatial_features(spatial, pool_size)
+            reg_tokens = torch.cat((cls.float().unsqueeze(1), pooled), dim=1)
+        else:
+            raise ValueError("token_mode must be cls or cls_spatial")
     repa = resize_spatial_features(spatial, target_grid) if include_repa else None
-    return REGTargets(reg_tokens=reg_tokens, repa=repa)
+    return FeatureTargets(reg=reg_tokens, repa=repa)
+
+
+def repa_target_for_scope(
+    targets: FeatureTargets,
+    token_scope: str,
+) -> Tensor | None:
+    if targets.repa is None:
+        return None
+    if token_scope == "image":
+        return targets.repa
+    if token_scope == "image_and_reg":
+        if targets.reg is None:
+            raise ValueError("REPA image_and_reg targets require clean REG tokens")
+        return torch.cat((targets.reg, targets.repa), dim=1)
+    raise ValueError("REPA token scope must be image or image_and_reg")
 
 
 def negative_cosine_repa_loss(prediction: Tensor, target: Tensor) -> Tensor:
@@ -92,12 +110,12 @@ class DINOv3FeatureExtractor(nn.Module):
 
     native_image_size = 256
 
-    def __init__(self, config: REGConfig) -> None:
+    def __init__(self, config: FeaturesConfig) -> None:
         super().__init__()
         import timm
 
         self.config = config
-        self.encoder = timm.create_model(config.model_name, pretrained=True)
+        self.encoder = timm.create_model(config.encoder.model_name, pretrained=True)
         resolved = timm.data.resolve_model_data_config(self.encoder)
         mean = resolved.get("mean", (0.485, 0.456, 0.406))
         std = resolved.get("std", (0.229, 0.224, 0.225))
@@ -145,29 +163,31 @@ class DINOv3FeatureExtractor(nn.Module):
             cls, spatial = output
         else:
             expected_spatial = (self.native_image_size // 16) ** 2
-            expected_tokens = 1 + self.config.register_tokens + expected_spatial
+            expected_tokens = 1 + self.config.encoder.register_tokens + expected_spatial
             if output.ndim != 3 or output.shape[1] != expected_tokens:
                 raise ValueError(
                     f"DINOv3 must return {expected_tokens} tokens, received {tuple(output.shape)}"
                 )
             cls = output[:, 0]
-            spatial = output[:, 1 + self.config.register_tokens :]
+            spatial = output[:, 1 + self.config.encoder.register_tokens :]
         expected_spatial = (self.native_image_size // 16) ** 2
         if (
-            cls.shape != (images.shape[0], self.config.feature_dim)
-            or spatial.shape != (images.shape[0], expected_spatial, self.config.feature_dim)
+            cls.shape != (images.shape[0], self.config.encoder.feature_dim)
+            or spatial.shape
+            != (images.shape[0], expected_spatial, self.config.encoder.feature_dim)
         ):
             raise ValueError("DINOv3 CLS or spatial feature shape is incompatible with REG")
         return cls.float(), spatial.float()
 
     @torch.no_grad()
-    def targets(self, images: Tensor, target_grid: int) -> REGTargets:
+    def targets(self, images: Tensor, target_grid: int) -> FeatureTargets:
         cls, spatial = self.extract(images)
-        return prepare_reg_targets(
+        return prepare_feature_targets(
             cls,
             spatial,
             target_grid,
-            token_mode=self.config.token_mode,
-            pool_size=self.config.pool_size,
-            include_repa=self.config.repa_enabled,
+            include_reg=self.config.reg.enabled,
+            token_mode=self.config.reg.token_mode,
+            pool_size=self.config.reg.pool_size,
+            include_repa=self.config.repa.enabled,
         )

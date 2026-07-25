@@ -1,0 +1,112 @@
+schema_version: 2
+data:
+  repository: benjamin-paine/imagenet-1k-256x256
+  revision: 1bd0400450249a7fe90c0aece37d0d03e7ea956a
+  split: train
+  workers: 16
+  prefetch_factor: 4
+  max_samples: null
+feature_cache:
+  enabled: false
+  directory: data/features
+  batch_size: 128
+  log_interval: 10
+model:
+  image_size: 256
+  patch_size: 16
+  in_channels: 3
+  hidden_size: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+  num_classes: 1000
+  class_dropout_prob: 0.1
+  gradient_checkpointing: false
+  variant: SiT-B
+  features:
+    encoder:
+      model_name: vit_base_patch16_dinov3.lvd1689m
+      feature_dim: 768
+      register_tokens: 4
+    reg:
+      enabled: true
+      token_mode: cls_spatial
+      pool_size: 4
+      loss_weight: 0.03
+      head:
+        kind: wide_mlp
+        hidden_size: 2048
+        depth: 2
+        mlp_ratio: 4.0
+      timestep:
+        train_ratio_min: 0.5
+        train_ratio_max: 1.0
+        sample_ratio: 0.5
+      early_prediction:
+        block: 4
+        projection_hidden_size: 2048
+    repa:
+      enabled: false
+      block: 4
+      projection_hidden_size: 2048
+      loss_weight: 0.5
+      token_scope: image
+compile:
+  enabled: true
+  backend: inductor
+  mode: default
+  fullgraph: true
+  dynamic: false
+train:
+  epochs: 80
+  global_batch_size: 1024
+  micro_batch_size: 512
+  max_steps: null
+  grad_clip: 1.0
+  ema_decay: 0.9995
+  seed: 0
+  timestep_loc: -0.8
+  timestep_scale: 0.8
+  horizontal_flip_probability: 0.5
+  optimizer:
+    kind: muon
+    lr: 0.0002
+    min_lr: 0.00002
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.95
+sampling:
+  num_samples: 50000
+  batch_size: 32
+  sampling_steps: 50
+  solver: euler
+  guidance_scale: 1.78
+  timestep_shift: 1.0
+  cfg_start: 0.0
+  cfg_end: 0.9
+  log_interval: 10
+evaluation:
+  reference_npz: data/VIRTUAL_imagenet256_labeled.npz
+  batch_size: 32
+  device: auto
+  log_interval: 10
+validation:
+  interval: 5
+  periodic_samples: 10000
+  final_samples: 50000
+  plan_path: validation-plan.pt
+  validate_now: true
+checkpoint:
+  directory: checkpoints
+  interval: 5
+  keep_last_n: 8
+  save_best_fid: true
+wandb:
+  enabled: false
+  entity: null
+  project: jit-reg
+  name: null
+  group: null
+  tags: []
+  mode: online
+  checkpoint_artifacts: false

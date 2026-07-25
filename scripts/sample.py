@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -8,6 +9,7 @@ from safetensors.torch import load_file
 
 from jit_reg.checkpoint_bundle import load_checkpoint_bundle
 from jit_reg.distributed import broadcast_string, initialize_distributed
+from jit_reg.evaluation import evaluate_npz, save_evaluation
 from jit_reg.model.compile import compile_model_regions
 from jit_reg.model.sit import SiT
 from jit_reg.sample_runtime import (
@@ -27,31 +29,57 @@ def build_parser() -> argparse.ArgumentParser:
         description="Sample a self-contained JiT checkpoint into an ADM-compatible NPZ"
     )
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
-    parser.add_argument("--num-samples", type=int, default=50_000)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--sampling-steps", type=int, default=50)
-    parser.add_argument("--solver", choices=("euler", "heun"), default="euler")
-    parser.add_argument("--guidance-scale", type=float, default=1.78)
-    parser.add_argument("--timestep-shift", type=float, default=1.0)
-    parser.add_argument("--cfg-start", type=float, default=0.0)
-    parser.add_argument("--cfg-end", type=float, default=0.9)
-    parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--num-samples", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--sampling-steps", type=int)
+    parser.add_argument("--solver", choices=("euler", "heun"))
+    parser.add_argument("--guidance-scale", type=float)
+    parser.add_argument("--timestep-shift", type=float)
+    parser.add_argument("--reg-timestep-ratio", type=float)
+    parser.add_argument("--cfg-start", type=float)
+    parser.add_argument("--cfg-end", type=float)
+    parser.add_argument("--log-interval", type=int)
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="compute FID on rank zero and write evaluation.json beside samples.npz",
+    )
+    parser.add_argument("--reference-npz", type=Path)
     return parser
+
+
+def _value(explicit: object | None, inherited: object) -> object:
+    return inherited if explicit is None else explicit
 
 
 def main() -> None:
     args = build_parser().parse_args()
     bundle = load_checkpoint_bundle(args.checkpoint_dir)
     config = bundle.config
+    defaults = config.sampling
+    reg = config.model.features.reg
+    sample_count = int(_value(args.num_samples, defaults.num_samples))
     parameters = SamplingParameters(
-        batch_size=args.batch_size,
-        sampling_steps=args.sampling_steps,
-        solver=args.solver,
-        guidance_scale=args.guidance_scale,
-        timestep_shift=args.timestep_shift,
-        cfg_start=args.cfg_start,
-        cfg_end=args.cfg_end,
-        log_interval=args.log_interval,
+        batch_size=int(_value(args.batch_size, defaults.batch_size)),
+        sampling_steps=int(
+            _value(args.sampling_steps, defaults.sampling_steps)
+        ),
+        solver=str(_value(args.solver, defaults.solver)),
+        guidance_scale=float(
+            _value(args.guidance_scale, defaults.guidance_scale)
+        ),
+        timestep_shift=float(
+            _value(args.timestep_shift, defaults.timestep_shift)
+        ),
+        reg_timestep_ratio=float(
+            _value(
+                args.reg_timestep_ratio,
+                reg.timestep.sample_ratio if reg.enabled else 1.0,
+            )
+        ),
+        cfg_start=float(_value(args.cfg_start, defaults.cfg_start)),
+        cfg_end=float(_value(args.cfg_end, defaults.cfg_end)),
+        log_interval=int(_value(args.log_interval, defaults.log_interval)),
     )
     parameters.validate()
     rank, _world_size, device = initialize_distributed()
@@ -81,15 +109,20 @@ def main() -> None:
         reg_noise = (
             noise_for_samples(
                 noise_seeds,
-                (config.model.reg.num_tokens, config.model.reg.feature_dim),
+                (
+                    reg.num_tokens,
+                    config.model.features.encoder.feature_dim,
+                ),
                 device,
                 dtype=dtype,
                 seed_offset=1_000_003,
             )
-            if config.model.reg.enabled
+            if reg.enabled
             else None
         )
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        with torch.autocast(
+            device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+        ):
             generated = ode_sample(
                 execution_model,
                 noise,
@@ -98,6 +131,7 @@ def main() -> None:
                 steps=parameters.sampling_steps,
                 guidance_scale=parameters.guidance_scale,
                 timestep_shift=parameters.timestep_shift,
+                reg_timestep_ratio=parameters.reg_timestep_ratio,
                 cfg_interval=(parameters.cfg_start, parameters.cfg_end),
                 solver=parameters.solver,
                 num_classes=config.model.num_classes,
@@ -105,42 +139,46 @@ def main() -> None:
         image = generated.image if isinstance(generated, ODESample) else generated
         return image.float().add(1).div(2)
 
-    wide_extensions_active = config.model.reg.wide_extensions_active
-    sample_to_archive(
-        output_dir=bundle.directory / sampling_output_name(args.num_samples, parameters),
+    output_dir = bundle.directory / sampling_output_name(sample_count, parameters)
+    archive = sample_to_archive(
+        output_dir=output_dir,
         plan=plan,
-        sample_count=args.num_samples,
+        sample_count=sample_count,
         num_classes=config.model.num_classes,
         image_size=config.model.image_size,
         patch_size=config.model.patch_size,
         model_variant=config.model.model_variant,
-        reg_enabled=config.model.reg.enabled,
-        reg_variant=config.model.reg.cls_predictor if config.model.reg.enabled else "disabled",
-        repa_enabled=config.model.reg.enabled and config.model.reg.repa_enabled,
-        reg_token_mode=config.model.reg.token_mode if config.model.reg.enabled else "disabled",
-        reg_pool_size=config.model.reg.pool_size,
-        reg_x0_conditioning=(
-            config.model.reg.x0_conditioning if wide_extensions_active else False
-        ),
-        reg_continuation_tokens=(
-            config.model.reg.continuation_tokens if wide_extensions_active else None
-        ),
-        reg_patch_reprojection_enabled=(
-            config.model.reg.patch_reprojection.enabled
-            if wide_extensions_active
-            else False
-        ),
-        reg_patch_reprojection_source=config.model.reg.patch_reprojection.source,
-        reg_patch_reprojection_intermediate_size=(
-            config.model.reg.patch_reprojection.intermediate_size
-        ),
-        reg_patch_reprojection_include_timestep=(
-            config.model.reg.patch_reprojection.include_timestep
-        ),
+        feature_schema={
+            "schema_version": 2,
+            **asdict(config.model.features),
+        },
         checkpoint_hash=digest,
         parameters=parameters,
         generate_batch=generate_batch,
     )
+    if args.evaluate and rank == 0:
+        del execution_model, model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        reference = args.reference_npz or Path(config.evaluation.reference_npz)
+        eval_device = (
+            device
+            if config.evaluation.device == "auto"
+            else torch.device(config.evaluation.device)
+        )
+        metrics = evaluate_npz(
+            archive,
+            reference,
+            batch_size=config.evaluation.batch_size,
+            device=eval_device,
+            log_interval=config.evaluation.log_interval,
+        )
+        save_evaluation(
+            output_dir / "evaluation.json",
+            metrics,
+            plan.plan_hash,
+        )
+        print(f"evaluation: {output_dir / 'evaluation.json'}")
 
 
 if __name__ == "__main__":

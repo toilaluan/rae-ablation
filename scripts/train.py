@@ -13,11 +13,11 @@ from jit_reg.data import (
     preprocessing_metadata,
 )
 from jit_reg.distributed import initialize_distributed
+from jit_reg.feature_cache import FeatureCache
 from jit_reg.model.compile import compile_model_regions
 from jit_reg.model.sit import SiT
 from jit_reg.optim import build_optimizer
 from jit_reg.reg import DINOv3FeatureExtractor
-from jit_reg.reg_cache import REGTokenCache
 from jit_reg.rng import RNGStreams
 from jit_reg.sample_runtime import SamplingParameters
 from jit_reg.training import TrainState, make_train_loader, train
@@ -30,78 +30,45 @@ torch._dynamo.config.cache_size_limit = 1000
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train pixel-space JiT on ImageNet-256")
-    parser.add_argument("--config", type=Path, default=Path("configs/canonical.yaml"))
-    parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
-    reg = parser.add_mutually_exclusive_group()
-    reg.add_argument("--reg", action="store_true", help="enable standard DINOv3 REG and REPA")
-    reg.add_argument(
-        "--reg-widehead",
-        action="store_true",
-        help="enable REG with the wide intermediate clean-token predictor",
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/baseline-p16.yaml"),
+        help="schema-v2 experiment YAML (default: configs/baseline-p16.yaml)",
     )
-    parser.add_argument("--no-repa", action="store_true", help="disable REPA for a REG run")
+    parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", type=Path)
-    parser.add_argument("--validation-interval", type=int)
-    parser.add_argument("--checkpoint-interval", type=int)
-    parser.add_argument("--max-steps", type=int)
-    parser.add_argument("--validate-now", action="store_true")
-    parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--reference-npz", type=Path, required=True)
-    parser.add_argument("--eval-batch-size", type=int, default=32)
-    parser.add_argument("--eval-sampling-steps", type=int, default=50)
-    parser.add_argument("--eval-solver", choices=("euler", "heun"), default="euler")
-    parser.add_argument("--eval-guidance-scale", type=float, default=1.78)
-    parser.add_argument("--eval-timestep-shift", type=float, default=1.0)
-    parser.add_argument("--eval-cfg-start", type=float, default=0.0)
-    parser.add_argument("--eval-cfg-end", type=float, default=0.9)
-    parser.add_argument("--eval-log-interval", type=int, default=10)
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    overrides = list(args.override)
-    if args.reg:
-        overrides.extend(
-            ["model.reg.enabled=true", "model.reg.cls_predictor=standard"]
-        )
-    elif args.reg_widehead:
-        overrides.extend(
-            ["model.reg.enabled=true", "model.reg.cls_predictor=wide_intermediate"]
-        )
-    if args.no_repa:
-        overrides.append("model.reg.repa_enabled=false")
-    config = load_config(args.config, overrides)
-    if args.no_repa and not config.model.reg.enabled:
-        parser.error("--no-repa requires REG")
+    config = load_config(args.config, args.override)
     if args.output:
         config.checkpoint.directory = str(args.output / "checkpoints")
         config.validation.plan_path = str(args.output / "validation-plan.pt")
-    if args.validation_interval is not None:
-        config.validation.interval = args.validation_interval
-    if args.checkpoint_interval is not None:
-        config.checkpoint.interval = args.checkpoint_interval
-    if args.max_steps is not None:
-        config.train.max_steps = args.max_steps
-    config.validation.validate_now = args.validate_now
-    config.wandb.enabled = config.wandb.enabled or args.wandb
     config.validate()
+    sampling_config = config.sampling
+    reg_config = config.model.features.reg
     sampling = SamplingParameters(
-        batch_size=args.eval_batch_size,
-        sampling_steps=args.eval_sampling_steps,
-        solver=args.eval_solver,
-        guidance_scale=args.eval_guidance_scale,
-        timestep_shift=args.eval_timestep_shift,
-        cfg_start=args.eval_cfg_start,
-        cfg_end=args.eval_cfg_end,
-        log_interval=args.eval_log_interval,
+        batch_size=sampling_config.batch_size,
+        sampling_steps=sampling_config.sampling_steps,
+        solver=sampling_config.solver,
+        guidance_scale=sampling_config.guidance_scale,
+        timestep_shift=sampling_config.timestep_shift,
+        reg_timestep_ratio=(
+            reg_config.timestep.sample_ratio if reg_config.enabled else 1.0
+        ),
+        cfg_start=sampling_config.cfg_start,
+        cfg_end=sampling_config.cfg_end,
+        log_interval=sampling_config.log_interval,
     )
     sampling.validate()
-    if not args.reference_npz.is_file():
-        raise FileNotFoundError(args.reference_npz)
+    if not Path(config.evaluation.reference_npz).is_file():
+        raise FileNotFoundError(config.evaluation.reference_npz)
 
     rank, world_size, device = initialize_distributed()
     if rank == 0:
@@ -111,8 +78,8 @@ def main() -> None:
         torch.manual_seed(streams.initialization.initial_seed())
         model = SiT(config.model).to(device)
     dataset = load_imagenet(config.data, config.model.image_size)
-    cache_active = config.reg_cache.enabled and config.model.reg.enabled
-    reg_cache = REGTokenCache(config, len(dataset)) if cache_active else None
+    cache_active = config.feature_cache.enabled and config.model.features.enabled
+    feature_cache = FeatureCache(config, len(dataset)) if cache_active else None
     fingerprint = data_fingerprint(config.data, config.model.image_size)
     plan_path = Path(config.validation.plan_path)
     if rank == 0 and not plan_path.exists():
@@ -138,7 +105,7 @@ def main() -> None:
             ema,
             fingerprint,
             plan.plan_hash,
-            reg_cache.fingerprint if reg_cache is not None else None,
+            feature_cache.fingerprints if feature_cache is not None else None,
         )
         optimizer.load_state_dict(resumed.optimizer)
         streams.load_state_dict(resumed.rng_streams)
@@ -155,28 +122,33 @@ def main() -> None:
             execution_model,
             device_ids=[device.index] if device.type == "cuda" else None,
         )
-    reg_encoder = None
-    if config.model.reg.enabled and reg_cache is None:
-        reg_encoder = torch.compile(DINOv3FeatureExtractor(config.model.reg)).to(device).bfloat16()
+    feature_encoder = None
+    if config.model.features.enabled and feature_cache is None:
+        feature_encoder = (
+            DINOv3FeatureExtractor(config.model.features).to(device).bfloat16()
+        )
+        if config.compile.enabled:
+            feature_encoder = torch.compile(
+                feature_encoder,
+                backend=config.compile.backend,
+                mode=config.compile.mode,
+                fullgraph=config.compile.fullgraph,
+                dynamic=config.compile.dynamic,
+            )
     loader, sampler = make_train_loader(dataset, config, streams)
     logged_config = config.as_dict()
-    logged_config["online_validation"] = {
-        "reference_npz": str(args.reference_npz),
-        "batch_size": sampling.batch_size,
-        "solver": sampling.solver,
-        "sampling_steps": sampling.sampling_steps,
-        "sampling_nfe": sampling.sampling_nfe,
-        "guidance_scale": sampling.guidance_scale,
-        "timestep_shift": sampling.timestep_shift,
-        "cfg_interval": [sampling.cfg_start, sampling.cfg_end],
-        "log_interval": sampling.log_interval,
-    }
     logged_config["provenance"] = {
         "dataset_and_preprocessing": preprocessing_metadata(config.data, config.model.image_size),
         "data_fingerprint": fingerprint,
         "validation_plan_hash": plan.plan_hash,
-        "reg_target": config.model.reg.model_name if config.model.reg.enabled else None,
-        "reg_cache_fingerprint": reg_cache.fingerprint if reg_cache is not None else None,
+        "feature_target": (
+            config.model.features.encoder.model_name
+            if config.model.features.enabled
+            else None
+        ),
+        "feature_cache_fingerprints": (
+            feature_cache.fingerprints if feature_cache is not None else None
+        ),
     }
     logged_config["model_parameters"] = {
         "total": sum(parameter.numel() for parameter in model.parameters()),
@@ -193,8 +165,8 @@ def main() -> None:
     )
     logger.event(
         f"training initialized: variant={config.model.model_variant}, "
-        f"reg={config.model.reg.enabled}, reg_variant="
-        f"{config.model.reg.cls_predictor if config.model.reg.enabled else 'disabled'}, "
+        f"reg={reg_config.enabled}, repa={config.model.features.repa.enabled}, "
+        f"reg_head={reg_config.head.kind if reg_config.enabled else 'disabled'}, "
         "parameters="
         f"{logged_config['model_parameters']['total']:,}"
     )
@@ -210,10 +182,7 @@ def main() -> None:
             completed_epoch=epoch,
             final=final,
             output_root=output_root,
-            reference_npz=args.reference_npz,
             sampling=sampling,
-            eval_batch_size=args.eval_batch_size,
-            eval_log_interval=args.eval_log_interval,
         )
         if rank == 0:
             labels = ", ".join(str(value) for value in plan.labels[:16].tolist())
@@ -245,8 +214,8 @@ def main() -> None:
             validation_plan_hash=plan.plan_hash,
             validation_plan_path=plan_path,
             logger=logger,
-            reg_encoder=reg_encoder,
-            reg_cache=reg_cache,
+            feature_encoder=feature_encoder,
+            feature_cache=feature_cache,
             state=state,
             validation_callback=validate_callback,
         )

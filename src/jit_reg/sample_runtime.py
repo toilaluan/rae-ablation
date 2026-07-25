@@ -27,6 +27,7 @@ class SamplingParameters:
     solver: str = "euler"
     guidance_scale: float = 1.78
     timestep_shift: float = 1.0
+    reg_timestep_ratio: float = 1.0
     cfg_start: float = 0.0
     cfg_end: float = 0.9
     log_interval: int = 10
@@ -46,6 +47,11 @@ class SamplingParameters:
             raise ValueError("sampling solver must be euler or heun")
         if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
             raise ValueError("timestep shift must be finite and positive")
+        if (
+            not math.isfinite(self.reg_timestep_ratio)
+            or self.reg_timestep_ratio <= 0
+        ):
+            raise ValueError("REG timestep ratio must be finite and positive")
         if not math.isfinite(self.guidance_scale):
             raise ValueError("guidance scale must be finite")
         if not 0 <= self.cfg_start <= self.cfg_end <= 1:
@@ -67,6 +73,7 @@ def sampling_output_name(sample_count: int, parameters: SamplingParameters) -> s
         f"samples-{parameters.solver}-n{sample_count}-steps{parameters.sampling_steps}"
         f"-cfg{_float_slug(parameters.guidance_scale)}"
         f"-shift{_float_slug(parameters.timestep_shift)}"
+        f"-regshift{_float_slug(parameters.reg_timestep_ratio)}"
         f"-window{_float_slug(parameters.cfg_start)}-{_float_slug(parameters.cfg_end)}"
     )
 
@@ -154,23 +161,13 @@ def _manifest_base(
     image_size: int,
     patch_size: int,
     model_variant: str,
-    reg_enabled: bool,
-    reg_variant: str,
-    repa_enabled: bool,
-    reg_token_mode: str,
-    reg_pool_size: int,
-    reg_x0_conditioning: bool,
-    reg_continuation_tokens: int | None,
-    reg_patch_reprojection_enabled: bool,
-    reg_patch_reprojection_source: str,
-    reg_patch_reprojection_intermediate_size: int,
-    reg_patch_reprojection_include_timestep: bool,
+    feature_schema: dict[str, Any],
     parameters: SamplingParameters,
 ) -> dict[str, Any]:
     counts = torch.bincount(labels, minlength=num_classes)
     ids_digest = hashlib.sha256(sample_ids.numpy().tobytes()).hexdigest()
     return {
-        "schema_version": 9,
+        "schema_version": 10,
         "checkpoint_sha256": checkpoint_hash,
         "validation_plan_hash": plan.plan_hash,
         "sample_ids_sha256": ids_digest,
@@ -178,31 +175,7 @@ def _manifest_base(
         "patch_size": patch_size,
         "jit_grid_size": image_size // patch_size,
         "model_variant": model_variant,
-        "reg_enabled": reg_enabled,
-        "reg_variant": reg_variant,
-        "repa_enabled": repa_enabled,
-        "reg_token_mode": reg_token_mode,
-        "reg_pool_size": reg_pool_size,
-        "reg_x0_conditioning": reg_x0_conditioning,
-        "reg_continuation_tokens": reg_continuation_tokens,
-        "reg_patch_reprojection": {
-            "enabled": reg_patch_reprojection_enabled,
-            "source": (
-                reg_patch_reprojection_source
-                if reg_patch_reprojection_enabled
-                else None
-            ),
-            "intermediate_size": (
-                reg_patch_reprojection_intermediate_size
-                if reg_patch_reprojection_enabled
-                else None
-            ),
-            "include_timestep": (
-                reg_patch_reprojection_include_timestep
-                if reg_patch_reprojection_enabled
-                else None
-            ),
-        },
+        "feature_schema": feature_schema,
         "sample_count": sample_count,
         "num_classes": num_classes,
         "class_counts": counts.tolist(),
@@ -214,6 +187,7 @@ def _manifest_base(
             "sampling_nfe": parameters.sampling_nfe,
             "guidance_scale": parameters.guidance_scale,
             "timestep_shift": parameters.timestep_shift,
+            "reg_timestep_ratio": parameters.reg_timestep_ratio,
             "cfg_interval": [parameters.cfg_start, parameters.cfg_end],
         },
     }
@@ -237,18 +211,12 @@ def _initialize_or_resume(
     output_dir.mkdir(parents=True, exist_ok=True)
     if paths["manifest"].exists():
         existing = json.loads(paths["manifest"].read_text())
-        normalized = dict(existing)
-        if existing.get("schema_version") == 8:
-            sampling = existing.get("sampling")
-            if isinstance(sampling, dict) and "solver" not in sampling:
-                normalized_sampling = dict(sampling)
-                normalized_sampling["solver"] = "euler"
-                normalized_sampling["sampling_nfe"] = normalized_sampling.get(
-                    "sampling_steps"
-                )
-                normalized["sampling"] = normalized_sampling
-                normalized["schema_version"] = 9
-        comparable = {key: normalized.get(key) for key in base}
+        if existing.get("schema_version") != 10:
+            raise ValueError(
+                "sampling manifest uses an incompatible schema; old manifests "
+                "cannot be resumed"
+            )
+        comparable = {key: existing.get(key) for key in base}
         if comparable != base:
             raise ValueError("existing sampling manifest does not match this request")
         if existing.get("complete"):
@@ -376,17 +344,7 @@ def sample_to_archive(
     image_size: int,
     patch_size: int,
     model_variant: str,
-    reg_enabled: bool,
-    reg_variant: str,
-    repa_enabled: bool,
-    reg_token_mode: str,
-    reg_pool_size: int,
-    reg_x0_conditioning: bool,
-    reg_continuation_tokens: int | None,
-    reg_patch_reprojection_enabled: bool,
-    reg_patch_reprojection_source: str,
-    reg_patch_reprojection_intermediate_size: int,
-    reg_patch_reprojection_include_timestep: bool,
+    feature_schema: dict[str, Any],
     checkpoint_hash: str,
     parameters: SamplingParameters,
     generate_batch: GenerateBatch,
@@ -397,31 +355,8 @@ def sample_to_archive(
         raise ValueError("image size must be positive and divisible by patch size")
     if not model_variant:
         raise ValueError("model variant cannot be empty")
-    expected_reg_variants = {"disabled", "standard", "wide_intermediate"}
-    if reg_variant not in expected_reg_variants:
-        raise ValueError("REG variant must be disabled, standard, or wide_intermediate")
-    if reg_enabled != (reg_variant != "disabled"):
-        raise ValueError("REG enabled status and variant do not agree")
-    if reg_variant != "wide_intermediate":
-        reg_x0_conditioning = False
-        reg_continuation_tokens = None
-        reg_patch_reprojection_enabled = False
-    expected_token_modes = {"disabled", "cls", "cls_spatial"}
-    if reg_token_mode not in expected_token_modes:
-        raise ValueError("REG token mode must be disabled, cls, or cls_spatial")
-    if reg_enabled != (reg_token_mode != "disabled"):
-        raise ValueError("REG enabled status and token mode do not agree")
-    if repa_enabled and not reg_enabled:
-        raise ValueError("REPA cannot be enabled without REG")
-    if reg_variant == "wide_intermediate":
-        if reg_continuation_tokens is not None and reg_continuation_tokens < 1:
-            raise ValueError("REG continuation token count must be positive")
-        if reg_patch_reprojection_source not in {"x0_cls", "wide_cls"}:
-            raise ValueError("unknown REG patch-reprojection source")
-        if reg_patch_reprojection_intermediate_size < 1:
-            raise ValueError("REG patch-reprojection intermediate size must be positive")
-    if not 1 <= reg_pool_size <= 16:
-        raise ValueError("REG pool size must be within the native 16x16 feature grid")
+    if feature_schema.get("schema_version") != 2:
+        raise ValueError("sampling requires a schema-v2 feature description")
     labels, sample_ids, noise_seeds = validate_sampling_plan(plan, sample_count, num_classes)
     output_dir = Path(output_dir)
     paths = _paths(output_dir)
@@ -435,21 +370,7 @@ def sample_to_archive(
         image_size=image_size,
         patch_size=patch_size,
         model_variant=model_variant,
-        reg_enabled=reg_enabled,
-        reg_variant=reg_variant,
-        repa_enabled=repa_enabled,
-        reg_token_mode=reg_token_mode,
-        reg_pool_size=reg_pool_size,
-        reg_x0_conditioning=reg_x0_conditioning,
-        reg_continuation_tokens=reg_continuation_tokens,
-        reg_patch_reprojection_enabled=reg_patch_reprojection_enabled,
-        reg_patch_reprojection_source=reg_patch_reprojection_source,
-        reg_patch_reprojection_intermediate_size=(
-            reg_patch_reprojection_intermediate_size
-        ),
-        reg_patch_reprojection_include_timestep=(
-            reg_patch_reprojection_include_timestep
-        ),
+        feature_schema=feature_schema,
         parameters=parameters,
     )
     rank, world_size = _distributed()
