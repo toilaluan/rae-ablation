@@ -5,12 +5,12 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
-from torch import nn
+from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, default_collate
 from torch.utils.data.distributed import DistributedSampler
 
 from .checkpoint import EMA, CheckpointManager, should_checkpoint
@@ -41,6 +41,38 @@ class TrainState:
 ValidationCallback = Callable[[int, bool], dict[str, float]]
 
 
+class TrainBatch(NamedTuple):
+    pixels: Tensor
+    labels: Tensor
+    indices: Tensor
+    cached_targets: FeatureTargets | None
+
+
+class _TrainBatchCollator:
+    """Collate images and lazily gather cached targets inside each loader worker."""
+
+    def __init__(
+        self,
+        cache_config: ExperimentConfig | None,
+        dataset_size: int,
+    ) -> None:
+        self.cache_config = cache_config
+        self.dataset_size = dataset_size
+        self._feature_cache: FeatureCache | None = None
+
+    def __call__(self, samples: list[Any]) -> TrainBatch:
+        pixels, labels, indices = default_collate(samples)
+        cached_targets = None
+        if self.cache_config is not None:
+            if self._feature_cache is None:
+                self._feature_cache = FeatureCache(
+                    self.cache_config,
+                    self.dataset_size,
+                )
+            cached_targets = self._feature_cache.lookup(indices)
+        return TrainBatch(pixels, labels, indices, cached_targets)
+
+
 def distributed_info() -> tuple[int, int]:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank(), torch.distributed.get_world_size()
@@ -53,6 +85,7 @@ def make_train_loader(
     streams: RNGStreams,
 ) -> tuple[DataLoader[Any], DistributedSampler[Any] | None]:
     rank, world_size = distributed_info()
+    cache_active = config.feature_cache.enabled and config.model.features.enabled
     sampler = (
         DistributedSampler(
             dataset,
@@ -76,6 +109,10 @@ def make_train_loader(
             pin_memory=torch.cuda.is_available(),
             persistent_workers=config.data.workers > 0,
             prefetch_factor=config.data.prefetch_factor if config.data.workers > 0 else None,
+            collate_fn=_TrainBatchCollator(
+                config if cache_active else None,
+                len(dataset),
+            ),
             drop_last=True,
         ),
         sampler,
@@ -128,9 +165,12 @@ def train(
         step_started = epoch_started
         last_compute_end = epoch_started
         accumulated_data_wait = 0.0
-        for batch_index, (pixels, labels, indices) in enumerate(loader):
+        for batch_index, batch in enumerate(loader):
             batch_ready = time.perf_counter()
             accumulated_data_wait += batch_ready - last_compute_end
+            pixels = batch.pixels
+            labels = batch.labels
+            cached_targets = batch.cached_targets
             pixels = pixels.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             pixels = random_horizontal_flip(
@@ -166,20 +206,35 @@ def train(
             reg_timesteps = None
             reg_ratios = None
             if feature_cache is not None:
-                cached_targets = feature_cache.lookup(indices)
+                if cached_targets is None:
+                    raise RuntimeError(
+                        "cached feature training requires targets from the train loader"
+                    )
                 targets = FeatureTargets(
                     (
-                        cached_targets.reg.to(device=device, dtype=torch.float32)
+                        cached_targets.reg.to(
+                            device=device,
+                            dtype=torch.float32,
+                            non_blocking=True,
+                        )
                         if cached_targets.reg is not None
                         else None
                     ),
                     (
-                        cached_targets.repa.to(device=device, dtype=torch.float32)
+                        cached_targets.repa.to(
+                            device=device,
+                            dtype=torch.float32,
+                            non_blocking=True,
+                        )
                         if cached_targets.repa is not None
                         else None
                     ),
                 )
             elif feature_encoder is not None:
+                if cached_targets is not None:
+                    raise RuntimeError(
+                        "online feature training received unexpected cached targets"
+                    )
                 with torch.autocast(
                     device_type=device.type,
                     dtype=torch.bfloat16,

@@ -125,8 +125,13 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --config configs/reg-repa-p16.yaml \
   --override feature_cache.enabled=true \
   --override train.horizontal_flip_probability=0 \
+  --override data.prefetch_factor=1 \
   --output runs/reg-repa-cached-p16
 ```
+
+Cached targets are gathered in DataLoader workers and pinned with the image batch.
+REPA targets are large, so start with `data.prefetch_factor=1` and increase it only
+when host memory and profiling show that deeper prefetching is useful.
 
 Cache manifests record environment versions diagnostically, but only pinned
 dataset/preprocessing, encoder identity, component feature schema, and the

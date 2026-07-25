@@ -320,7 +320,8 @@ class FeatureComponentCache:
             raise ValueError("feature-cache indices must have shape [B]")
         if np.any(positions < 0) or np.any(positions >= self.shape[0]):
             raise IndexError("feature-cache index is out of range")
-        bits = np.asarray(self._values[positions]).copy()
+        # NumPy advanced indexing returns a detached array, so no second copy is needed.
+        bits = np.asarray(self._values[positions])
         return torch.from_numpy(bits).view(torch.bfloat16)
 
 

@@ -23,6 +23,12 @@ from jit_reg.config import (
     load_config,
 )
 from jit_reg.data import data_fingerprint, random_horizontal_flip
+from jit_reg.feature_cache import (
+    FeatureCache,
+    FeatureComponentCacheWriter,
+    component_path,
+    component_spec,
+)
 from jit_reg.model.sit import SiT
 from jit_reg.optim import build_optimizer
 from jit_reg.reg import FeatureTargets
@@ -178,9 +184,19 @@ def test_rng_streams_checkpoint_relative_reg_timing() -> None:
         streams.load_state_dict(old)
 
 
-@pytest.mark.parametrize("kind", ["baseline", "paper", "early"])
+@pytest.mark.parametrize(
+    ("kind", "cached"),
+    [
+        ("baseline", False),
+        ("paper", False),
+        ("early", False),
+        ("paper", True),
+    ],
+)
 def test_required_preset_shapes_run_one_training_step(
-    tmp_path: Path, kind: str
+    tmp_path: Path,
+    kind: str,
+    cached: bool,
 ) -> None:
     preset = {
         "baseline": "baseline-p16.yaml",
@@ -222,9 +238,25 @@ def test_required_preset_shapes_run_one_training_step(
             "validation.final_samples=2",
         ],
     )
-    config.checkpoint.directory = str(tmp_path / kind / "checkpoints")
+    case_name = f"{kind}-cached" if cached else kind
+    config.checkpoint.directory = str(tmp_path / case_name / "checkpoints")
+    feature_cache = None
+    if cached:
+        config.feature_cache.enabled = True
+        config.feature_cache.directory = str(tmp_path / case_name / "features")
+        config.train.horizontal_flip_probability = 0
+        config.validate()
+        for component in ("reg", "repa"):
+            spec = component_spec(config, 2, component)
+            path = component_path(config, 2, component)
+            FeatureComponentCacheWriter.initialize(path, spec)
+            writer = FeatureComponentCacheWriter(path, spec)
+            values = torch.nn.functional.normalize(torch.ones(writer.shape), dim=-1)
+            writer.write(torch.arange(2), values)
+            writer.finalize()
+        feature_cache = FeatureCache(config, 2)
     plan = create_validation_plan(2, 2, 2, seed=5)
-    plan_path = tmp_path / kind / "plan.pt"
+    plan_path = tmp_path / case_name / "plan.pt"
     plan.save(plan_path)
     dataset = TensorDataset(
         torch.rand(2, 3, 16, 16),
@@ -249,8 +281,9 @@ def test_required_preset_shapes_run_one_training_step(
         validation_plan_path=plan_path,
         logger=RunLogger(WandbConfig(), {}, True, log_interval=100),
         feature_encoder=TinyTarget(config)
-        if config.model.features.enabled
+        if config.model.features.enabled and feature_cache is None
         else None,
+        feature_cache=feature_cache,
     )
     assert state.global_step == 1
     assert (Path(config.checkpoint.directory) / "epoch-0001").is_dir()

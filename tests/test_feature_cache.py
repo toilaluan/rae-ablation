@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from torch.utils.data import TensorDataset
 
 from jit_reg.config import ExperimentConfig
 from jit_reg.feature_cache import (
@@ -18,6 +19,8 @@ from jit_reg.feature_cache import (
     component_path,
     component_spec,
 )
+from jit_reg.rng import RNGStreams
+from jit_reg.training import TrainBatch, make_train_loader
 
 
 def cache_config(tmp_path: Path) -> ExperimentConfig:
@@ -40,6 +43,26 @@ def fingerprints(config: ExperimentConfig) -> tuple[str, str]:
         component_fingerprint(component_spec(config, 4, "reg")),
         component_fingerprint(component_spec(config, 4, "repa")),
     )
+
+
+def write_active_caches(config: ExperimentConfig, dataset_size: int) -> None:
+    components = []
+    if config.model.features.reg.enabled:
+        components.append("reg")
+    if config.model.features.repa.enabled:
+        components.append("repa")
+    for component in components:
+        spec = component_spec(config, dataset_size, component)
+        path = component_path(config, dataset_size, component)
+        FeatureComponentCacheWriter.initialize(path, spec)
+        writer = FeatureComponentCacheWriter(path, spec)
+        values = (
+            torch.arange(dataset_size, dtype=torch.float32)
+            .reshape(dataset_size, 1, 1)
+            .expand(writer.shape)
+        )
+        writer.write(torch.arange(dataset_size), values)
+        writer.finalize()
 
 
 def test_component_fingerprints_are_minimal_and_independent(tmp_path: Path) -> None:
@@ -105,6 +128,9 @@ def test_component_writer_is_resumable(
     assert FeatureComponentCacheWriter.initialize(path, spec)
     cache = FeatureComponentCache(config, 4, component)  # type: ignore[arg-type]
     assert torch.equal(cache.lookup(torch.tensor([0, 2])).float(), values)
+    detached = cache.lookup(torch.tensor([0]))
+    detached.zero_()
+    assert torch.equal(cache.lookup(torch.tensor([0])).float(), values[:1])
 
 
 def test_combined_cache_reuses_independent_components(tmp_path: Path) -> None:
@@ -121,6 +147,58 @@ def test_combined_cache_reuses_independent_components(tmp_path: Path) -> None:
     assert targets.reg is not None and targets.reg.shape == (2, 1, 8)
     assert targets.repa is not None and targets.repa.shape == (2, 4, 8)
     assert set(cache.fingerprints) == {"reg", "repa"}
+
+
+@pytest.mark.parametrize(
+    ("workers", "reg_enabled", "repa_enabled"),
+    [
+        (0, True, False),
+        (0, False, True),
+        (0, True, True),
+        (2, True, True),
+    ],
+)
+def test_train_loader_prefetches_index_aligned_cached_targets(
+    tmp_path: Path,
+    workers: int,
+    reg_enabled: bool,
+    repa_enabled: bool,
+) -> None:
+    config = cache_config(tmp_path)
+    config.model.features.reg.enabled = reg_enabled
+    config.model.features.repa.enabled = repa_enabled
+    if not reg_enabled:
+        config.model.features.repa.token_scope = "image"
+    config.data.workers = workers
+    config.data.prefetch_factor = 1
+    config.train.micro_batch_size = 2
+    write_active_caches(config, 4)
+    dataset = TensorDataset(
+        torch.rand(4, 3, 16, 16),
+        torch.arange(4),
+        torch.arange(4),
+    )
+
+    loader, _sampler = make_train_loader(dataset, config, RNGStreams.create(7))
+    batches = list(loader)
+
+    assert len(batches) == 2
+    for batch in batches:
+        assert isinstance(batch, TrainBatch)
+        assert batch.cached_targets is not None
+        expected = batch.indices.to(torch.float32)
+        if reg_enabled:
+            assert batch.cached_targets.reg is not None
+            assert batch.cached_targets.reg.dtype == torch.bfloat16
+            assert torch.equal(batch.cached_targets.reg[:, 0, 0].float(), expected)
+        else:
+            assert batch.cached_targets.reg is None
+        if repa_enabled:
+            assert batch.cached_targets.repa is not None
+            assert batch.cached_targets.repa.dtype == torch.bfloat16
+            assert torch.equal(batch.cached_targets.repa[:, 0, 0].float(), expected)
+        else:
+            assert batch.cached_targets.repa is None
 
 
 def test_incompatible_and_old_manifests_are_rejected(tmp_path: Path) -> None:
