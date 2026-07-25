@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import torch
@@ -196,10 +197,14 @@ def main() -> None:
     try:
         if config.validation.validate_now:
             logger.event(f"forced validation started after epoch {state.epoch}")
+            forced_validation_started = time.perf_counter()
             forced_metrics = validate_callback(state.epoch, state.epoch >= config.train.epochs)
+            forced_validation_seconds = time.perf_counter() - forced_validation_started
+            forced_metrics["throughput/validation_seconds"] = forced_validation_seconds
             state.last_completed_validation_epoch = state.epoch
             config.validation.validate_now = False
             logger.log(forced_metrics, step=state.global_step)
+            logger.event(f"forced validation finished in {forced_validation_seconds:.1f}s")
         train(
             canonical_model=model,
             execution_model=execution_model,

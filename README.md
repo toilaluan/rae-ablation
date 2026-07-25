@@ -98,6 +98,12 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --output runs/early-reg-p16
 ```
 
+Training logs separate timing for DataLoader wait, host batch preparation, GPU
+input preparation, GPU forward/backward, optimizer/EMA, and logging. Validation
+and checkpoint durations are logged when those operations run. Because logging
+duration is only known after a step is emitted, `throughput/logging_seconds` on a
+step describes the preceding step's logging call.
+
 For example, a REPA-only run can be selected without feature-specific CLI flags:
 
 ```bash

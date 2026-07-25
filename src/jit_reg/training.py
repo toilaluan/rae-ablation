@@ -163,11 +163,28 @@ def train(
             feature_encoder.eval()
         epoch_started = time.perf_counter()
         step_started = epoch_started
-        last_compute_end = epoch_started
-        accumulated_data_wait = 0.0
-        for batch_index, batch in enumerate(loader):
+        previous_logging_seconds = 0.0
+        accumulated_host_batch = 0.0
+        cuda_batch_timings: list[
+            tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]
+        ] = []
+        iterator_started = time.perf_counter()
+        loader_iterator = iter(loader)
+        accumulated_data_wait = time.perf_counter() - iterator_started
+        for batch_index in range(len(loader)):
+            data_wait_started = time.perf_counter()
+            batch = next(loader_iterator)
             batch_ready = time.perf_counter()
-            accumulated_data_wait += batch_ready - last_compute_end
+            accumulated_data_wait += batch_ready - data_wait_started
+            host_batch_started = batch_ready
+            cuda_input_started = None
+            cuda_model_started = None
+            cuda_backward_finished = None
+            if device.type == "cuda":
+                cuda_input_started = torch.cuda.Event(enable_timing=True)
+                cuda_model_started = torch.cuda.Event(enable_timing=True)
+                cuda_backward_finished = torch.cuda.Event(enable_timing=True)
+                cuda_input_started.record()
             pixels = batch.pixels
             labels = batch.labels
             cached_targets = batch.cached_targets
@@ -257,6 +274,8 @@ def train(
                 )
                 noisy_reg = noisy_interpolate(targets.reg, reg_noise, reg_timesteps)
 
+            if cuda_model_started is not None:
+                cuda_model_started.record()
             update = (batch_index + 1) % accumulation == 0
             sync_context = (
                 execution_model.no_sync()
@@ -300,7 +319,17 @@ def train(
                     repa_weight=config.model.features.repa.loss_weight,
                 )
                 (losses.total / accumulation).backward()
-            last_compute_end = time.perf_counter()
+            if cuda_backward_finished is not None:
+                cuda_backward_finished.record()
+                assert cuda_input_started is not None and cuda_model_started is not None
+                cuda_batch_timings.append(
+                    (
+                        cuda_input_started,
+                        cuda_model_started,
+                        cuda_backward_finished,
+                    )
+                )
+            accumulated_host_batch += time.perf_counter() - host_batch_started
             if not update:
                 continue
 
@@ -311,55 +340,97 @@ def train(
                 config.train.optimizer.min_lr,
             )
             set_learning_rate(optimizer, lr)
+            optimizer_host_started = time.perf_counter()
+            cuda_optimizer_started = None
+            cuda_optimizer_finished = None
+            if device.type == "cuda":
+                cuda_optimizer_started = torch.cuda.Event(enable_timing=True)
+                cuda_optimizer_finished = torch.cuda.Event(enable_timing=True)
+                cuda_optimizer_started.record()
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 canonical_model.parameters(), config.train.grad_clip
             )
             optimizer.step()
             optimizer.zero_grad()
             ema.update(canonical_model)
+            if cuda_optimizer_finished is not None:
+                cuda_optimizer_finished.record()
+            optimizer_host_seconds = time.perf_counter() - optimizer_host_started
             state.global_step += 1
+            gpu_input_seconds = 0.0
+            gpu_forward_backward_seconds = 0.0
+            gpu_optimizer_seconds = 0.0
+            if cuda_optimizer_finished is not None:
+                cuda_optimizer_finished.synchronize()
+                gpu_input_seconds = sum(
+                    started.elapsed_time(model_started)
+                    for started, model_started, _finished in cuda_batch_timings
+                ) / 1_000
+                gpu_forward_backward_seconds = sum(
+                    model_started.elapsed_time(finished)
+                    for _started, model_started, finished in cuda_batch_timings
+                ) / 1_000
+                assert cuda_optimizer_started is not None
+                gpu_optimizer_seconds = (
+                    cuda_optimizer_started.elapsed_time(cuda_optimizer_finished) / 1_000
+                )
             now = time.perf_counter()
             elapsed = max(now - step_started, 1e-9)
             images = config.train.global_batch_size
+            metrics = {
+                "train/loss": losses.total.item(),
+                "train/image_velocity_loss": losses.image_velocity.item(),
+                "train/reg_velocity_loss": losses.reg_velocity.item(),
+                "train/reg_x0_mse": losses.reg_x0_mse.item(),
+                "train/reg_x0_cosine": losses.reg_x0_cosine.item(),
+                "train/repa_loss": losses.repa.item(),
+                "train/image_timestep_mean": timesteps.mean().item(),
+                "train/reg_timestep_mean": (
+                    reg_timesteps.mean().item()
+                    if reg_timesteps is not None
+                    else 0.0
+                ),
+                "train/reg_timestep_ratio_mean": (
+                    reg_ratios.mean().item() if reg_ratios is not None else 0.0
+                ),
+                "train/lr": lr,
+                "train/lr_adamw": lr,
+                "train/lr_muon": lr if config.train.optimizer.kind == "muon" else 0.0,
+                "train/gradient_norm": float(grad_norm),
+                "train/ema_decay": ema.decay,
+                "throughput/images_per_second": images / elapsed,
+                "throughput/jit_tokens_per_second": images
+                * config.model.grid_size**2
+                / elapsed,
+                "throughput/step_seconds": elapsed,
+                "throughput/data_wait_seconds": accumulated_data_wait,
+                "throughput/host_batch_seconds": accumulated_host_batch,
+                "throughput/optimizer_host_seconds": optimizer_host_seconds,
+                "throughput/logging_seconds": previous_logging_seconds,
+                "throughput/gpu_input_seconds": gpu_input_seconds,
+                "throughput/gpu_forward_backward_seconds": gpu_forward_backward_seconds,
+                "throughput/gpu_optimizer_seconds": gpu_optimizer_seconds,
+                "throughput/gpu_step_seconds": (
+                    gpu_input_seconds
+                    + gpu_forward_backward_seconds
+                    + gpu_optimizer_seconds
+                ),
+                "system/peak_memory_gib": torch.cuda.max_memory_allocated(device) / 2**30
+                if device.type == "cuda"
+                else 0,
+                "train/epoch": progress,
+                "train/global_step": state.global_step,
+            }
+            logging_started = time.perf_counter()
             logger.log_training(
-                {
-                    "train/loss": losses.total.item(),
-                    "train/image_velocity_loss": losses.image_velocity.item(),
-                    "train/reg_velocity_loss": losses.reg_velocity.item(),
-                    "train/reg_x0_mse": losses.reg_x0_mse.item(),
-                    "train/reg_x0_cosine": losses.reg_x0_cosine.item(),
-                    "train/repa_loss": losses.repa.item(),
-                    "train/image_timestep_mean": timesteps.mean().item(),
-                    "train/reg_timestep_mean": (
-                        reg_timesteps.mean().item()
-                        if reg_timesteps is not None
-                        else 0.0
-                    ),
-                    "train/reg_timestep_ratio_mean": (
-                        reg_ratios.mean().item() if reg_ratios is not None else 0.0
-                    ),
-                    "train/lr": lr,
-                    "train/lr_adamw": lr,
-                    "train/lr_muon": lr if config.train.optimizer.kind == "muon" else 0.0,
-                    "train/gradient_norm": float(grad_norm),
-                    "train/ema_decay": ema.decay,
-                    "throughput/images_per_second": images / elapsed,
-                    "throughput/jit_tokens_per_second": images
-                    * config.model.grid_size**2
-                    / elapsed,
-                    "throughput/step_seconds": elapsed,
-                    "throughput/data_wait_seconds": accumulated_data_wait,
-                    "system/peak_memory_gib": torch.cuda.max_memory_allocated(device) / 2**30
-                    if device.type == "cuda"
-                    else 0,
-                    "train/epoch": progress,
-                    "train/global_step": state.global_step,
-                },
+                metrics,
                 step=state.global_step,
             )
+            previous_logging_seconds = time.perf_counter() - logging_started
             step_started = now
-            last_compute_end = now
             accumulated_data_wait = 0.0
+            accumulated_host_batch = 0.0
+            cuda_batch_timings.clear()
             if config.train.max_steps is not None and state.global_step >= config.train.max_steps:
                 break
 
@@ -376,10 +447,14 @@ def train(
             config.validation.validate_now,
         ):
             logger.event(f"validation started after epoch {state.epoch}")
+            validation_started = time.perf_counter()
             validation_metrics = validation_callback(state.epoch, final_epoch)
+            validation_seconds = time.perf_counter() - validation_started
+            validation_metrics["throughput/validation_seconds"] = validation_seconds
             state.last_completed_validation_epoch = state.epoch
             config.validation.validate_now = False
             logger.log(validation_metrics, step=state.global_step)
+            logger.event(f"validation finished in {validation_seconds:.1f}s")
             for name, value in validation_metrics.items():
                 if "FID" in name:
                     logger.event(f"{name}: {value:.6f}")
@@ -388,6 +463,7 @@ def train(
             should_checkpoint(state.epoch, config.train.epochs, config.checkpoint.interval)
             or final_epoch
         ):
+            checkpoint_started = time.perf_counter()
             fid = next(
                 (
                     value
@@ -414,9 +490,14 @@ def train(
                 ),
                 fid=fid,
             )
-            logger.event(f"checkpoint saved: {path}")
             if config.wandb.checkpoint_artifacts:
                 logger.log_checkpoint(str(path), f"checkpoint-epoch-{state.epoch:04d}")
+            checkpoint_seconds = time.perf_counter() - checkpoint_started
+            logger.log(
+                {"throughput/checkpoint_seconds": checkpoint_seconds},
+                step=state.global_step,
+            )
+            logger.event(f"checkpoint saved in {checkpoint_seconds:.1f}s: {path}")
 
         logger.log(
             {"train/epoch_seconds": time.perf_counter() - epoch_started},

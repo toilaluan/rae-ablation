@@ -64,6 +64,13 @@ class RunLogger:
             f"grad_norm={metrics['train/gradient_norm']:.4f} "
             f"throughput={metrics['throughput/images_per_second']:.2f} images/s "
             f"step_time={metrics['throughput/step_seconds']:.3f}s "
+            f"data_wait={metrics['throughput/data_wait_seconds']:.3f}s "
+            f"host_batch={metrics['throughput/host_batch_seconds']:.3f}s "
+            f"gpu_input={metrics['throughput/gpu_input_seconds']:.3f}s "
+            f"gpu_fwd_bwd={metrics['throughput/gpu_forward_backward_seconds']:.3f}s "
+            f"optim_host={metrics['throughput/optimizer_host_seconds']:.3f}s "
+            f"gpu_optim={metrics['throughput/gpu_optimizer_seconds']:.3f}s "
+            f"logging={metrics['throughput/logging_seconds']:.3f}s "
             f"peak_memory={metrics['system/peak_memory_gib']:.2f} GiB"
         )
 

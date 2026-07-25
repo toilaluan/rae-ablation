@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -113,6 +114,15 @@ class TinyTarget(nn.Module):
             else None
         )
         return FeatureTargets(reg, repa)
+
+
+class RecordingLogger(RunLogger):
+    def __init__(self) -> None:
+        super().__init__(WandbConfig(), {}, True, log_interval=100)
+        self.metrics: list[dict[str, Any]] = []
+
+    def log(self, metrics: dict[str, Any], step: int | None = None) -> None:
+        self.metrics.append(metrics)
 
 
 def save_checkpoint(tmp_path: Path) -> tuple[CheckpointManager, Path, SiT]:
@@ -233,6 +243,7 @@ def test_required_preset_shapes_run_one_training_step(
             "train.micro_batch_size=2",
             "train.max_steps=1",
             "data.workers=0",
+            "feature_cache.enabled=false",
             "validation.interval=0",
             "validation.periodic_samples=2",
             "validation.final_samples=2",
@@ -266,6 +277,7 @@ def test_required_preset_shapes_run_one_training_step(
     streams = RNGStreams.create(3)
     loader, sampler = make_train_loader(dataset, config, streams)
     model = SiT(config.model)
+    logger = RecordingLogger()
     state = train(
         canonical_model=model,
         execution_model=model,
@@ -279,7 +291,7 @@ def test_required_preset_shapes_run_one_training_step(
         data_fingerprint="data",
         validation_plan_hash=plan.plan_hash,
         validation_plan_path=plan_path,
-        logger=RunLogger(WandbConfig(), {}, True, log_interval=100),
+        logger=logger,
         feature_encoder=TinyTarget(config)
         if config.model.features.enabled and feature_cache is None
         else None,
@@ -287,6 +299,18 @@ def test_required_preset_shapes_run_one_training_step(
     )
     assert state.global_step == 1
     assert (Path(config.checkpoint.directory) / "epoch-0001").is_dir()
+    logged_names = {name for metrics in logger.metrics for name in metrics}
+    assert {
+        "throughput/data_wait_seconds",
+        "throughput/host_batch_seconds",
+        "throughput/optimizer_host_seconds",
+        "throughput/logging_seconds",
+        "throughput/gpu_input_seconds",
+        "throughput/gpu_forward_backward_seconds",
+        "throughput/gpu_optimizer_seconds",
+        "throughput/gpu_step_seconds",
+        "throughput/checkpoint_seconds",
+    } <= logged_names
 
 
 def test_data_fingerprint_and_flip_are_stable() -> None:
