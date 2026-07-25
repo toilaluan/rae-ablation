@@ -66,6 +66,7 @@ def load_imagenet(config: DataConfig, image_size: int) -> ImageNetDataset:
     dataset = load_dataset(
         config.repository,
         split=config.split,
+        num_proc=12,
         revision=config.revision,
     )
     if config.max_samples is not None:
