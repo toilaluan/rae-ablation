@@ -51,6 +51,14 @@ def test_unknown_optimizer_kind_is_rejected() -> None:
         config.validate()
 
 
+def test_retired_micro_batch_override_is_rejected() -> None:
+    with pytest.raises(ValueError, match="micro_batch_size"):
+        load_config(
+            ROOT / "configs/baseline-p16.yaml",
+            ["train.micro_batch_size=8"],
+        )
+
+
 @pytest.mark.parametrize(
     ("reg", "repa", "scope"),
     [

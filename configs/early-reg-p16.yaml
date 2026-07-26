@@ -62,7 +62,6 @@ compile:
 train:
   epochs: 200
   global_batch_size: 1024
-  micro_batch_size: 128
   max_steps: null
   grad_clip: 1.0
   ema_decay: 0.9995

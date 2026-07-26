@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -9,7 +8,6 @@ from typing import Any, NamedTuple
 
 import torch
 from torch import Tensor, nn
-from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, default_collate
 from torch.utils.data.distributed import DistributedSampler
 
@@ -261,12 +259,26 @@ def distributed_info() -> tuple[int, int]:
     return 0, 1
 
 
+def local_batch_size(global_batch_size: int, world_size: int) -> int:
+    if world_size < 1:
+        raise ValueError("distributed world size must be positive")
+    if global_batch_size < 1 or global_batch_size % world_size:
+        raise ValueError(
+            "train.global_batch_size must be positive and exactly divisible "
+            "by the distributed world size"
+        )
+    return global_batch_size // world_size
+
+
 def make_train_loader(
     dataset: torch.utils.data.Dataset[Any],
     config: ExperimentConfig,
     streams: RNGStreams,
 ) -> tuple[DataLoader[Any], DistributedSampler[Any] | None]:
     rank, world_size = distributed_info()
+    rank_batch_size = local_batch_size(
+        config.train.global_batch_size, world_size
+    )
     cache_active = config.feature_cache.enabled and config.model.features.enabled
     sampler = (
         DistributedSampler(
@@ -283,7 +295,7 @@ def make_train_loader(
     return (
         DataLoader(
             dataset,
-            batch_size=config.train.micro_batch_size,
+            batch_size=rank_batch_size,
             sampler=sampler,
             shuffle=sampler is None,
             generator=streams.shuffle,
@@ -324,11 +336,13 @@ def train(
     state = state or TrainState()
     rank, world_size = distributed_info()
     device = next(canonical_model.parameters()).device
-    accumulation = config.train.global_batch_size // (config.train.micro_batch_size * world_size)
-    if accumulation < 1 or config.train.global_batch_size % (
-        config.train.micro_batch_size * world_size
-    ):
-        raise ValueError("global batch size must divide micro batch size * world size exactly")
+    expected_batch_size = local_batch_size(
+        config.train.global_batch_size, world_size
+    )
+    if loader.batch_size != expected_batch_size:
+        raise ValueError(
+            "train loader batch size does not match global_batch_size / world_size"
+        )
     target_sources = int(feature_encoder is not None) + int(feature_cache is not None)
     if config.model.features.enabled != (target_sources == 1):
         raise ValueError(
@@ -451,49 +465,42 @@ def train(
 
             if cuda_model_started is not None:
                 cuda_model_started.record()
-            update = (batch_index + 1) % accumulation == 0
-            sync_context = (
-                execution_model.no_sync()
-                if isinstance(execution_model, DistributedDataParallel) and not update
-                else contextlib.nullcontext()
-            )
-            with sync_context:
-                with torch.autocast(
-                    device_type=device.type,
-                    dtype=torch.bfloat16,
-                    enabled=device.type == "cuda",
-                ):
-                    output = execution_model(
-                        noisy_image,
-                        timesteps,
-                        model_labels,
-                        noisy_reg=noisy_reg,
-                        reg_timestep=reg_timesteps,
-                        return_repa=config.model.features.repa.enabled,
-                    )
-                repa_target = (
-                    repa_target_for_scope(
-                        targets,
-                        config.model.features.repa.token_scope,
-                    )
-                    if targets is not None and config.model.features.repa.enabled
-                    else None
-                )
-                losses = jit_losses(
-                    clean,
-                    image_noise,
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=device.type == "cuda",
+            ):
+                output = execution_model(
+                    noisy_image,
                     timesteps,
-                    output.image,
-                    clean_reg=targets.reg if targets is not None else None,
-                    reg_noise=reg_noise,
-                    reg_prediction=output.reg,
+                    model_labels,
+                    noisy_reg=noisy_reg,
                     reg_timestep=reg_timesteps,
-                    repa_prediction=output.repa,
-                    repa_target=repa_target,
-                    reg_weight=config.model.features.reg.loss_weight,
-                    repa_weight=config.model.features.repa.loss_weight,
+                    return_repa=config.model.features.repa.enabled,
                 )
-                (losses.total / accumulation).backward()
+            repa_target = (
+                repa_target_for_scope(
+                    targets,
+                    config.model.features.repa.token_scope,
+                )
+                if targets is not None and config.model.features.repa.enabled
+                else None
+            )
+            losses = jit_losses(
+                clean,
+                image_noise,
+                timesteps,
+                output.image,
+                clean_reg=targets.reg if targets is not None else None,
+                reg_noise=reg_noise,
+                reg_prediction=output.reg,
+                reg_timestep=reg_timesteps,
+                repa_prediction=output.repa,
+                repa_target=repa_target,
+                reg_weight=config.model.features.reg.loss_weight,
+                repa_weight=config.model.features.repa.loss_weight,
+            )
+            losses.total.backward()
             if cuda_backward_finished is not None:
                 cuda_backward_finished.record()
                 assert (
@@ -509,8 +516,6 @@ def train(
                     )
                 )
             accumulated_host_batch += time.perf_counter() - host_batch_started
-            if not update:
-                continue
 
             progress = epoch_index + (batch_index + 1) / len(loader)
             lr = learning_rate_at_epoch(

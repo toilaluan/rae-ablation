@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from jit_reg.feature_cache import (
 )
 from jit_reg.reg import FeatureTargets
 from jit_reg.rng import RNGStreams
-from jit_reg.training import TrainBatch, make_train_loader
+from jit_reg.training import TrainBatch, local_batch_size, make_train_loader
 
 
 def cache_config(tmp_path: Path) -> ExperimentConfig:
@@ -238,7 +239,7 @@ def test_train_loader_prefetches_index_aligned_cached_targets(
         config.model.features.repa.token_scope = "image"
     config.data.workers = workers
     config.data.prefetch_factor = 1
-    config.train.micro_batch_size = 2
+    config.train.global_batch_size = 2
     write_active_caches(config, 4)
     dataset = TensorDataset(
         torch.randint(0, 256, (4, 3, 16, 16), dtype=torch.uint8),
@@ -267,6 +268,59 @@ def test_train_loader_prefetches_index_aligned_cached_targets(
             assert torch.equal(batch.cached_targets.repa[:, 0, 0].float(), expected)
         else:
             assert batch.cached_targets.repa is None
+
+
+@pytest.mark.parametrize(
+    ("global_batch_size", "world_size", "expected"),
+    [(1, 1, 1), (1024, 1, 1024), (1024, 8, 128)],
+)
+def test_local_batch_size_is_derived_from_world_size(
+    global_batch_size: int,
+    world_size: int,
+    expected: int,
+) -> None:
+    assert local_batch_size(global_batch_size, world_size) == expected
+
+
+@pytest.mark.parametrize(
+    ("global_batch_size", "world_size"),
+    [(0, 1), (3, 2), (8, 0)],
+)
+def test_local_batch_size_rejects_invalid_division(
+    global_batch_size: int,
+    world_size: int,
+) -> None:
+    with pytest.raises(ValueError, match=r"world size|world_size"):
+        local_batch_size(global_batch_size, world_size)
+
+
+def test_train_loader_uses_rank_local_share_of_global_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jit_reg.training as training
+
+    config = ExperimentConfig()
+    config.train.global_batch_size = 8
+    config.data.workers = 0
+    dataset = TensorDataset(
+        torch.zeros(8, 3, 4, 4, dtype=torch.uint8),
+        torch.zeros(8, dtype=torch.long),
+        torch.arange(8),
+    )
+    monkeypatch.setattr(training, "distributed_info", lambda: (1, 4))
+    loader, sampler = make_train_loader(
+        dataset, config, RNGStreams.create(3)
+    )
+    assert loader.batch_size == 2
+    assert sampler is not None
+
+
+def test_training_hot_path_has_no_gradient_accumulation() -> None:
+    import jit_reg.training as training
+
+    source = inspect.getsource(training.train)
+    assert "accumulation" not in source
+    assert "no_sync" not in source
 
 
 def test_incompatible_and_old_manifests_are_rejected(tmp_path: Path) -> None:

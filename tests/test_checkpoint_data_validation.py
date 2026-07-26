@@ -83,7 +83,6 @@ def tiny_experiment(kind: str = "baseline") -> ExperimentConfig:
     config.train.optimizer.kind = "adamw"
     config.train.epochs = 1
     config.train.global_batch_size = 2
-    config.train.micro_batch_size = 2
     config.train.max_steps = 1
     config.data.workers = 0
     config.validation.interval = 0
@@ -197,6 +196,7 @@ def test_current_checkpoint_config_uses_structured_defaults(
     reg = values["model"]["features"]["reg"]
     reg.pop("spatial_rope")
     reg["early_prediction"].pop("reinjection_mode")
+    values["train"]["micro_batch_size"] = 1
     config_path.write_text(json.dumps(values))
     bundle = load_checkpoint_bundle(checkpoint)
     assert bundle.config.model.features.reg.spatial_rope
@@ -204,6 +204,7 @@ def test_current_checkpoint_config_uses_structured_defaults(
         bundle.config.model.features.reg.early_prediction.reinjection_mode
         == "replace"
     )
+    assert not hasattr(bundle.config.train, "micro_batch_size")
 
 
 def test_old_checkpoint_schema_is_explicitly_rejected(tmp_path: Path) -> None:
@@ -277,7 +278,6 @@ def test_required_preset_shapes_run_one_training_step(
             "train.optimizer.kind=adamw",
             "train.epochs=1",
             "train.global_batch_size=2",
-            "train.micro_batch_size=2",
             "train.max_steps=1",
             "data.workers=0",
             "feature_cache.enabled=false",

@@ -147,7 +147,6 @@ class OptimizerConfig:
 class TrainConfig:
     epochs: int = 80
     global_batch_size: int = 1024
-    micro_batch_size: int = 256
     max_steps: int | None = None
     grad_clip: float = 1.0
     ema_decay: float = 0.9995
@@ -355,10 +354,10 @@ class ExperimentConfig:
             or self.validation.final_samples % m.num_classes
         ):
             raise ValueError("validation sample counts must be class balanced")
-        if self.train.global_batch_size < self.train.micro_batch_size:
-            raise ValueError("global batch size must be at least the micro batch size")
-        if self.train.epochs < 1 or self.train.micro_batch_size < 1:
-            raise ValueError("training epochs and batch sizes must be positive")
+        if self.train.epochs < 1 or self.train.global_batch_size < 1:
+            raise ValueError(
+                "training epochs and global batch size must be positive"
+            )
         if self.train.max_steps is not None and self.train.max_steps < 1:
             raise ValueError("train.max_steps must be positive")
         if not 0 < self.train.ema_decay < 1:
@@ -474,4 +473,9 @@ def load_checkpoint_config(path: str | Path) -> ExperimentConfig:
     values = deepcopy(
         _require_current_schema(json.loads(Path(path).read_text()), path)
     )
+    train = values.get("train")
+    if isinstance(train, dict):
+        # Retired runtime-only field from schema-v3 checkpoints. Per-rank batch
+        # size is now derived from global_batch_size and distributed world size.
+        train.pop("micro_batch_size", None)
     return _structured_config(values)

@@ -113,6 +113,10 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --output runs/early-reg-p16
 ```
 
+`train.global_batch_size` is divided evenly across the distributed world size to
+derive each rank's loader batch. Every loader batch performs one optimizer step;
+gradient accumulation and a separate per-device batch setting are not used.
+
 Training logs separate timing for DataLoader wait, host batch preparation, GPU
 input preparation, GPU forward/backward, optimizer/EMA, and logging. Validation
 and checkpoint durations are logged when those operations run. Because logging
