@@ -27,6 +27,104 @@ def _axis_angles(positions: Tensor, half_dim: int, dtype: torch.dtype) -> Tensor
     return angles.to(dtype=dtype)
 
 
+def rope_cos_sin(
+    y_positions: Tensor,
+    x_positions: Tensor,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> tuple[Tensor, Tensor]:
+    """Build factorized 2D RoPE tables for explicit coordinates."""
+    if (
+        y_positions.ndim != 1
+        or x_positions.ndim != 1
+        or y_positions.shape != x_positions.shape
+    ):
+        raise ValueError("RoPE coordinates must be equal one-dimensional tensors")
+    if head_dim % 4:
+        raise ValueError("head dimension must be divisible by four")
+    half = head_dim // 2
+    y = _axis_angles(y_positions, half, dtype)
+    x = _axis_angles(x_positions, half, dtype)
+    angles = torch.cat((y, x), dim=-1)
+    return angles.cos(), angles.sin()
+
+
+def apply_rope_cos_sin(
+    q: Tensor,
+    k: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Apply a precomputed RoPE table to complete Q/K token sequences."""
+    if q.shape != k.shape or q.ndim != 4:
+        raise ValueError("q and k must have equal [B, heads, tokens, dim] shapes")
+    if cos.shape != sin.shape or cos.shape != q.shape[-2:]:
+        raise ValueError("RoPE tables must have shape [tokens, head_dim]")
+    cos = cos.reshape(1, 1, *cos.shape)
+    sin = sin.reshape(1, 1, *sin.shape)
+    return (
+        q * cos + _rotate_pairs(q) * sin,
+        k * cos + _rotate_pairs(k) * sin,
+    )
+
+
+def precompute_rope_tables(
+    image_height: int,
+    image_width: int,
+    head_dim: int,
+    *,
+    prefix_tokens: int = 0,
+    spatial_pool_size: int | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[Tensor, Tensor]:
+    """Build one image-plus-prefix RoPE table for a static attention layout."""
+    if image_height < 1 or image_width < 1:
+        raise ValueError("RoPE grid dimensions must be positive")
+    if prefix_tokens < 0:
+        raise ValueError("RoPE prefix token count cannot be negative")
+    image_y = torch.arange(image_height, dtype=torch.float32)
+    image_x = torch.arange(image_width, dtype=torch.float32)
+    image_y = (
+        image_y[:, None].expand(image_height, image_width).reshape(-1)
+    )
+    image_x = (
+        image_x[None, :].expand(image_height, image_width).reshape(-1)
+    )
+    image_cos, image_sin = rope_cos_sin(
+        image_y, image_x, head_dim, dtype
+    )
+    if prefix_tokens == 0:
+        return image_cos, image_sin
+    if spatial_pool_size is None:
+        prefix_cos = torch.ones(prefix_tokens, head_dim, dtype=dtype)
+        prefix_sin = torch.zeros(prefix_tokens, head_dim, dtype=dtype)
+    else:
+        if spatial_pool_size**2 != prefix_tokens:
+            raise ValueError(
+                "spatial RoPE pool size must match the prefix token count"
+            )
+        cell = torch.arange(spatial_pool_size, dtype=torch.float32) + 0.5
+        prefix_y = cell * (image_height / spatial_pool_size) - 0.5
+        prefix_x = cell * (image_width / spatial_pool_size) - 0.5
+        prefix_y = (
+            prefix_y[:, None]
+            .expand(spatial_pool_size, spatial_pool_size)
+            .reshape(-1)
+        )
+        prefix_x = (
+            prefix_x[None, :]
+            .expand(spatial_pool_size, spatial_pool_size)
+            .reshape(-1)
+        )
+        prefix_cos, prefix_sin = rope_cos_sin(
+            prefix_y, prefix_x, head_dim, dtype
+        )
+    return (
+        torch.cat((prefix_cos, image_cos), dim=0),
+        torch.cat((prefix_sin, image_sin), dim=0),
+    )
+
+
 def apply_2d_rope_positions(
     q: Tensor,
     k: Tensor,
@@ -43,24 +141,13 @@ def apply_2d_rope_positions(
         or q.shape[-2] != y_positions.shape[0]
     ):
         raise ValueError("RoPE coordinates must match the token count")
-    head_dim = q.shape[-1]
-    if head_dim % 4:
-        raise ValueError("head dimension must be divisible by four")
-    half = head_dim // 2
-    y = _axis_angles(y_positions.to(q.device), half, q.dtype).reshape(
-        1, 1, -1, half
+    cos, sin = rope_cos_sin(
+        y_positions.to(q.device),
+        x_positions.to(q.device),
+        q.shape[-1],
+        q.dtype,
     )
-    x = _axis_angles(x_positions.to(q.device), half, q.dtype).reshape(
-        1, 1, -1, half
-    )
-
-    def rotate(tensor: Tensor) -> Tensor:
-        ty, tx = tensor.split(half, dim=-1)
-        ty = ty * y.cos() + _rotate_pairs(ty) * y.sin()
-        tx = tx * x.cos() + _rotate_pairs(tx) * x.sin()
-        return torch.cat((ty, tx), dim=-1)
-
-    return rotate(q), rotate(k)
+    return apply_rope_cos_sin(q, k, cos, sin)
 
 
 def apply_2d_rope(q: Tensor, k: Tensor, height: int, width: int) -> tuple[Tensor, Tensor]:

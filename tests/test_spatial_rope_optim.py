@@ -8,6 +8,8 @@ from jit_reg.model.rope import (
     apply_2d_rope,
     apply_2d_rope_positions,
     apply_aligned_spatial_rope,
+    apply_rope_cos_sin,
+    precompute_rope_tables,
 )
 from jit_reg.model.sit import Attention
 from jit_reg.optim import _muon_eligible
@@ -30,6 +32,7 @@ def test_attention_rotates_entire_spatial_reg_prefix_and_image_tokens(
     attention = Attention(
         8,
         1,
+        grid_size=2,
         spatial_pool_size=2,
         spatial_rope=True,
     )
@@ -66,6 +69,74 @@ def test_attention_rotates_entire_spatial_reg_prefix_and_image_tokens(
     rotated = captured[0][0]
     assert torch.allclose(rotated[:, :, :4], expected_spatial)
     assert torch.allclose(rotated[:, :, 4:], expected_patches)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_precomputed_image_rope_matches_functional_reference(
+    dtype: torch.dtype,
+) -> None:
+    q = torch.randn(2, 3, 6, 8).to(dtype)
+    k = torch.randn_like(q)
+    cos, sin = precompute_rope_tables(2, 3, 8, dtype=dtype)
+    actual = apply_rope_cos_sin(q, k, cos, sin)
+    expected = apply_2d_rope(q, k, 2, 3)
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
+
+
+@pytest.mark.parametrize("spatial_rope", [False, True])
+def test_precomputed_prefix_rope_matches_identity_or_spatial_reference(
+    spatial_rope: bool,
+) -> None:
+    q = torch.randn(1, 2, 8, 8)
+    k = torch.randn_like(q)
+    cos, sin = precompute_rope_tables(
+        2,
+        2,
+        8,
+        prefix_tokens=4,
+        spatial_pool_size=2 if spatial_rope else None,
+    )
+    actual_q, actual_k = apply_rope_cos_sin(q, k, cos, sin)
+    if spatial_rope:
+        prefix_q, prefix_k = apply_aligned_spatial_rope(
+            q[:, :, :4], k[:, :, :4], 2, 2, 2
+        )
+    else:
+        prefix_q, prefix_k = q[:, :, :4], k[:, :, :4]
+    image_q, image_k = apply_2d_rope(
+        q[:, :, 4:], k[:, :, 4:], 2, 2
+    )
+    assert torch.equal(actual_q, torch.cat((prefix_q, image_q), dim=2))
+    assert torch.equal(actual_k, torch.cat((prefix_k, image_k), dim=2))
+
+
+def test_attention_rope_tables_are_nonpersistent_and_forward_is_static(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attention = Attention(
+        8,
+        1,
+        grid_size=2,
+        spatial_pool_size=2,
+        spatial_rope=False,
+    )
+    assert {
+        "rope_cos_fp32",
+        "rope_sin_fp32",
+        "rope_cos_bf16",
+        "rope_sin_bf16",
+    } <= dict(attention.named_buffers()).keys()
+    assert not any("rope_" in name for name in attention.state_dict())
+
+    def unexpected(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("coordinate or trigonometric work ran in forward")
+
+    monkeypatch.setattr(torch, "arange", unexpected)
+    monkeypatch.setattr(torch, "outer", unexpected)
+    monkeypatch.setattr(torch.Tensor, "cos", unexpected)
+    monkeypatch.setattr(torch.Tensor, "sin", unexpected)
+    assert attention(torch.randn(1, 8, 8), 2, 2, 4).shape == (1, 8, 8)
 
 
 @pytest.mark.parametrize(

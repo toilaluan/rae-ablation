@@ -38,7 +38,7 @@ def data_fingerprint(config: DataConfig, image_size: int) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-class ImageNetDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
+class ImageNetDataset(Dataset[tuple[Tensor, int, int]]):
     """Small tensor adapter over the pinned Hugging Face ImageNet-256 dataset."""
 
     def __init__(self, dataset: Any, image_size: int) -> None:
@@ -48,7 +48,7 @@ class ImageNetDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor]:
+    def __getitem__(self, index: int) -> tuple[Tensor, int, int]:
         row: Mapping[str, Any] = self.dataset[index]
         image = row["image"].convert("RGB")
         if image.size != (self.image_size, self.image_size):
@@ -56,8 +56,8 @@ class ImageNetDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
                 (self.image_size, self.image_size), Image.Resampling.BICUBIC
             )
         pixels = np.asarray(image, dtype=np.uint8).copy()
-        tensor = torch.from_numpy(pixels).permute(2, 0, 1).float().div_(255)
-        return tensor, torch.tensor(int(row["label"])), torch.tensor(index)
+        tensor = torch.from_numpy(pixels).permute(2, 0, 1)
+        return tensor, int(row["label"]), index
 
 
 def load_imagenet(config: DataConfig, image_size: int) -> ImageNetDataset:

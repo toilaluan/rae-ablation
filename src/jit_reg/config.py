@@ -330,8 +330,10 @@ class ExperimentConfig:
             if repa.token_scope == "image_and_reg" and not features.reg.enabled:
                 raise ValueError("REPA image_and_reg token scope requires REG")
 
-        if self.train.optimizer.kind not in {"adamw", "muon"}:
-            raise ValueError("optimizer.kind must be adamw or muon")
+        if self.train.optimizer.kind not in {"adamw", "muon", "fused_muon"}:
+            raise ValueError(
+                "optimizer.kind must be adamw, muon, or fused_muon"
+            )
         if self.wandb.mode not in {"online", "offline", "disabled"}:
             raise ValueError("wandb.mode must be online, offline, or disabled")
         if self.data.workers < 0 or self.data.prefetch_factor < 1:

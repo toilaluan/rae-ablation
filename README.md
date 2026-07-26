@@ -71,6 +71,19 @@ uv run pytest -q
 uv run ruff check .
 ```
 
+The default presets use PyTorch Muon. The fused Gram Newton–Schulz backend is an
+explicit Hopper/Blackwell opt-in:
+
+```bash
+uv sync --extra dev --extra fused-muon
+uv run python scripts/train.py \
+  --override train.optimizer.kind=fused_muon
+```
+
+This installs `gram-newton-schulz==0.1.6` and requires CUDA 12.9 or newer plus
+compute capability 9.0 or newer. Unsupported hardware and missing dependencies
+produce an error; training never falls back to another optimizer.
+
 Download the ImageNet-256 ADM reference statistics to the path configured by
 `evaluation.reference_npz`:
 

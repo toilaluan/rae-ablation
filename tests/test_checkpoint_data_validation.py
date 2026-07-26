@@ -307,7 +307,7 @@ def test_required_preset_shapes_run_one_training_step(
     plan_path = tmp_path / case_name / "plan.pt"
     plan.save(plan_path)
     dataset = TensorDataset(
-        torch.rand(2, 3, 16, 16),
+        torch.randint(0, 256, (2, 3, 16, 16), dtype=torch.uint8),
         torch.tensor([0, 1]),
         torch.arange(2),
     )

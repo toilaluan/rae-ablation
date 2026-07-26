@@ -9,7 +9,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from ..config import ModelConfig
-from .rope import apply_2d_rope, apply_aligned_spatial_rope
+from .rope import apply_rope_cos_sin, precompute_rope_tables
 
 
 class SiTOutput(NamedTuple):
@@ -78,6 +78,7 @@ class Attention(nn.Module):
         hidden_size: int,
         num_heads: int,
         *,
+        grid_size: int,
         spatial_pool_size: int | None = None,
         spatial_rope: bool = False,
     ) -> None:
@@ -85,8 +86,41 @@ class Attention(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        self.grid_size = grid_size
         self.spatial_pool_size = spatial_pool_size
         self.spatial_rope = spatial_rope
+        self.prefix_tokens = (
+            spatial_pool_size**2 if spatial_pool_size is not None else 0
+        )
+        spatial_table_pool = spatial_pool_size if spatial_rope else None
+        rope_cos_fp32, rope_sin_fp32 = precompute_rope_tables(
+            grid_size,
+            grid_size,
+            self.head_dim,
+            prefix_tokens=self.prefix_tokens,
+            spatial_pool_size=spatial_table_pool,
+            dtype=torch.float32,
+        )
+        rope_cos_bf16, rope_sin_bf16 = precompute_rope_tables(
+            grid_size,
+            grid_size,
+            self.head_dim,
+            prefix_tokens=self.prefix_tokens,
+            spatial_pool_size=spatial_table_pool,
+            dtype=torch.bfloat16,
+        )
+        self.register_buffer(
+            "rope_cos_fp32", rope_cos_fp32, persistent=False
+        )
+        self.register_buffer(
+            "rope_sin_fp32", rope_sin_fp32, persistent=False
+        )
+        self.register_buffer(
+            "rope_cos_bf16", rope_cos_bf16, persistent=False
+        )
+        self.register_buffer(
+            "rope_sin_bf16", rope_sin_bf16, persistent=False
+        )
         self.qkv = nn.Linear(hidden_size, 3 * hidden_size)
         self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
@@ -94,6 +128,15 @@ class Attention(nn.Module):
 
     def forward(self, x: Tensor, height: int, width: int, patch_start: int) -> Tensor:
         batch, tokens, _hidden = x.shape
+        if (
+            height != self.grid_size
+            or width != self.grid_size
+            or patch_start != self.prefix_tokens
+            or tokens != self.rope_cos_fp32.shape[0]
+        ):
+            raise ValueError(
+                "attention token layout does not match its precomputed RoPE table"
+            )
         qkv = (
             self.qkv(x)
             .reshape(batch, tokens, 3, self.num_heads, self.head_dim)
@@ -101,26 +144,19 @@ class Attention(nn.Module):
         )
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
-        prefix_q, prefix_k = q[:, :, :patch_start], k[:, :, :patch_start]
-        if self.spatial_rope and patch_start:
-            if self.spatial_pool_size is None:
-                raise ValueError("spatial REG RoPE requires a pool size")
-            spatial_q, spatial_k = apply_aligned_spatial_rope(
-                prefix_q,
-                prefix_k,
-                self.spatial_pool_size,
-                height,
-                width,
-            )
-            prefix_q, prefix_k = spatial_q, spatial_k
-        patch_q, patch_k = apply_2d_rope(
-            q[:, :, patch_start:], k[:, :, patch_start:], height, width
-        )
-        if patch_start:
-            q = torch.cat((prefix_q, patch_q), dim=2)
-            k = torch.cat((prefix_k, patch_k), dim=2)
+        if q.dtype == torch.bfloat16:
+            rope_cos, rope_sin = self.rope_cos_bf16, self.rope_sin_bf16
         else:
-            q, k = patch_q, patch_k
+            rope_cos, rope_sin = self.rope_cos_fp32, self.rope_sin_fp32
+            if q.dtype != torch.float32:
+                rope_cos = rope_cos.to(q.dtype)
+                rope_sin = rope_sin.to(q.dtype)
+        q, k = apply_rope_cos_sin(
+            q,
+            k,
+            rope_cos,
+            rope_sin,
+        )
         attended = F.scaled_dot_product_attention(q, k, v, is_causal=False)
         attended = attended.transpose(1, 2).reshape(batch, tokens, self.hidden_size)
         return self.projection(attended)
@@ -145,6 +181,7 @@ class SiTBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float,
         *,
+        grid_size: int,
         spatial_pool_size: int | None = None,
         spatial_rope: bool = False,
     ) -> None:
@@ -153,6 +190,7 @@ class SiTBlock(nn.Module):
         self.attention = Attention(
             hidden_size,
             num_heads,
+            grid_size=grid_size,
             spatial_pool_size=spatial_pool_size,
             spatial_rope=spatial_rope,
         )
@@ -329,6 +367,7 @@ class SiT(nn.Module):
                     config.hidden_size,
                     config.num_heads,
                     config.mlp_ratio,
+                    grid_size=self.grid_size,
                     spatial_pool_size=reg.pool_size if reg.enabled else None,
                     spatial_rope=reg.enabled and reg.spatial_rope,
                 )
@@ -472,8 +511,6 @@ class SiT(nn.Module):
         batch = noisy_image.shape[0]
         if timestep.shape != (batch,) or labels.shape != (batch,):
             raise ValueError("timestep and labels must both have shape [B]")
-        if torch.any(labels < 0) or torch.any(labels > self.config.num_classes):
-            raise ValueError("labels contain an invalid class index")
         class_conditioning = self.class_embedding(labels)
         image_conditioning = self.timestep_embedding(timestep) + class_conditioning
         sequence = self.patch_projection(noisy_image).flatten(2).transpose(1, 2)

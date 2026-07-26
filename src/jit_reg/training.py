@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -51,6 +51,183 @@ class TrainBatch(NamedTuple):
     labels: Tensor
     indices: Tensor
     cached_targets: FeatureTargets | None
+
+
+def _prepare_pixels(
+    pixels: Tensor,
+    device: torch.device,
+    *,
+    non_blocking: bool,
+) -> Tensor:
+    source_is_uint8 = pixels.dtype == torch.uint8
+    pixels = pixels.to(
+        device=device,
+        dtype=torch.float32,
+        non_blocking=non_blocking,
+    )
+    if source_is_uint8:
+        pixels.div_(255)
+    return pixels
+
+
+def prepare_train_batch(
+    batch: TrainBatch,
+    device: torch.device | str,
+    *,
+    non_blocking: bool = False,
+) -> TrainBatch:
+    """Move and convert a loader batch without changing its pixel values."""
+    device = torch.device(device)
+    cached_targets = batch.cached_targets
+    prepared_targets = (
+        FeatureTargets(
+            (
+                cached_targets.reg.to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=non_blocking,
+                )
+                if cached_targets.reg is not None
+                else None
+            ),
+            (
+                cached_targets.repa.to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=non_blocking,
+                )
+                if cached_targets.repa is not None
+                else None
+            ),
+        )
+        if cached_targets is not None
+        else None
+    )
+    return TrainBatch(
+        _prepare_pixels(batch.pixels, device, non_blocking=non_blocking),
+        batch.labels.to(device=device, non_blocking=non_blocking),
+        batch.indices,
+        prepared_targets,
+    )
+
+
+def _record_destination_stream(
+    batch: TrainBatch,
+    stream: torch.cuda.Stream,
+) -> None:
+    batch.pixels.record_stream(stream)
+    batch.labels.record_stream(stream)
+    if batch.cached_targets is not None:
+        if batch.cached_targets.reg is not None:
+            batch.cached_targets.reg.record_stream(stream)
+        if batch.cached_targets.repa is not None:
+            batch.cached_targets.repa.record_stream(stream)
+
+
+class _PreparedBatchIterator(Iterator[TrainBatch]):
+    """Synchronously prepare CPU batches while tracking loader wait time."""
+
+    def __init__(
+        self,
+        iterator: Iterator[TrainBatch],
+        device: torch.device,
+    ) -> None:
+        self.iterator = iterator
+        self.device = device
+        self.data_wait_seconds = 0.0
+
+    def __iter__(self) -> _PreparedBatchIterator:
+        return self
+
+    def __next__(self) -> TrainBatch:
+        started = time.perf_counter()
+        batch = next(self.iterator)
+        self.data_wait_seconds += time.perf_counter() - started
+        return prepare_train_batch(batch, self.device)
+
+    def take_input_timing(
+        self,
+    ) -> tuple[torch.cuda.Event, torch.cuda.Event] | None:
+        return None
+
+    def close(self) -> None:
+        return
+
+
+class _CUDABatchPrefetcher(_PreparedBatchIterator):
+    """Overlap pinned-memory batch staging with model work on a CUDA stream."""
+
+    def __init__(
+        self,
+        iterator: Iterator[TrainBatch],
+        device: torch.device,
+    ) -> None:
+        super().__init__(iterator, device)
+        self.stream = torch.cuda.Stream(device=device)
+        self._next_batch: TrainBatch | None = None
+        self._next_timing: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+        self._current_timing: (
+            tuple[torch.cuda.Event, torch.cuda.Event] | None
+        ) = None
+        self._sources: list[tuple[TrainBatch, torch.cuda.Event]] = []
+        self._preload()
+
+    def _release_completed_sources(self) -> None:
+        self._sources = [
+            (source, finished)
+            for source, finished in self._sources
+            if not finished.query()
+        ]
+
+    def _preload(self) -> None:
+        self._release_completed_sources()
+        started_waiting = time.perf_counter()
+        try:
+            source = next(self.iterator)
+        except StopIteration:
+            self.data_wait_seconds += time.perf_counter() - started_waiting
+            self._next_batch = None
+            self._next_timing = None
+            return
+        self.data_wait_seconds += time.perf_counter() - started_waiting
+        input_started = torch.cuda.Event(enable_timing=True)
+        input_finished = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(self.stream):
+            input_started.record()
+            self._next_batch = prepare_train_batch(
+                source,
+                self.device,
+                non_blocking=True,
+            )
+            input_finished.record()
+        self._sources.append((source, input_finished))
+        self._next_timing = (input_started, input_finished)
+
+    def __next__(self) -> TrainBatch:
+        if self._next_batch is None:
+            raise StopIteration
+        consuming_stream = torch.cuda.current_stream(self.device)
+        consuming_stream.wait_stream(self.stream)
+        batch = self._next_batch
+        self._current_timing = self._next_timing
+        _record_destination_stream(batch, consuming_stream)
+        self._next_batch = None
+        self._next_timing = None
+        self._preload()
+        return batch
+
+    def take_input_timing(
+        self,
+    ) -> tuple[torch.cuda.Event, torch.cuda.Event] | None:
+        timing = self._current_timing
+        self._current_timing = None
+        return timing
+
+    def close(self) -> None:
+        self.stream.synchronize()
+        self._sources.clear()
+        self._next_batch = None
+        self._next_timing = None
 
 
 class _TrainBatchCollator:
@@ -171,30 +348,38 @@ def train(
         previous_logging_seconds = 0.0
         accumulated_host_batch = 0.0
         cuda_batch_timings: list[
-            tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]
+            tuple[
+                torch.cuda.Event,
+                torch.cuda.Event,
+                torch.cuda.Event,
+                torch.cuda.Event,
+            ]
         ] = []
         iterator_started = time.perf_counter()
         loader_iterator = iter(loader)
+        batch_iterator: _PreparedBatchIterator
+        if device.type == "cuda":
+            batch_iterator = _CUDABatchPrefetcher(loader_iterator, device)
+        else:
+            batch_iterator = _PreparedBatchIterator(loader_iterator, device)
         accumulated_data_wait = time.perf_counter() - iterator_started
         for batch_index in range(len(loader)):
-            data_wait_started = time.perf_counter()
-            batch = next(loader_iterator)
+            previous_data_wait = batch_iterator.data_wait_seconds
+            batch = next(batch_iterator)
             batch_ready = time.perf_counter()
-            accumulated_data_wait += batch_ready - data_wait_started
+            accumulated_data_wait += (
+                batch_iterator.data_wait_seconds - previous_data_wait
+            )
             host_batch_started = batch_ready
-            cuda_input_started = None
+            cuda_input_timing = batch_iterator.take_input_timing()
             cuda_model_started = None
             cuda_backward_finished = None
             if device.type == "cuda":
-                cuda_input_started = torch.cuda.Event(enable_timing=True)
                 cuda_model_started = torch.cuda.Event(enable_timing=True)
                 cuda_backward_finished = torch.cuda.Event(enable_timing=True)
-                cuda_input_started.record()
             pixels = batch.pixels
             labels = batch.labels
             cached_targets = batch.cached_targets
-            pixels = pixels.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
             pixels = random_horizontal_flip(
                 pixels,
                 streams.augmentations,
@@ -232,26 +417,7 @@ def train(
                     raise RuntimeError(
                         "cached feature training requires targets from the train loader"
                     )
-                targets = FeatureTargets(
-                    (
-                        cached_targets.reg.to(
-                            device=device,
-                            dtype=torch.float32,
-                            non_blocking=True,
-                        )
-                        if cached_targets.reg is not None
-                        else None
-                    ),
-                    (
-                        cached_targets.repa.to(
-                            device=device,
-                            dtype=torch.float32,
-                            non_blocking=True,
-                        )
-                        if cached_targets.repa is not None
-                        else None
-                    ),
-                )
+                targets = cached_targets
             elif feature_encoder is not None:
                 if cached_targets is not None:
                     raise RuntimeError(
@@ -330,10 +496,14 @@ def train(
                 (losses.total / accumulation).backward()
             if cuda_backward_finished is not None:
                 cuda_backward_finished.record()
-                assert cuda_input_started is not None and cuda_model_started is not None
+                assert (
+                    cuda_input_timing is not None
+                    and cuda_model_started is not None
+                )
                 cuda_batch_timings.append(
                     (
-                        cuda_input_started,
+                        cuda_input_timing[0],
+                        cuda_input_timing[1],
                         cuda_model_started,
                         cuda_backward_finished,
                     )
@@ -372,12 +542,14 @@ def train(
             if cuda_optimizer_finished is not None:
                 cuda_optimizer_finished.synchronize()
                 gpu_input_seconds = sum(
-                    started.elapsed_time(model_started)
-                    for started, model_started, _finished in cuda_batch_timings
+                    started.elapsed_time(finished)
+                    for started, finished, _model_started, _backward_finished
+                    in cuda_batch_timings
                 ) / 1_000
                 gpu_forward_backward_seconds = sum(
-                    model_started.elapsed_time(finished)
-                    for _started, model_started, finished in cuda_batch_timings
+                    model_started.elapsed_time(backward_finished)
+                    for _input_started, _input_finished, model_started, backward_finished
+                    in cuda_batch_timings
                 ) / 1_000
                 assert cuda_optimizer_started is not None
                 gpu_optimizer_seconds = (
@@ -404,7 +576,11 @@ def train(
                 ),
                 "train/lr": lr,
                 "train/lr_adamw": lr,
-                "train/lr_muon": lr if config.train.optimizer.kind == "muon" else 0.0,
+                "train/lr_muon": (
+                    lr
+                    if config.train.optimizer.kind in {"muon", "fused_muon"}
+                    else 0.0
+                ),
                 "train/gradient_norm": float(grad_norm),
                 "train/ema_decay": ema.decay,
                 "throughput/images_per_second": images / elapsed,
@@ -442,6 +618,7 @@ def train(
             cuda_batch_timings.clear()
             if config.train.max_steps is not None and state.global_step >= config.train.max_steps:
                 break
+        batch_iterator.close()
 
         state.epoch = epoch_index + 1
         final_epoch = state.epoch == config.train.epochs or (

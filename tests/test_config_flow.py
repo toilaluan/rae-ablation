@@ -17,6 +17,12 @@ def test_required_presets_load() -> None:
     paper = load_config(ROOT / "configs/reg-repa-p16.yaml")
     early = load_config(ROOT / "configs/early-reg-p16.yaml")
     assert baseline.schema_version == paper.schema_version == early.schema_version == 3
+    assert (
+        baseline.train.optimizer.kind
+        == paper.train.optimizer.kind
+        == early.train.optimizer.kind
+        == "muon"
+    )
     assert baseline.model.patch_size == paper.model.patch_size == early.model.patch_size == 16
     assert not baseline.model.features.enabled
     assert paper.model.features.reg.num_tokens == 16
@@ -29,6 +35,20 @@ def test_required_presets_load() -> None:
     assert early.model.features.reg.early_prediction.reinjection_mode == "add"
     assert early.model.features.reg.timestep.train_ratio_min == 1.0
     assert early.model.features.reg.timestep.sample_ratio == 1.0
+
+
+@pytest.mark.parametrize("kind", ["adamw", "muon", "fused_muon"])
+def test_all_optimizer_kinds_validate(kind: str) -> None:
+    config = ExperimentConfig()
+    config.train.optimizer.kind = kind
+    config.validate()
+
+
+def test_unknown_optimizer_kind_is_rejected() -> None:
+    config = ExperimentConfig()
+    config.train.optimizer.kind = "automatic"
+    with pytest.raises(ValueError, match="adamw, muon, or fused_muon"):
+        config.validate()
 
 
 @pytest.mark.parametrize(

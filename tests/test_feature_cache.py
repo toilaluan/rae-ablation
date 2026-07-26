@@ -241,7 +241,7 @@ def test_train_loader_prefetches_index_aligned_cached_targets(
     config.train.micro_batch_size = 2
     write_active_caches(config, 4)
     dataset = TensorDataset(
-        torch.rand(4, 3, 16, 16),
+        torch.randint(0, 256, (4, 3, 16, 16), dtype=torch.uint8),
         torch.arange(4),
         torch.arange(4),
     )
@@ -252,6 +252,7 @@ def test_train_loader_prefetches_index_aligned_cached_targets(
     assert len(batches) == 2
     for batch in batches:
         assert isinstance(batch, TrainBatch)
+        assert batch.pixels.dtype == torch.uint8
         assert batch.cached_targets is not None
         expected = batch.indices.to(torch.float32)
         if reg_enabled:
