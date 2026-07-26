@@ -13,6 +13,7 @@ from jit_reg.evaluation import evaluate_npz, save_evaluation
 from jit_reg.model.compile import compile_model_regions
 from jit_reg.model.sit import SiT
 from jit_reg.sample_runtime import (
+    FEATURE_SCHEMA_VERSION,
     SamplingParameters,
     checkpoint_sha256,
     sample_to_archive,
@@ -149,7 +150,7 @@ def main() -> None:
         patch_size=config.model.patch_size,
         model_variant=config.model.model_variant,
         feature_schema={
-            "schema_version": 2,
+            "schema_version": FEATURE_SCHEMA_VERSION,
             **asdict(config.model.features),
         },
         checkpoint_hash=digest,

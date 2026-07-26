@@ -13,7 +13,8 @@ from torch import Tensor, nn
 
 from .model.compile import clean_state_dict
 
-TRAINING_STATE_SCHEMA_VERSION = 3
+CHECKPOINT_SCHEMA_VERSION = 3
+TRAINING_STATE_SCHEMA_VERSION = 4
 
 
 def _contiguous(state: dict[str, object]) -> dict[str, Tensor]:
@@ -128,7 +129,7 @@ class CheckpointManager:
         (temporary / "metadata.json").write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": CHECKPOINT_SCHEMA_VERSION,
                     "completed_epoch": completed_epoch,
                     "global_step": global_step,
                     "data_fingerprint": data_fingerprint,
@@ -198,25 +199,21 @@ class CheckpointManager:
         metadata_path = path / "metadata.json"
         if not metadata_path.is_file():
             raise ValueError(
-                "checkpoint predates schema v2; old checkpoints are not supported"
+                "checkpoint predates schema v3; old checkpoints are not supported"
             )
         metadata = json.loads(metadata_path.read_text())
-        if metadata.get("schema_version") != 2:
+        if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
             raise ValueError(
-                "checkpoint schema is incompatible; schema-v1 checkpoints cannot be migrated"
+                "checkpoint schema is incompatible; old checkpoints cannot be migrated"
             )
         from .config import load_checkpoint_config
 
         state = torch.load(path / "training.pt", map_location="cpu", weights_only=False)
         state_schema = state.get("schema_version")
-        if state_schema == 2:
-            raise ValueError(
-                "checkpoint training-state schema v2 is sampling-only after "
-                "optimizer routing change; exact training resume requires schema v3"
-            )
         if state_schema != TRAINING_STATE_SCHEMA_VERSION:
             raise ValueError(
-                "checkpoint training state is incompatible with schema v3"
+                f"checkpoint training state is incompatible with schema "
+                f"v{TRAINING_STATE_SCHEMA_VERSION}"
             )
         load_checkpoint_config(path / "config.json")
         model.load_state_dict(load_file(str(path / "model.safetensors")))

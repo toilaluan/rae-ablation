@@ -5,20 +5,20 @@ jointly denoises DINOv3 representation tokens; REPA aligns an intermediate SiT
 sequence with frozen DINOv3 targets. Either feature can be enabled independently,
 and disabling both leaves the baseline model and objective unchanged.
 
-This repository uses configuration schema v2. Schema-v1 configs, checkpoints,
+This repository uses configuration schema v3. Older configs, checkpoints, REG
 feature caches, and sampling manifests are intentionally incompatible and must be
-rebuilt.
+rebuilt. Independent REPA caches remain reusable.
 
 ## Presets
 
 - `configs/baseline-p16.yaml`: feature-free SiT-B/16 baseline.
-- `configs/reg-repa-p16.yaml`: paper-style one-CLS REG plus block-4,
+- `configs/reg-repa-p16.yaml`: pooled 4×4 spatial REG plus block-4,
   full-sequence REPA; equal image and REG time.
 - `configs/early-reg-p16.yaml`: pooled 4×4 spatial REG with aligned 2D RoPE, a
-  block-4 2048-wide depth-2 head, additive FC–GELU–FC reinjection, and a
-  log-uniform training REG-time ratio from 0.5 to 1.0 (0.5 at sampling time).
+  block-4 2048-wide depth-2 head, additive FC–GELU–FC reinjection, and equal
+  image and REG time.
 
-The v2 feature configuration lives under `model.features`:
+The v3 feature configuration lives under `model.features`:
 
 ```yaml
 model:
@@ -29,8 +29,8 @@ model:
       register_tokens: 4
     reg:
       enabled: true
-      token_mode: cls       # cls | spatial | cls_spatial
       pool_size: 4
+      target_std: 0.53
       spatial_rope: true
       loss_weight: 0.03
       head:
@@ -117,10 +117,12 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
 
 ## Independent feature caches
 
-The component builder creates only missing active components. REG and REPA live
+The component builder creates only missing active components. Canonical cached REG
+tokens have per-token mean zero and standard deviation one; `target_std` is applied
+only after online extraction or cache lookup during training. REG and REPA live
 under separate fingerprints, so changing a head, loss, optimizer, REPA block, REG
-timing, sampling, evaluation, or the other feature does not invalidate a reusable
-component.
+target scale or timing, sampling, evaluation, or the other feature does not
+invalidate a reusable component.
 
 Cached training disables random flips:
 
@@ -145,6 +147,13 @@ Cache manifests record environment versions diagnostically, but only pinned
 dataset/preprocessing, encoder identity, component feature schema, and the
 component’s target layout participate in its fingerprint.
 
+Cache construction uses two pinned host buffers, a dedicated CUDA copy stream, and
+one bounded disk-writer thread per rank. It drains queued writes before
+finalization and logs data wait, GPU extraction, buffer backpressure, copy,
+write/flush, and total throughput. A capacity preflight runs before allocation.
+Full ImageNet needs approximately 29.3 GiB for 4×4 REG, 469.2 GiB for 16×16 REPA,
+or 498.5 GiB for both.
+
 ## Sampling and evaluation
 
 Standalone sampling inherits `sampling.*` from the checkpoint. Explicit sampling
@@ -163,6 +172,6 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
 
 `--evaluate` computes FID on rank zero using the checkpoint’s `evaluation.*`
 settings and writes `evaluation.json` beside `samples.npz`. Output names and
-manifests record the relative REG schedule and complete schema-v2 feature
+manifests record the relative REG schedule and complete schema-v3 feature
 description. Sampling is rank-partitioned and resumable only from a compatible
-schema-v2 manifest.
+schema-v3 manifest.

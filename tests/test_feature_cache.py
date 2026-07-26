@@ -12,13 +12,17 @@ from torch.utils.data import TensorDataset
 from jit_reg.config import ExperimentConfig
 from jit_reg.feature_cache import (
     CACHE_SCHEMA_VERSION,
+    AsyncFeatureCacheWriter,
     FeatureCache,
     FeatureComponentCache,
     FeatureComponentCacheWriter,
     component_fingerprint,
     component_path,
     component_spec,
+    preflight_cache_capacity,
+    required_cache_bytes,
 )
+from jit_reg.reg import FeatureTargets
 from jit_reg.rng import RNGStreams
 from jit_reg.training import TrainBatch, make_train_loader
 
@@ -72,6 +76,7 @@ def test_component_fingerprints_are_minimal_and_independent(tmp_path: Path) -> N
     irrelevant = copy.deepcopy(config)
     irrelevant.model.features.reg.head.kind = "wide_mlp"
     irrelevant.model.features.reg.loss_weight = 99
+    irrelevant.model.features.reg.target_std = 99
     irrelevant.model.features.reg.timestep.sample_ratio = 0.25
     irrelevant.model.features.repa.block = 2
     irrelevant.model.features.repa.loss_weight = 99
@@ -81,18 +86,11 @@ def test_component_fingerprints_are_minimal_and_independent(tmp_path: Path) -> N
     irrelevant.evaluation.batch_size = 1
     assert fingerprints(irrelevant) == original
 
-    token_change = copy.deepcopy(config)
-    token_change.model.features.reg.token_mode = "cls_spatial"
-    changed = fingerprints(token_change)
+    changed_pool = copy.deepcopy(config)
+    changed_pool.model.features.reg.pool_size = 2
+    changed = fingerprints(changed_pool)
     assert changed[0] != original[0]
     assert changed[1] == original[1]
-
-    spatial = copy.deepcopy(config)
-    spatial.model.features.reg.token_mode = "spatial"
-    spatial_fingerprint = fingerprints(spatial)
-    changed_pool = copy.deepcopy(spatial)
-    changed_pool.model.features.reg.pool_size = 2
-    assert fingerprints(changed_pool)[0] != spatial_fingerprint[0]
 
     grid_change = copy.deepcopy(config)
     grid_change.model.patch_size = 4
@@ -151,9 +149,71 @@ def test_combined_cache_reuses_independent_components(tmp_path: Path) -> None:
         writer.finalize()
     cache = FeatureCache(config, 3)
     targets = cache.lookup(torch.tensor([2, 0]))
-    assert targets.reg is not None and targets.reg.shape == (2, 1, 8)
+    assert targets.reg is not None and targets.reg.shape == (2, 16, 8)
     assert targets.repa is not None and targets.repa.shape == (2, 4, 8)
     assert set(cache.fingerprints) == {"reg", "repa"}
+
+
+@pytest.mark.parametrize(
+    "components", [("reg",), ("repa",), ("reg", "repa")]
+)
+def test_cache_pipeline_cpu_fallback_writes_partial_batches_in_order(
+    tmp_path: Path, components: tuple[str, ...]
+) -> None:
+    config = cache_config(tmp_path)
+    writers = {}
+    for component in components:
+        spec = component_spec(config, 3, component)  # type: ignore[arg-type]
+        path = component_path(config, 3, component)  # type: ignore[arg-type]
+        FeatureComponentCacheWriter.initialize(path, spec)
+        writers[component] = FeatureComponentCacheWriter(path, spec)
+    pipeline = AsyncFeatureCacheWriter(writers, batch_size=2, device="cpu")  # type: ignore[arg-type]
+    assert not pipeline.asynchronous
+    for indices in (torch.tensor([2, 0]), torch.tensor([1])):
+        count = indices.numel()
+        reg = (
+            indices.float()
+            .reshape(count, 1, 1)
+            .expand(count, writers["reg"].shape[1], writers["reg"].shape[2])
+            if "reg" in writers
+            else None
+        )
+        repa = (
+            (indices.float() + 10)
+            .reshape(count, 1, 1)
+            .expand(count, writers["repa"].shape[1], writers["repa"].shape[2])
+            if "repa" in writers
+            else None
+        )
+        pipeline.submit(indices, FeatureTargets(reg, repa))
+    pipeline.close()
+    metrics = pipeline.metrics()
+    assert metrics.examples == 3 and metrics.batches == 2
+    assert metrics.buffer_backpressure_seconds == 0
+    for component, writer in writers.items():
+        writer.finalize()
+        cache = FeatureComponentCache(config, 3, component)  # type: ignore[arg-type]
+        expected = torch.arange(3) + (10 if component == "repa" else 0)
+        assert torch.equal(
+            cache.lookup(torch.arange(3))[:, 0, 0].float(), expected.float()
+        )
+
+
+def test_cache_capacity_preflight_counts_unallocated_bytes(tmp_path: Path) -> None:
+    config = cache_config(tmp_path)
+    specs = {
+        component: component_spec(config, 3, component)
+        for component in ("reg", "repa")
+    }
+    paths = {
+        component: component_path(config, 3, component)
+        for component in ("reg", "repa")
+    }
+    expected = sum(required_cache_bytes(spec) for spec in specs.values())
+    assert preflight_cache_capacity(tmp_path, specs, paths) == expected
+    FeatureComponentCacheWriter.initialize(paths["reg"], specs["reg"])
+    remaining = preflight_cache_capacity(tmp_path, specs, paths)
+    assert required_cache_bytes(specs["repa"]) <= remaining < expected
 
 
 @pytest.mark.parametrize(

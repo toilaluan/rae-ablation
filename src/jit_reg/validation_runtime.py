@@ -13,7 +13,12 @@ from .evaluation import evaluate_npz, save_evaluation
 from .model.compile import compile_model_regions
 from .model.sit import SiT
 from .rng import preserving_global_rng
-from .sample_runtime import SamplingParameters, sample_to_archive, state_dict_sha256
+from .sample_runtime import (
+    FEATURE_SCHEMA_VERSION,
+    SamplingParameters,
+    sample_to_archive,
+    state_dict_sha256,
+)
 from .sampling import ODESample, ode_sample
 from .validation import ValidationPlan, noise_for_samples
 
@@ -108,7 +113,7 @@ def validate_ema(
         patch_size=config.model.patch_size,
         model_variant=config.model.model_variant,
         feature_schema={
-            "schema_version": 2,
+            "schema_version": FEATURE_SCHEMA_VERSION,
             **asdict(config.model.features),
         },
         checkpoint_hash=digest,

@@ -19,47 +19,51 @@ from jit_reg.reg import (
     negative_cosine_repa_loss,
     prepare_feature_targets,
     repa_target_for_scope,
+    scale_reg_targets,
 )
 from jit_reg.sampling import ODESample, ode_sample
 
 
 def test_optional_component_target_extraction() -> None:
-    cls = torch.arange(16, dtype=torch.float32).reshape(2, 8)
     spatial = torch.randn(2, 16, 8)
     baseline = prepare_feature_targets(
-        cls, spatial, 2, include_reg=False, include_repa=False
+        spatial, 2, include_reg=False, include_repa=False
     )
     assert baseline == FeatureTargets(None, None)
 
     reg = prepare_feature_targets(
-        cls,
         spatial,
         2,
         include_reg=True,
-        token_mode="cls_spatial",
         pool_size=2,
         include_repa=False,
     )
-    assert reg.reg is not None and reg.reg.shape == (2, 5, 8)
+    assert reg.reg is not None and reg.reg.shape == (2, 4, 8)
     assert reg.repa is None
-    spatial_only = prepare_feature_targets(
-        cls,
-        spatial,
-        2,
-        include_reg=True,
-        token_mode="spatial",
-        pool_size=2,
-        include_repa=False,
+    assert torch.allclose(reg.reg.mean(dim=-1), torch.zeros(2, 4), atol=1e-6)
+    assert torch.allclose(
+        reg.reg.std(dim=-1, unbiased=False), torch.ones(2, 4), atol=2e-4
     )
-    assert spatial_only.reg is not None
-    assert torch.equal(spatial_only.reg, reg.reg[:, 1:])
 
     repa = prepare_feature_targets(
-        cls, spatial, 2, include_reg=False, include_repa=True
+        spatial, 2, include_reg=False, include_repa=True
     )
     assert repa.reg is None
     assert repa.repa is not None and repa.repa.shape == (2, 4, 8)
     assert torch.allclose(repa.repa.norm(dim=-1), torch.ones(2, 4))
+
+
+def test_training_reg_scale_preserves_repa_and_reaches_requested_std() -> None:
+    canonical = FeatureTargets(
+        F.layer_norm(torch.randn(2, 4, 8), (8,)),
+        F.normalize(torch.randn(2, 4, 8), dim=-1),
+    )
+    scaled = scale_reg_targets(canonical, 0.53)
+    assert scaled.reg is not None
+    assert scaled.reg.std(dim=-1, unbiased=False).mean() == pytest.approx(
+        0.53, abs=2e-4
+    )
+    assert scaled.repa is canonical.repa
 
 
 def test_repa_target_scopes() -> None:
@@ -119,13 +123,7 @@ def test_reg_velocity_loss_uses_reg_timestep() -> None:
     assert losses.reg_velocity == pytest.approx((1 / 0.75) ** 2)
 
 
-@pytest.mark.parametrize(
-    ("num_cls", "expected_cls_mse", "expected_spatial_mse"),
-    [(0, 0.0, 2.0), (1, 1.0, 2.5), (3, 2.0, 0.0)],
-)
-def test_reg_metrics_split_by_configured_token_layout(
-    num_cls: int, expected_cls_mse: float, expected_spatial_mse: float
-) -> None:
+def test_reg_metrics_are_generic() -> None:
     clean_reg = torch.tensor([[[1.0], [2.0], [1.0]]])
     prediction = torch.zeros_like(clean_reg)
     losses = jit_losses(
@@ -137,15 +135,11 @@ def test_reg_metrics_split_by_configured_token_layout(
         reg_noise=torch.zeros_like(clean_reg),
         reg_prediction=prediction,
         reg_timestep=torch.tensor([0.5]),
-        reg_num_cls_tokens=num_cls,
     )
     assert losses.reg_x0_mse == pytest.approx(2.0)
-    assert losses.reg_cls_x0_mse == pytest.approx(expected_cls_mse)
-    assert losses.reg_spatial_x0_mse == pytest.approx(expected_spatial_mse)
-    assert losses.reg_cls_velocity == pytest.approx(expected_cls_mse * 4)
-    assert losses.reg_spatial_velocity == pytest.approx(expected_spatial_mse * 4)
-    assert losses.reg_cls_x0_cosine == 0
-    assert losses.reg_spatial_x0_cosine == 0
+    assert losses.reg_velocity == pytest.approx(8.0)
+    assert losses.reg_x0_cosine == 0
+    assert not any("cls" in field or "spatial" in field for field in losses._fields)
 
 
 class RecordingCleanModel(nn.Module):

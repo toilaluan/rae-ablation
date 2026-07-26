@@ -59,6 +59,8 @@ class SamplingParameters:
 
 
 GenerateBatch = Callable[[Tensor, Tensor, Tensor], Tensor]
+SAMPLING_MANIFEST_SCHEMA_VERSION = 11
+FEATURE_SCHEMA_VERSION = 3
 
 
 def _float_slug(value: float) -> str:
@@ -167,7 +169,7 @@ def _manifest_base(
     counts = torch.bincount(labels, minlength=num_classes)
     ids_digest = hashlib.sha256(sample_ids.numpy().tobytes()).hexdigest()
     return {
-        "schema_version": 10,
+        "schema_version": SAMPLING_MANIFEST_SCHEMA_VERSION,
         "checkpoint_sha256": checkpoint_hash,
         "validation_plan_hash": plan.plan_hash,
         "sample_ids_sha256": ids_digest,
@@ -211,7 +213,7 @@ def _initialize_or_resume(
     output_dir.mkdir(parents=True, exist_ok=True)
     if paths["manifest"].exists():
         existing = json.loads(paths["manifest"].read_text())
-        if existing.get("schema_version") != 10:
+        if existing.get("schema_version") != SAMPLING_MANIFEST_SCHEMA_VERSION:
             raise ValueError(
                 "sampling manifest uses an incompatible schema; old manifests "
                 "cannot be resumed"
@@ -355,8 +357,10 @@ def sample_to_archive(
         raise ValueError("image size must be positive and divisible by patch size")
     if not model_variant:
         raise ValueError("model variant cannot be empty")
-    if feature_schema.get("schema_version") != 2:
-        raise ValueError("sampling requires a schema-v2 feature description")
+    if feature_schema.get("schema_version") != FEATURE_SCHEMA_VERSION:
+        raise ValueError(
+            f"sampling requires a schema-v{FEATURE_SCHEMA_VERSION} feature description"
+        )
     labels, sample_ids, noise_seeds = validate_sampling_plan(plan, sample_count, num_classes)
     output_dir = Path(output_dir)
     paths = _paths(output_dir)

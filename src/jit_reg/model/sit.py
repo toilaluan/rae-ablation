@@ -78,7 +78,6 @@ class Attention(nn.Module):
         hidden_size: int,
         num_heads: int,
         *,
-        num_cls_tokens: int = 0,
         spatial_pool_size: int | None = None,
         spatial_rope: bool = False,
     ) -> None:
@@ -86,7 +85,6 @@ class Attention(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.num_cls_tokens = num_cls_tokens
         self.spatial_pool_size = spatial_pool_size
         self.spatial_rope = spatial_rope
         self.qkv = nn.Linear(hidden_size, 3 * hidden_size)
@@ -104,19 +102,17 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
         prefix_q, prefix_k = q[:, :, :patch_start], k[:, :, :patch_start]
-        spatial_start = self.num_cls_tokens
-        if self.spatial_rope and patch_start > spatial_start:
+        if self.spatial_rope and patch_start:
             if self.spatial_pool_size is None:
                 raise ValueError("spatial REG RoPE requires a pool size")
             spatial_q, spatial_k = apply_aligned_spatial_rope(
-                prefix_q[:, :, spatial_start:],
-                prefix_k[:, :, spatial_start:],
+                prefix_q,
+                prefix_k,
                 self.spatial_pool_size,
                 height,
                 width,
             )
-            prefix_q = torch.cat((prefix_q[:, :, :spatial_start], spatial_q), dim=2)
-            prefix_k = torch.cat((prefix_k[:, :, :spatial_start], spatial_k), dim=2)
+            prefix_q, prefix_k = spatial_q, spatial_k
         patch_q, patch_k = apply_2d_rope(
             q[:, :, patch_start:], k[:, :, patch_start:], height, width
         )
@@ -149,7 +145,6 @@ class SiTBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float,
         *,
-        num_cls_tokens: int = 0,
         spatial_pool_size: int | None = None,
         spatial_rope: bool = False,
     ) -> None:
@@ -158,7 +153,6 @@ class SiTBlock(nn.Module):
         self.attention = Attention(
             hidden_size,
             num_heads,
-            num_cls_tokens=num_cls_tokens,
             spatial_pool_size=spatial_pool_size,
             spatial_rope=spatial_rope,
         )
@@ -301,8 +295,6 @@ class SiT(nn.Module):
         features = config.features
         reg = features.reg
         repa = features.repa
-        if reg.enabled and reg.token_mode not in {"cls", "spatial", "cls_spatial"}:
-            raise ValueError("unknown REG token mode")
         if reg.enabled and not 1 <= reg.pool_size <= 16:
             raise ValueError("REG pool size must be within the native 16x16 feature grid")
         if reg.enabled and reg.head.kind not in {"standard", "wide_mlp"}:
@@ -337,17 +329,8 @@ class SiT(nn.Module):
                     config.hidden_size,
                     config.num_heads,
                     config.mlp_ratio,
-                    num_cls_tokens=reg.num_cls_tokens if reg.enabled else 0,
-                    spatial_pool_size=(
-                        reg.pool_size
-                        if reg.enabled and reg.num_spatial_tokens
-                        else None
-                    ),
-                    spatial_rope=(
-                        reg.enabled
-                        and bool(reg.num_spatial_tokens)
-                        and reg.spatial_rope
-                    ),
+                    spatial_pool_size=reg.pool_size if reg.enabled else None,
+                    spatial_rope=reg.enabled and reg.spatial_rope,
                 )
                 for _ in range(config.depth)
             ]
@@ -357,12 +340,9 @@ class SiT(nn.Module):
         feature_dim = features.encoder.feature_dim
         if reg.enabled:
             self.reg_input: nn.Linear | None = nn.Linear(feature_dim, config.hidden_size)
-            if reg.num_spatial_tokens:
-                self.reg_position_embedding = nn.Parameter(
-                    torch.empty(1, reg.num_spatial_tokens, config.hidden_size)
-                )
-            else:
-                self.register_parameter("reg_position_embedding", None)
+            self.reg_position_embedding = nn.Parameter(
+                torch.empty(1, reg.num_tokens, config.hidden_size)
+            )
             if reg.head.kind == "standard":
                 self.reg_head: nn.Module | None = FinalLayer(
                     config.hidden_size, feature_dim
@@ -467,14 +447,7 @@ class SiT(nn.Module):
     def _add_reg_positions(self, tokens: Tensor) -> Tensor:
         if self.reg_position_embedding is None:
             return tokens
-        spatial_start = self.config.features.reg.num_cls_tokens
-        return torch.cat(
-            (
-                tokens[:, :spatial_start],
-                tokens[:, spatial_start:] + self.reg_position_embedding,
-            ),
-            dim=1,
-        )
+        return tokens + self.reg_position_embedding
 
     def forward(
         self,

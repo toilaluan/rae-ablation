@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
 
 
 def _positive(name: str, *values: int | float) -> None:
@@ -47,8 +47,8 @@ class REGTimestepConfig:
 @dataclass
 class REGConfig:
     enabled: bool = False
-    token_mode: str = "cls"
     pool_size: int = 4
+    target_std: float = 0.53
     spatial_rope: bool = True
     loss_weight: float = 0.03
     head: REGHeadConfig = field(default_factory=REGHeadConfig)
@@ -58,24 +58,8 @@ class REGConfig:
     )
 
     @property
-    def num_cls_tokens(self) -> int:
-        if self.token_mode in {"cls", "cls_spatial"}:
-            return 1
-        if self.token_mode == "spatial":
-            return 0
-        raise ValueError(f"unknown REG token mode: {self.token_mode}")
-
-    @property
-    def num_spatial_tokens(self) -> int:
-        if self.token_mode == "cls":
-            return 0
-        if self.token_mode in {"spatial", "cls_spatial"}:
-            return self.pool_size**2
-        raise ValueError(f"unknown REG token mode: {self.token_mode}")
-
-    @property
     def num_tokens(self) -> int:
-        return self.num_cls_tokens + self.num_spatial_tokens
+        return self.pool_size**2
 
 
 @dataclass
@@ -282,13 +266,13 @@ class ExperimentConfig:
                 raise ValueError("model.features.encoder.model_name cannot be empty")
         if features.reg.enabled:
             reg = features.reg
-            if reg.token_mode not in {"cls", "spatial", "cls_spatial"}:
-                raise ValueError(
-                    "model.features.reg.token_mode must be cls, spatial, or cls_spatial"
-                )
             if reg.pool_size < 1 or reg.pool_size > 16:
                 raise ValueError(
                     "model.features.reg.pool_size must be within the native 16x16 grid"
+                )
+            if not math.isfinite(reg.target_std) or reg.target_std <= 0:
+                raise ValueError(
+                    "model.features.reg.target_std must be finite and positive"
                 )
             if reg.loss_weight < 0:
                 raise ValueError("model.features.reg.loss_weight cannot be negative")
@@ -430,7 +414,7 @@ class ExperimentConfig:
         return asdict(self)
 
 
-def _require_v2(values: Any, source: str | Path) -> dict[str, Any]:
+def _require_current_schema(values: Any, source: str | Path) -> dict[str, Any]:
     if not isinstance(values, dict):
         raise ValueError(f"{source} must contain a configuration object")
     version = values.get("schema_version")
@@ -451,7 +435,9 @@ def _structured_config(values: dict[str, Any]) -> ExperimentConfig:
         OmegaConf.set_struct(cfg, True)
         result = OmegaConf.to_object(cfg)
     except Exception as error:
-        raise ValueError(f"invalid schema-v2 configuration: {error}") from error
+        raise ValueError(
+            f"invalid schema-v{CONFIG_SCHEMA_VERSION} configuration: {error}"
+        ) from error
     if not isinstance(result, ExperimentConfig):
         raise TypeError("configuration did not resolve to ExperimentConfig")
     result.validate()
@@ -461,13 +447,13 @@ def _structured_config(values: dict[str, Any]) -> ExperimentConfig:
 def load_config(
     path: str | Path | None = None, overrides: list[str] | None = None
 ) -> ExperimentConfig:
-    """Load schema-v2 structured YAML and reject old or unknown fields."""
+    """Load the current structured YAML schema and reject old or unknown fields."""
     from omegaconf import OmegaConf
 
     values: dict[str, Any] = {"schema_version": CONFIG_SCHEMA_VERSION}
     if path is not None:
         loaded = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
-        values = _require_v2(loaded, path)
+        values = _require_current_schema(loaded, path)
     if overrides:
         override_values = OmegaConf.to_container(
             OmegaConf.from_dotlist(overrides), resolve=True
@@ -482,14 +468,8 @@ def load_config(
 
 
 def load_checkpoint_config(path: str | Path) -> ExperimentConfig:
-    """Load a resolved v2 checkpoint config with sampling-compatible old defaults."""
-    values = deepcopy(_require_v2(json.loads(Path(path).read_text()), path))
-    model = values.setdefault("model", {})
-    features = model.setdefault("features", {})
-    reg = features.setdefault("reg", {})
-    # These fields did not exist in early schema-v2 checkpoints. Enabling spatial
-    # RoPE or changing reinjection would alter their sampling behavior.
-    reg.setdefault("spatial_rope", False)
-    early = reg.setdefault("early_prediction", {})
-    early.setdefault("reinjection_mode", "replace")
+    """Load a resolved current-schema checkpoint config."""
+    values = deepcopy(
+        _require_current_schema(json.loads(Path(path).read_text()), path)
+    )
     return _structured_config(values)

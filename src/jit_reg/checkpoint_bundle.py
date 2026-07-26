@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from .checkpoint import CHECKPOINT_SCHEMA_VERSION
 from .config import ExperimentConfig, load_checkpoint_config
 from .validation import ValidationPlan, create_validation_plan
 
@@ -33,12 +34,12 @@ def _expected_plan_hash(directory: Path) -> str:
     metadata_path = directory / "metadata.json"
     if not metadata_path.is_file():
         raise ValueError(
-            "checkpoint predates schema v2; old checkpoints are not supported"
+            "checkpoint predates schema v3; old checkpoints are not supported"
         )
     metadata = json.loads(metadata_path.read_text())
-    if metadata.get("schema_version") != 2:
+    if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
         raise ValueError(
-            "checkpoint schema is incompatible; schema-v1 checkpoints cannot be migrated"
+            "checkpoint schema is incompatible; old checkpoints cannot be migrated"
         )
     value = metadata.get("validation_plan_hash")
     if not isinstance(value, str) or not value:

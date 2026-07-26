@@ -24,13 +24,12 @@ def test_spatial_rope_uses_image_aligned_cell_centers() -> None:
     assert torch.allclose(actual[1], expected[1])
 
 
-def test_attention_rotates_spatial_and_image_tokens_but_not_cls(
+def test_attention_rotates_entire_spatial_reg_prefix_and_image_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     attention = Attention(
         8,
         1,
-        num_cls_tokens=1,
         spatial_pool_size=2,
         spatial_rope=True,
     )
@@ -57,15 +56,16 @@ def test_attention_rotates_spatial_and_image_tokens_but_not_cls(
         return v
 
     monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", capture)
-    tokens = torch.randn(1, 9, 8)
-    attention(tokens, height=2, width=2, patch_start=5)
-    raw = attention.q_norm(tokens.reshape(1, 1, 9, 8))
-    expected_spatial, _ = apply_aligned_spatial_rope(raw[:, :, 1:5], raw[:, :, 1:5], 2, 2, 2)
-    expected_patches, _ = apply_2d_rope(raw[:, :, 5:], raw[:, :, 5:], 2, 2)
+    tokens = torch.randn(1, 8, 8)
+    attention(tokens, height=2, width=2, patch_start=4)
+    raw = attention.q_norm(tokens.reshape(1, 1, 8, 8))
+    expected_spatial, _ = apply_aligned_spatial_rope(
+        raw[:, :, :4], raw[:, :, :4], 2, 2, 2
+    )
+    expected_patches, _ = apply_2d_rope(raw[:, :, 4:], raw[:, :, 4:], 2, 2)
     rotated = captured[0][0]
-    assert torch.equal(rotated[:, :, :1], raw[:, :, :1])
-    assert torch.allclose(rotated[:, :, 1:5], expected_spatial)
-    assert torch.allclose(rotated[:, :, 5:], expected_patches)
+    assert torch.allclose(rotated[:, :, :4], expected_spatial)
+    assert torch.allclose(rotated[:, :, 4:], expected_patches)
 
 
 @pytest.mark.parametrize(

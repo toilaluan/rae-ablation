@@ -17,12 +17,6 @@ class JiTLoss(NamedTuple):
     repa: Tensor
     reg_x0_mse: Tensor
     reg_x0_cosine: Tensor
-    reg_cls_velocity: Tensor
-    reg_spatial_velocity: Tensor
-    reg_cls_x0_mse: Tensor
-    reg_spatial_x0_mse: Tensor
-    reg_cls_x0_cosine: Tensor
-    reg_spatial_x0_cosine: Tensor
 
 
 def sample_timesteps(
@@ -104,30 +98,6 @@ def clean_prediction_velocity_loss(
     return F.mse_loss(predicted_velocity, target_velocity)
 
 
-def _reg_partition_metrics(
-    clean: Tensor,
-    noise: Tensor,
-    timestep: Tensor,
-    prediction: Tensor,
-    start: int,
-    end: int,
-    zero: Tensor,
-) -> tuple[Tensor, Tensor, Tensor]:
-    if start == end:
-        return zero, zero, zero
-    clean_part = clean[:, start:end]
-    noise_part = noise[:, start:end]
-    prediction_part = prediction[:, start:end]
-    velocity = clean_prediction_velocity_loss(
-        clean_part, noise_part, timestep, prediction_part
-    )
-    mse = F.mse_loss(prediction_part.float(), clean_part.float())
-    cosine = F.cosine_similarity(
-        prediction_part.float(), clean_part.float(), dim=-1
-    ).mean()
-    return velocity, mse, cosine
-
-
 @torch.compile
 def jit_losses(
     clean_image: Tensor,
@@ -143,7 +113,6 @@ def jit_losses(
     repa_target: Tensor | None = None,
     reg_weight: float = 0.03,
     repa_weight: float = 0.5,
-    reg_num_cls_tokens: int = 0,
 ) -> JiTLoss:
     image_loss = clean_prediction_velocity_loss(
         clean_image, image_noise, timestep, image_prediction
@@ -169,44 +138,10 @@ def jit_losses(
         reg_x0_cosine = F.cosine_similarity(
             reg_prediction.float(), clean_reg.float(), dim=-1
         ).mean()
-        if not 0 <= reg_num_cls_tokens <= clean_reg.shape[1]:
-            raise ValueError("REG CLS token count is incompatible with REG targets")
-        (
-            reg_cls_velocity,
-            reg_cls_x0_mse,
-            reg_cls_x0_cosine,
-        ) = _reg_partition_metrics(
-            clean_reg,
-            reg_noise,
-            reg_timestep,
-            reg_prediction,
-            0,
-            reg_num_cls_tokens,
-            zero,
-        )
-        (
-            reg_spatial_velocity,
-            reg_spatial_x0_mse,
-            reg_spatial_x0_cosine,
-        ) = _reg_partition_metrics(
-            clean_reg,
-            reg_noise,
-            reg_timestep,
-            reg_prediction,
-            reg_num_cls_tokens,
-            clean_reg.shape[1],
-            zero,
-        )
     else:
         reg_loss = zero
         reg_x0_mse = zero
         reg_x0_cosine = zero
-        reg_cls_velocity = zero
-        reg_spatial_velocity = zero
-        reg_cls_x0_mse = zero
-        reg_spatial_x0_mse = zero
-        reg_cls_x0_cosine = zero
-        reg_spatial_x0_cosine = zero
     if repa_prediction is None and repa_target is None:
         repa_loss = zero
     elif repa_prediction is None or repa_target is None:
@@ -221,12 +156,6 @@ def jit_losses(
         repa_loss,
         reg_x0_mse,
         reg_x0_cosine,
-        reg_cls_velocity,
-        reg_spatial_velocity,
-        reg_cls_x0_mse,
-        reg_spatial_x0_mse,
-        reg_cls_x0_cosine,
-        reg_spatial_x0_cosine,
     )
 
 

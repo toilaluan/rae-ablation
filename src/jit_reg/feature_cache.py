@@ -5,8 +5,13 @@ import hashlib
 import importlib.metadata
 import json
 import os
-from collections.abc import Iterator
+import queue
+import shutil
+import threading
+import time
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -61,13 +66,8 @@ def component_spec(
     if component == "reg":
         reg = features.reg
         target = {
-            "feature_schema": "dino-normalized-cls-and-optional-pooled-spatial-v2",
-            "token_mode": reg.token_mode,
-            "pool_size": (
-                reg.pool_size
-                if reg.token_mode in {"spatial", "cls_spatial"}
-                else None
-            ),
+            "feature_schema": "dino-unit-std-pooled-spatial-v3",
+            "pool_size": reg.pool_size,
             "num_tokens": reg.num_tokens,
             "dtype": "bfloat16",
         }
@@ -130,6 +130,47 @@ def _shape(spec: dict[str, Any]) -> tuple[int, int, int]:
         int(inputs["target"]["num_tokens"]),
         int(inputs["encoder"]["feature_dim"]),
     )
+
+
+def required_cache_bytes(spec: dict[str, Any]) -> int:
+    """Return allocated value and completion bytes for one component cache."""
+    shape = _shape(spec)
+    return int(np.prod(shape, dtype=np.int64)) * 2 + shape[0]
+
+
+def preflight_cache_capacity(
+    directory: str | Path,
+    specs: Mapping[Component, dict[str, Any]],
+    paths: Mapping[Component, Path] | None = None,
+) -> int:
+    """Reject cache builds that cannot fit their not-yet-allocated payloads."""
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    needed = 0
+    for component, spec in specs.items():
+        shape = _shape(spec)
+        path = paths[component] if paths is not None else root / component
+        expected_values = int(np.prod(shape, dtype=np.int64)) * 2
+        expected_completion = shape[0]
+        for filename, expected in (
+            (VALUES_FILE, expected_values),
+            (COMPLETION_FILE, expected_completion),
+        ):
+            file = path / filename
+            allocated = (
+                min(file.stat().st_blocks * 512, expected)
+                if file.is_file()
+                else 0
+            )
+            needed += max(expected - allocated, 0)
+    available = shutil.disk_usage(root).free
+    if needed > available:
+        gib = 2**30
+        raise OSError(
+            "insufficient disk capacity for feature cache: "
+            f"{needed / gib:.1f} GiB required, {available / gib:.1f} GiB available"
+        )
+    return needed
 
 
 def _manifest(spec: dict[str, Any], *, complete: bool) -> dict[str, Any]:
@@ -294,6 +335,265 @@ class FeatureComponentCacheWriter:
             self.directory / MANIFEST_FILE,
             _manifest(self.spec, complete=True),
         )
+
+
+@dataclass(frozen=True)
+class CachePipelineMetrics:
+    examples: int
+    batches: int
+    buffer_backpressure_seconds: float
+    copy_seconds: float
+    write_flush_seconds: float
+    total_seconds: float
+
+    @property
+    def images_per_second(self) -> float:
+        return self.examples / max(self.total_seconds, 1e-9)
+
+
+@dataclass
+class _HostBuffer:
+    indices: Tensor
+    values: dict[Component, Tensor]
+
+
+@dataclass
+class _WriteJob:
+    buffer: _HostBuffer
+    count: int
+    sources: tuple[Tensor, ...]
+    copy_started: torch.cuda.Event
+    copy_finished: torch.cuda.Event
+
+
+class AsyncFeatureCacheWriter:
+    """Two-buffer CUDA-to-host pipeline with one durable disk-writer thread."""
+
+    def __init__(
+        self,
+        writers: Mapping[Component, FeatureComponentCacheWriter],
+        batch_size: int,
+        device: torch.device | str,
+    ) -> None:
+        if not writers:
+            raise ValueError("asynchronous cache writer requires a component writer")
+        if batch_size < 1:
+            raise ValueError("cache pipeline batch size must be positive")
+        self.writers = dict(writers)
+        self.batch_size = batch_size
+        self.device = torch.device(device)
+        self.asynchronous = self.device.type == "cuda"
+        self._started = time.perf_counter()
+        self._examples = 0
+        self._batches = 0
+        self._backpressure_seconds = 0.0
+        self._copy_seconds = 0.0
+        self._write_seconds = 0.0
+        self._metrics_lock = threading.Lock()
+        self._error: BaseException | None = None
+        self._closed = False
+        self._free: queue.Queue[_HostBuffer] = queue.Queue(maxsize=2)
+        self._jobs: queue.Queue[_WriteJob | None] = queue.Queue(maxsize=2)
+        self._copy_stream: torch.cuda.Stream | None = None
+        self._thread: threading.Thread | None = None
+        if self.asynchronous:
+            self._copy_stream = torch.cuda.Stream(device=self.device)
+            for _ in range(2):
+                self._free.put(
+                    _HostBuffer(
+                        indices=torch.empty(
+                            batch_size, dtype=torch.int64, pin_memory=True
+                        ),
+                        values={
+                            component: torch.empty(
+                                (batch_size, writer.shape[1], writer.shape[2]),
+                                dtype=torch.bfloat16,
+                                pin_memory=True,
+                            )
+                            for component, writer in self.writers.items()
+                        },
+                    )
+                )
+            self._thread = threading.Thread(
+                target=self._writer_loop,
+                name="feature-cache-writer",
+                daemon=False,
+            )
+            self._thread.start()
+
+    def __enter__(self) -> AsyncFeatureCacheWriter:
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: object,
+    ) -> None:
+        del exception_type, exception, traceback
+        self.close()
+
+    def _raise_worker_error(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("feature-cache disk writer failed") from self._error
+
+    def acquire_buffer(self) -> _HostBuffer | None:
+        """Reserve a host slot before GPU extraction to bound live target tensors."""
+        if self._closed:
+            raise RuntimeError("feature-cache pipeline is closed")
+        self._raise_worker_error()
+        if not self.asynchronous:
+            return None
+        started = time.perf_counter()
+        while True:
+            self._raise_worker_error()
+            try:
+                buffer = self._free.get(timeout=0.05)
+                break
+            except queue.Empty:
+                continue
+        with self._metrics_lock:
+            self._backpressure_seconds += time.perf_counter() - started
+        return buffer
+
+    def release_buffer(self, buffer: _HostBuffer | None) -> None:
+        """Return a reservation when extraction fails before submission."""
+        if buffer is not None:
+            self._free.put(buffer)
+
+    def submit(
+        self,
+        indices: Tensor,
+        targets: FeatureTargets,
+        *,
+        buffer: _HostBuffer | None = None,
+    ) -> None:
+        if self._closed:
+            raise RuntimeError("feature-cache pipeline is closed")
+        self._raise_worker_error()
+        try:
+            count = indices.numel()
+            if indices.ndim != 1 or count < 1 or count > self.batch_size:
+                raise ValueError("cache pipeline indices must be a non-empty batch")
+            active: dict[Component, Tensor] = {}
+            for component in self.writers:
+                value = getattr(targets, component)
+                if value is None:
+                    raise ValueError(
+                        f"active {component.upper()} cache has no targets"
+                    )
+                expected = (
+                    count,
+                    self.writers[component].shape[1],
+                    self.writers[component].shape[2],
+                )
+                if tuple(value.shape) != expected:
+                    raise ValueError(
+                        f"{component.upper()} cache targets must have shape {expected}"
+                    )
+                active[component] = value
+        except BaseException:
+            self.release_buffer(buffer)
+            raise
+
+        if not self.asynchronous:
+            started = time.perf_counter()
+            for component, value in active.items():
+                self.writers[component].write(indices, value)
+            elapsed = time.perf_counter() - started
+            with self._metrics_lock:
+                self._write_seconds += elapsed
+                self._examples += count
+                self._batches += 1
+            return
+
+        buffer = buffer if buffer is not None else self.acquire_buffer()
+        assert buffer is not None
+        assert self._copy_stream is not None
+        current_stream = torch.cuda.current_stream(self.device)
+        self._copy_stream.wait_stream(current_stream)
+        copy_started = torch.cuda.Event(enable_timing=True)
+        copy_finished = torch.cuda.Event(enable_timing=True)
+        copy_indices = indices.to(dtype=torch.int64)
+        with torch.cuda.stream(self._copy_stream):
+            copy_started.record()
+            buffer.indices[:count].copy_(
+                copy_indices, non_blocking=copy_indices.is_cuda
+            )
+            for component, value in active.items():
+                buffer.values[component][:count].copy_(
+                    value, non_blocking=True
+                )
+            copy_finished.record()
+        self._jobs.put(
+            _WriteJob(
+                buffer=buffer,
+                count=count,
+                sources=(copy_indices, *active.values()),
+                copy_started=copy_started,
+                copy_finished=copy_finished,
+            )
+        )
+        with self._metrics_lock:
+            self._examples += count
+            self._batches += 1
+
+    def _writer_loop(self) -> None:
+        while True:
+            job = self._jobs.get()
+            try:
+                if job is None:
+                    return
+                job.copy_finished.synchronize()
+                with self._metrics_lock:
+                    self._copy_seconds += (
+                        job.copy_started.elapsed_time(job.copy_finished) / 1_000
+                    )
+                if self._error is None:
+                    started = time.perf_counter()
+                    for component, writer in self.writers.items():
+                        writer.write(
+                            job.buffer.indices[: job.count],
+                            job.buffer.values[component][: job.count],
+                        )
+                    with self._metrics_lock:
+                        self._write_seconds += time.perf_counter() - started
+                # Keeping the job alive until here retains all CUDA source tensors.
+                self._free.put(job.buffer)
+            except BaseException as error:
+                if self._error is None:
+                    self._error = error
+                if job is not None:
+                    self._free.put(job.buffer)
+            finally:
+                self._jobs.task_done()
+
+    def drain(self) -> None:
+        if self.asynchronous:
+            self._jobs.join()
+        self._raise_worker_error()
+
+    def close(self) -> None:
+        if self._closed:
+            self._raise_worker_error()
+            return
+        if self.asynchronous:
+            self._jobs.put(None)
+            assert self._thread is not None
+            self._thread.join()
+        self._closed = True
+        self._raise_worker_error()
+
+    def metrics(self) -> CachePipelineMetrics:
+        with self._metrics_lock:
+            return CachePipelineMetrics(
+                examples=self._examples,
+                batches=self._batches,
+                buffer_backpressure_seconds=self._backpressure_seconds,
+                copy_seconds=self._copy_seconds,
+                write_flush_seconds=self._write_seconds,
+                total_seconds=time.perf_counter() - self._started,
+            )
 
 
 class FeatureComponentCache:

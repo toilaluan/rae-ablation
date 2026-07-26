@@ -16,19 +16,19 @@ def test_required_presets_load() -> None:
     baseline = load_config(ROOT / "configs/baseline-p16.yaml")
     paper = load_config(ROOT / "configs/reg-repa-p16.yaml")
     early = load_config(ROOT / "configs/early-reg-p16.yaml")
-    assert baseline.schema_version == paper.schema_version == early.schema_version == 2
+    assert baseline.schema_version == paper.schema_version == early.schema_version == 3
     assert baseline.model.patch_size == paper.model.patch_size == early.model.patch_size == 16
     assert not baseline.model.features.enabled
-    assert paper.model.features.reg.token_mode == "cls"
+    assert paper.model.features.reg.num_tokens == 16
+    assert paper.model.features.reg.target_std == pytest.approx(0.53)
     assert paper.model.features.repa.token_scope == "image_and_reg"
     assert paper.model.features.reg.early_prediction.block is None
-    assert early.model.features.reg.token_mode == "spatial"
     assert early.model.features.reg.spatial_rope
     assert early.model.features.reg.head.kind == "wide_mlp"
     assert early.model.features.reg.early_prediction.block == 4
     assert early.model.features.reg.early_prediction.reinjection_mode == "add"
-    assert early.model.features.reg.timestep.train_ratio_min == 0.5
-    assert early.model.features.reg.timestep.sample_ratio == 0.5
+    assert early.model.features.reg.timestep.train_ratio_min == 1.0
+    assert early.model.features.reg.timestep.sample_ratio == 1.0
 
 
 @pytest.mark.parametrize(
@@ -49,48 +49,31 @@ def test_feature_combination_matrix(reg: bool, repa: bool, scope: str) -> None:
     config.validate()
 
 
-@pytest.mark.parametrize("token_mode", ["cls", "spatial", "cls_spatial"])
 @pytest.mark.parametrize("head", ["standard", "wide_mlp"])
 @pytest.mark.parametrize("block", [None, 1])
-def test_reg_configuration_matrix(
-    token_mode: str, head: str, block: int | None
-) -> None:
+def test_reg_configuration_matrix(head: str, block: int | None) -> None:
     config = ExperimentConfig()
     config.model.depth = 2
     reg = config.model.features.reg
     reg.enabled = True
-    reg.token_mode = token_mode
     reg.head.kind = head
     reg.early_prediction.block = block
     config.validate()
 
 
-@pytest.mark.parametrize(
-    ("token_mode", "num_cls", "num_spatial", "num_tokens"),
-    [
-        ("cls", 1, 0, 1),
-        ("spatial", 0, 16, 16),
-        ("cls_spatial", 1, 16, 17),
-    ],
-)
-def test_reg_token_layout_properties(
-    token_mode: str, num_cls: int, num_spatial: int, num_tokens: int
-) -> None:
+@pytest.mark.parametrize(("pool_size", "num_tokens"), [(1, 1), (4, 16), (16, 256)])
+def test_reg_token_layout_properties(pool_size: int, num_tokens: int) -> None:
     reg = ExperimentConfig().model.features.reg
-    reg.token_mode = token_mode
-    assert (reg.num_cls_tokens, reg.num_spatial_tokens, reg.num_tokens) == (
-        num_cls,
-        num_spatial,
-        num_tokens,
-    )
+    reg.pool_size = pool_size
+    assert reg.num_tokens == num_tokens
 
 
 def test_inactive_feature_sections_are_not_validated() -> None:
     config = ExperimentConfig()
     config.model.features.encoder.model_name = ""
     config.model.features.encoder.feature_dim = -1
-    config.model.features.reg.token_mode = "retired"
     config.model.features.reg.head.kind = "retired"
+    config.model.features.reg.target_std = -1
     config.model.features.reg.timestep.train_ratio_min = -1
     config.model.features.repa.block = -1
     config.model.features.repa.token_scope = "retired"
@@ -103,8 +86,8 @@ def test_inactive_feature_sections_are_not_validated() -> None:
 def test_active_sections_validate_only_their_own_fields() -> None:
     repa_only = ExperimentConfig()
     repa_only.model.features.repa.enabled = True
-    repa_only.model.features.reg.token_mode = "irrelevant"
     repa_only.model.features.reg.head.kind = "irrelevant"
+    repa_only.model.features.reg.target_std = -1
     repa_only.model.features.reg.timestep.train_ratio_min = -1
     repa_only.validate()
 
@@ -135,9 +118,18 @@ def test_clean_break_rejects_old_and_unknown_configs(tmp_path: Path) -> None:
         load_checkpoint_config(old_checkpoint)
 
     unknown = tmp_path / "unknown.yaml"
-    unknown.write_text("schema_version: 2\nretired_experiment: true\n")
-    with pytest.raises(ValueError, match="invalid schema-v2"):
+    unknown.write_text("schema_version: 3\nretired_experiment: true\n")
+    with pytest.raises(ValueError, match="invalid schema-v3"):
         load_config(unknown)
+
+
+@pytest.mark.parametrize("target_std", [0.0, -1.0, float("inf"), float("nan")])
+def test_active_reg_target_std_must_be_finite_positive(target_std: float) -> None:
+    config = ExperimentConfig()
+    config.model.features.reg.enabled = True
+    config.model.features.reg.target_std = target_std
+    with pytest.raises(ValueError, match="target_std"):
+        config.validate()
 
 
 def test_structured_override_is_the_feature_selection_interface() -> None:

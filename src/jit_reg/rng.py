@@ -58,7 +58,7 @@ class RNGStreams:
         expected = set(self.state_dict())
         if set(state) != expected:
             raise ValueError(
-                "checkpoint RNG streams are incompatible with schema v2; "
+                "checkpoint RNG streams are incompatible with schema v3; "
                 f"expected {sorted(expected)}"
             )
         for name, value in state.items():

@@ -28,7 +28,7 @@ from jit_reg.validation_runtime import validate_ema
 
 ROOT = Path(__file__).resolve().parents[1]
 FEATURE_SCHEMA = {
-    "schema_version": 2,
+    "schema_version": 3,
     "encoder": {},
     "reg": {"enabled": False},
     "repa": {"enabled": False},
@@ -47,7 +47,7 @@ def test_sampling_output_name_includes_relative_reg_schedule() -> None:
     assert "-shift2p0-regshift0p5-" in name
 
 
-def test_sampling_manifest_has_v2_features_and_rejects_old_schema(
+def test_sampling_manifest_has_v3_features_and_rejects_old_schema(
     tmp_path: Path,
 ) -> None:
     plan = create_validation_plan(4, 2, 2, seed=4)
@@ -82,13 +82,13 @@ def test_sampling_manifest_has_v2_features_and_rejects_old_schema(
     )
     assert archive.is_file()
     manifest = json.loads((output / "samples.json").read_text())
-    assert manifest["schema_version"] == 10
+    assert manifest["schema_version"] == 11
     assert manifest["feature_schema"] == FEATURE_SCHEMA
     assert manifest["sampling"]["reg_timestep_ratio"] == 0.5
 
     old = tmp_path / "old"
     old.mkdir()
-    (old / "samples.json").write_text(json.dumps({"schema_version": 9}))
+    (old / "samples.json").write_text(json.dumps({"schema_version": 10}))
     with pytest.raises(ValueError, match="old manifests"):
         sample_to_archive(
             output_dir=old,

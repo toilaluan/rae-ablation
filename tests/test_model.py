@@ -23,7 +23,6 @@ def tiny_config(
     *,
     reg: bool = False,
     repa: bool = False,
-    token_mode: str = "cls",
     head: str = "standard",
     early: int | None = None,
     reinjection_mode: str = "replace",
@@ -41,7 +40,6 @@ def tiny_config(
             encoder=EncoderConfig(feature_dim=8, register_tokens=4),
             reg=REGConfig(
                 enabled=reg,
-                token_mode=token_mode,
                 pool_size=2,
                 head=REGHeadConfig(
                     kind=head,
@@ -107,15 +105,11 @@ def test_feature_disabled_model_is_baseline_only() -> None:
     assert output.reg is None and output.repa is None
 
 
-@pytest.mark.parametrize("token_mode", ["cls", "spatial", "cls_spatial"])
 @pytest.mark.parametrize("head", ["standard", "wide_mlp"])
 @pytest.mark.parametrize("early", [None, 1])
-def test_reg_head_token_and_location_matrix(
-    token_mode: str, head: str, early: int | None
-) -> None:
+def test_reg_head_token_and_location_matrix(head: str, early: int | None) -> None:
     config = tiny_config(
         reg=True,
-        token_mode=token_mode,
         head=head,
         early=early,
     )
@@ -130,7 +124,7 @@ def test_reg_head_token_and_location_matrix(
 
 @pytest.mark.parametrize(
     ("reg", "scope", "expected_tokens"),
-    [(False, "image", 4), (True, "image", 4), (True, "image_and_reg", 5)],
+    [(False, "image", 4), (True, "image", 4), (True, "image_and_reg", 8)],
 )
 def test_repa_scope_shapes(reg: bool, scope: str, expected_tokens: int) -> None:
     output = run(
@@ -152,7 +146,6 @@ def test_reg_requires_explicit_reg_timestep() -> None:
 def test_early_prediction_reinjects_exact_fc_gelu_fc_prefix() -> None:
     config = tiny_config(
         reg=True,
-        token_mode="cls_spatial",
         head="standard",
         early=1,
     )
@@ -191,7 +184,6 @@ def test_early_prediction_reinjects_exact_fc_gelu_fc_prefix() -> None:
 def test_additive_early_prediction_reinjects_into_existing_prefix() -> None:
     config = tiny_config(
         reg=True,
-        token_mode="spatial",
         head="standard",
         early=1,
         reinjection_mode="add",

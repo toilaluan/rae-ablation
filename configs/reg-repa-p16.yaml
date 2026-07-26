@@ -1,4 +1,4 @@
-schema_version: 2
+schema_version: 3
 data:
   repository: benjamin-paine/imagenet-1k-256x256
   revision: 1bd0400450249a7fe90c0aece37d0d03e7ea956a
@@ -30,8 +30,8 @@ model:
       register_tokens: 4
     reg:
       enabled: true
-      token_mode: cls
       pool_size: 4
+      target_std: 0.53
       loss_weight: 0.03
       head:
         kind: standard

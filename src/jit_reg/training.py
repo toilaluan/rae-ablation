@@ -25,7 +25,12 @@ from .objective import (
     sample_timesteps,
 )
 from .optim import CompositeOptimizer, learning_rate_at_epoch, set_learning_rate
-from .reg import DINOv3FeatureExtractor, FeatureTargets, repa_target_for_scope
+from .reg import (
+    DINOv3FeatureExtractor,
+    FeatureTargets,
+    repa_target_for_scope,
+    scale_reg_targets,
+)
 from .rng import RNGStreams
 from .validation import should_validate
 from .wandb_utils import RunLogger
@@ -259,6 +264,10 @@ def train(
                 ):
                     targets = feature_encoder.targets(pixels, config.model.grid_size)
             if targets is not None and targets.reg is not None:
+                targets = scale_reg_targets(
+                    targets, config.model.features.reg.target_std
+                )
+            if targets is not None and targets.reg is not None:
                 timing = config.model.features.reg.timestep
                 reg_timesteps, reg_ratios = sample_reg_timesteps(
                     timesteps,
@@ -317,11 +326,6 @@ def train(
                     repa_target=repa_target,
                     reg_weight=config.model.features.reg.loss_weight,
                     repa_weight=config.model.features.repa.loss_weight,
-                    reg_num_cls_tokens=(
-                        config.model.features.reg.num_cls_tokens
-                        if config.model.features.reg.enabled
-                        else 0
-                    ),
                 )
                 (losses.total / accumulation).backward()
             if cuda_backward_finished is not None:
@@ -388,12 +392,6 @@ def train(
                 "train/reg_velocity_loss": losses.reg_velocity.item(),
                 "train/reg_x0_mse": losses.reg_x0_mse.item(),
                 "train/reg_x0_cosine": losses.reg_x0_cosine.item(),
-                "train/reg_cls_velocity_loss": losses.reg_cls_velocity.item(),
-                "train/reg_spatial_velocity_loss": losses.reg_spatial_velocity.item(),
-                "train/reg_cls_x0_mse": losses.reg_cls_x0_mse.item(),
-                "train/reg_spatial_x0_mse": losses.reg_spatial_x0_mse.item(),
-                "train/reg_cls_x0_cosine": losses.reg_cls_x0_cosine.item(),
-                "train/reg_spatial_x0_cosine": losses.reg_spatial_x0_cosine.item(),
                 "train/repa_loss": losses.repa.item(),
                 "train/image_timestep_mean": timesteps.mean().item(),
                 "train/reg_timestep_mean": (
