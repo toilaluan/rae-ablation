@@ -9,7 +9,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from ..config import ModelConfig
-from .rope import apply_2d_rope
+from .rope import apply_2d_rope, apply_aligned_spatial_rope
 
 
 class SiTOutput(NamedTuple):
@@ -73,11 +73,22 @@ class TimestepEmbedding(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        *,
+        num_cls_tokens: int = 0,
+        spatial_pool_size: int | None = None,
+        spatial_rope: bool = False,
+    ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        self.num_cls_tokens = num_cls_tokens
+        self.spatial_pool_size = spatial_pool_size
+        self.spatial_rope = spatial_rope
         self.qkv = nn.Linear(hidden_size, 3 * hidden_size)
         self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
@@ -92,12 +103,26 @@ class Attention(nn.Module):
         )
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
+        prefix_q, prefix_k = q[:, :, :patch_start], k[:, :, :patch_start]
+        spatial_start = self.num_cls_tokens
+        if self.spatial_rope and patch_start > spatial_start:
+            if self.spatial_pool_size is None:
+                raise ValueError("spatial REG RoPE requires a pool size")
+            spatial_q, spatial_k = apply_aligned_spatial_rope(
+                prefix_q[:, :, spatial_start:],
+                prefix_k[:, :, spatial_start:],
+                self.spatial_pool_size,
+                height,
+                width,
+            )
+            prefix_q = torch.cat((prefix_q[:, :, :spatial_start], spatial_q), dim=2)
+            prefix_k = torch.cat((prefix_k[:, :, :spatial_start], spatial_k), dim=2)
         patch_q, patch_k = apply_2d_rope(
             q[:, :, patch_start:], k[:, :, patch_start:], height, width
         )
         if patch_start:
-            q = torch.cat((q[:, :, :patch_start], patch_q), dim=2)
-            k = torch.cat((k[:, :, :patch_start], patch_k), dim=2)
+            q = torch.cat((prefix_q, patch_q), dim=2)
+            k = torch.cat((prefix_k, patch_k), dim=2)
         else:
             q, k = patch_q, patch_k
         attended = F.scaled_dot_product_attention(q, k, v, is_causal=False)
@@ -118,10 +143,25 @@ class SwiGLU(nn.Module):
 
 
 class SiTBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float,
+        *,
+        num_cls_tokens: int = 0,
+        spatial_pool_size: int | None = None,
+        spatial_rope: bool = False,
+    ) -> None:
         super().__init__()
         self.norm1 = nn.RMSNorm(hidden_size, eps=1e-6)
-        self.attention = Attention(hidden_size, num_heads)
+        self.attention = Attention(
+            hidden_size,
+            num_heads,
+            num_cls_tokens=num_cls_tokens,
+            spatial_pool_size=spatial_pool_size,
+            spatial_rope=spatial_rope,
+        )
         self.norm2 = nn.RMSNorm(hidden_size, eps=1e-6)
         self.feed_forward = SwiGLU(hidden_size, mlp_ratio)
         self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size))
@@ -261,7 +301,7 @@ class SiT(nn.Module):
         features = config.features
         reg = features.reg
         repa = features.repa
-        if reg.enabled and reg.token_mode not in {"cls", "cls_spatial"}:
+        if reg.enabled and reg.token_mode not in {"cls", "spatial", "cls_spatial"}:
             raise ValueError("unknown REG token mode")
         if reg.enabled and not 1 <= reg.pool_size <= 16:
             raise ValueError("REG pool size must be within the native 16x16 feature grid")
@@ -271,6 +311,11 @@ class SiT(nn.Module):
             1 <= reg.early_prediction.block < config.depth
         ):
             raise ValueError("early REG prediction block must be before the final block")
+        if reg.enabled and reg.early_prediction.reinjection_mode not in {
+            "replace",
+            "add",
+        }:
+            raise ValueError("REG reinjection mode must be replace or add")
         if repa.enabled and not 1 <= repa.block <= config.depth:
             raise ValueError("REPA block must be within model depth")
         if repa.enabled and repa.token_scope == "image_and_reg" and not reg.enabled:
@@ -292,6 +337,17 @@ class SiT(nn.Module):
                     config.hidden_size,
                     config.num_heads,
                     config.mlp_ratio,
+                    num_cls_tokens=reg.num_cls_tokens if reg.enabled else 0,
+                    spatial_pool_size=(
+                        reg.pool_size
+                        if reg.enabled and reg.num_spatial_tokens
+                        else None
+                    ),
+                    spatial_rope=(
+                        reg.enabled
+                        and bool(reg.num_spatial_tokens)
+                        and reg.spatial_rope
+                    ),
                 )
                 for _ in range(config.depth)
             ]
@@ -301,9 +357,9 @@ class SiT(nn.Module):
         feature_dim = features.encoder.feature_dim
         if reg.enabled:
             self.reg_input: nn.Linear | None = nn.Linear(feature_dim, config.hidden_size)
-            if reg.token_mode == "cls_spatial":
+            if reg.num_spatial_tokens:
                 self.reg_position_embedding = nn.Parameter(
-                    torch.empty(1, reg.pool_size**2, config.hidden_size)
+                    torch.empty(1, reg.num_spatial_tokens, config.hidden_size)
                 )
             else:
                 self.register_parameter("reg_position_embedding", None)
@@ -411,7 +467,14 @@ class SiT(nn.Module):
     def _add_reg_positions(self, tokens: Tensor) -> Tensor:
         if self.reg_position_embedding is None:
             return tokens
-        return torch.cat((tokens[:, :1], tokens[:, 1:] + self.reg_position_embedding), dim=1)
+        spatial_start = self.config.features.reg.num_cls_tokens
+        return torch.cat(
+            (
+                tokens[:, :spatial_start],
+                tokens[:, spatial_start:] + self.reg_position_embedding,
+            ),
+            dim=1,
+        )
 
     def forward(
         self,
@@ -522,7 +585,11 @@ class SiT(nn.Module):
                     )
                 reg = predicted.x0 if isinstance(predicted, WideREGOutput) else predicted
                 assert self.reg_reinjection is not None
-                clean_reg = self._add_reg_positions(self.reg_reinjection(reg))
+                projected_reg = self.reg_reinjection(reg)
+                if reg_config.early_prediction.reinjection_mode == "replace":
+                    clean_reg = self._add_reg_positions(projected_reg)
+                else:
+                    clean_reg = sequence[:, :patch_start] + projected_reg
                 sequence = torch.cat((clean_reg, sequence[:, patch_start:]), dim=1)
 
         patch_tokens = sequence[:, patch_start:]

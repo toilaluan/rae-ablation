@@ -14,9 +14,9 @@ rebuilt.
 - `configs/baseline-p16.yaml`: feature-free SiT-B/16 baseline.
 - `configs/reg-repa-p16.yaml`: paper-style one-CLS REG plus block-4,
   full-sequence REPA; equal image and REG time.
-- `configs/early-reg-p16.yaml`: CLS plus pooled 4×4 spatial REG, a block-4
-  2048-wide depth-2 head, FC–GELU–FC reinjection, and a log-uniform training
-  REG-time ratio from 0.5 to 1.0 (0.5 at sampling time).
+- `configs/early-reg-p16.yaml`: pooled 4×4 spatial REG with aligned 2D RoPE, a
+  block-4 2048-wide depth-2 head, additive FC–GELU–FC reinjection, and a
+  log-uniform training REG-time ratio from 0.5 to 1.0 (0.5 at sampling time).
 
 The v2 feature configuration lives under `model.features`:
 
@@ -29,8 +29,9 @@ model:
       register_tokens: 4
     reg:
       enabled: true
-      token_mode: cls
+      token_mode: cls       # cls | spatial | cls_spatial
       pool_size: 4
+      spatial_rope: true
       loss_weight: 0.03
       head:
         kind: standard       # standard | wide_mlp
@@ -44,6 +45,7 @@ model:
       early_prediction:
         block: null          # null predicts after the final block
         projection_hidden_size: 2048
+        reinjection_mode: replace  # replace | add
     repa:
       enabled: true
       block: 4

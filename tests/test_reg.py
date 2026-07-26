@@ -42,6 +42,17 @@ def test_optional_component_target_extraction() -> None:
     )
     assert reg.reg is not None and reg.reg.shape == (2, 5, 8)
     assert reg.repa is None
+    spatial_only = prepare_feature_targets(
+        cls,
+        spatial,
+        2,
+        include_reg=True,
+        token_mode="spatial",
+        pool_size=2,
+        include_repa=False,
+    )
+    assert spatial_only.reg is not None
+    assert torch.equal(spatial_only.reg, reg.reg[:, 1:])
 
     repa = prepare_feature_targets(
         cls, spatial, 2, include_reg=False, include_repa=True
@@ -106,6 +117,35 @@ def test_reg_velocity_loss_uses_reg_timestep() -> None:
     )
     assert losses.image_velocity == 0
     assert losses.reg_velocity == pytest.approx((1 / 0.75) ** 2)
+
+
+@pytest.mark.parametrize(
+    ("num_cls", "expected_cls_mse", "expected_spatial_mse"),
+    [(0, 0.0, 2.0), (1, 1.0, 2.5), (3, 2.0, 0.0)],
+)
+def test_reg_metrics_split_by_configured_token_layout(
+    num_cls: int, expected_cls_mse: float, expected_spatial_mse: float
+) -> None:
+    clean_reg = torch.tensor([[[1.0], [2.0], [1.0]]])
+    prediction = torch.zeros_like(clean_reg)
+    losses = jit_losses(
+        torch.zeros(1, 1),
+        torch.zeros(1, 1),
+        torch.tensor([0.5]),
+        torch.zeros(1, 1),
+        clean_reg=clean_reg,
+        reg_noise=torch.zeros_like(clean_reg),
+        reg_prediction=prediction,
+        reg_timestep=torch.tensor([0.5]),
+        reg_num_cls_tokens=num_cls,
+    )
+    assert losses.reg_x0_mse == pytest.approx(2.0)
+    assert losses.reg_cls_x0_mse == pytest.approx(expected_cls_mse)
+    assert losses.reg_spatial_x0_mse == pytest.approx(expected_spatial_mse)
+    assert losses.reg_cls_velocity == pytest.approx(expected_cls_mse * 4)
+    assert losses.reg_spatial_velocity == pytest.approx(expected_spatial_mse * 4)
+    assert losses.reg_cls_x0_cosine == 0
+    assert losses.reg_spatial_x0_cosine == 0
 
 
 class RecordingCleanModel(nn.Module):

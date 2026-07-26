@@ -22,9 +22,11 @@ def test_required_presets_load() -> None:
     assert paper.model.features.reg.token_mode == "cls"
     assert paper.model.features.repa.token_scope == "image_and_reg"
     assert paper.model.features.reg.early_prediction.block is None
-    assert early.model.features.reg.token_mode == "cls_spatial"
+    assert early.model.features.reg.token_mode == "spatial"
+    assert early.model.features.reg.spatial_rope
     assert early.model.features.reg.head.kind == "wide_mlp"
     assert early.model.features.reg.early_prediction.block == 4
+    assert early.model.features.reg.early_prediction.reinjection_mode == "add"
     assert early.model.features.reg.timestep.train_ratio_min == 0.5
     assert early.model.features.reg.timestep.sample_ratio == 0.5
 
@@ -47,7 +49,7 @@ def test_feature_combination_matrix(reg: bool, repa: bool, scope: str) -> None:
     config.validate()
 
 
-@pytest.mark.parametrize("token_mode", ["cls", "cls_spatial"])
+@pytest.mark.parametrize("token_mode", ["cls", "spatial", "cls_spatial"])
 @pytest.mark.parametrize("head", ["standard", "wide_mlp"])
 @pytest.mark.parametrize("block", [None, 1])
 def test_reg_configuration_matrix(
@@ -61,6 +63,26 @@ def test_reg_configuration_matrix(
     reg.head.kind = head
     reg.early_prediction.block = block
     config.validate()
+
+
+@pytest.mark.parametrize(
+    ("token_mode", "num_cls", "num_spatial", "num_tokens"),
+    [
+        ("cls", 1, 0, 1),
+        ("spatial", 0, 16, 16),
+        ("cls_spatial", 1, 16, 17),
+    ],
+)
+def test_reg_token_layout_properties(
+    token_mode: str, num_cls: int, num_spatial: int, num_tokens: int
+) -> None:
+    reg = ExperimentConfig().model.features.reg
+    reg.token_mode = token_mode
+    assert (reg.num_cls_tokens, reg.num_spatial_tokens, reg.num_tokens) == (
+        num_cls,
+        num_spatial,
+        num_tokens,
+    )
 
 
 def test_inactive_feature_sections_are_not_validated() -> None:

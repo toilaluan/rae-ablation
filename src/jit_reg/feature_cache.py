@@ -63,7 +63,11 @@ def component_spec(
         target = {
             "feature_schema": "dino-normalized-cls-and-optional-pooled-spatial-v2",
             "token_mode": reg.token_mode,
-            "pool_size": reg.pool_size if reg.token_mode == "cls_spatial" else None,
+            "pool_size": (
+                reg.pool_size
+                if reg.token_mode in {"spatial", "cls_spatial"}
+                else None
+            ),
             "num_tokens": reg.num_tokens,
             "dtype": "bfloat16",
         }

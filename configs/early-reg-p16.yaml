@@ -30,8 +30,9 @@ model:
       register_tokens: 4
     reg:
       enabled: true
-      token_mode: cls_spatial
+      token_mode: spatial
       pool_size: 4
+      spatial_rope: true
       loss_weight: 0.03
       head:
         kind: wide_mlp
@@ -41,10 +42,11 @@ model:
       timestep:
         train_ratio_min: 0.5
         train_ratio_max: 1.0
-        sample_ratio: 0.8
+        sample_ratio: 0.5
       early_prediction:
         block: 4
         projection_hidden_size: 2048
+        reinjection_mode: add
     repa:
       enabled: false
       block: 4

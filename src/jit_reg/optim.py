@@ -10,7 +10,7 @@ from .config import OptimizerConfig
 
 
 def _muon_eligible(name: str, parameter: nn.Parameter) -> bool:
-    excluded = ("embedding", "norm", "bias", "projection", "head", "input_projection")
+    excluded = ("embedding", "norm", "bias", "projection", "input_projection")
     return parameter.ndim == 2 and not any(part in name for part in excluded)
 
 

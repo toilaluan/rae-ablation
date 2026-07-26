@@ -73,11 +73,15 @@ def prepare_feature_targets(
     if include_reg:
         if token_mode == "cls":
             reg_tokens = cls.float().unsqueeze(1)
-        elif token_mode == "cls_spatial":
+        elif token_mode in {"spatial", "cls_spatial"}:
             pooled = pool_spatial_features(spatial, pool_size)
-            reg_tokens = torch.cat((cls.float().unsqueeze(1), pooled), dim=1)
+            reg_tokens = (
+                pooled
+                if token_mode == "spatial"
+                else torch.cat((cls.float().unsqueeze(1), pooled), dim=1)
+            )
         else:
-            raise ValueError("token_mode must be cls or cls_spatial")
+            raise ValueError("token_mode must be cls, spatial, or cls_spatial")
     repa = resize_spatial_features(spatial, target_grid) if include_repa else None
     return FeatureTargets(reg=reg_tokens, repa=repa)
 

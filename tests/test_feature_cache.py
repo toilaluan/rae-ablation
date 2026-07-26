@@ -87,6 +87,13 @@ def test_component_fingerprints_are_minimal_and_independent(tmp_path: Path) -> N
     assert changed[0] != original[0]
     assert changed[1] == original[1]
 
+    spatial = copy.deepcopy(config)
+    spatial.model.features.reg.token_mode = "spatial"
+    spatial_fingerprint = fingerprints(spatial)
+    changed_pool = copy.deepcopy(spatial)
+    changed_pool.model.features.reg.pool_size = 2
+    assert fingerprints(changed_pool)[0] != spatial_fingerprint[0]
+
     grid_change = copy.deepcopy(config)
     grid_change.model.patch_size = 4
     changed = fingerprints(grid_change)

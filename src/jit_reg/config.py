@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ class REGHeadConfig:
 class REGEarlyPredictionConfig:
     block: int | None = None
     projection_hidden_size: int = 2048
+    reinjection_mode: str = "replace"
 
 
 @dataclass
@@ -47,6 +49,7 @@ class REGConfig:
     enabled: bool = False
     token_mode: str = "cls"
     pool_size: int = 4
+    spatial_rope: bool = True
     loss_weight: float = 0.03
     head: REGHeadConfig = field(default_factory=REGHeadConfig)
     timestep: REGTimestepConfig = field(default_factory=REGTimestepConfig)
@@ -55,12 +58,24 @@ class REGConfig:
     )
 
     @property
-    def num_tokens(self) -> int:
-        if self.token_mode == "cls":
+    def num_cls_tokens(self) -> int:
+        if self.token_mode in {"cls", "cls_spatial"}:
             return 1
-        if self.token_mode == "cls_spatial":
-            return 1 + self.pool_size**2
+        if self.token_mode == "spatial":
+            return 0
         raise ValueError(f"unknown REG token mode: {self.token_mode}")
+
+    @property
+    def num_spatial_tokens(self) -> int:
+        if self.token_mode == "cls":
+            return 0
+        if self.token_mode in {"spatial", "cls_spatial"}:
+            return self.pool_size**2
+        raise ValueError(f"unknown REG token mode: {self.token_mode}")
+
+    @property
+    def num_tokens(self) -> int:
+        return self.num_cls_tokens + self.num_spatial_tokens
 
 
 @dataclass
@@ -267,8 +282,10 @@ class ExperimentConfig:
                 raise ValueError("model.features.encoder.model_name cannot be empty")
         if features.reg.enabled:
             reg = features.reg
-            if reg.token_mode not in {"cls", "cls_spatial"}:
-                raise ValueError("model.features.reg.token_mode must be cls or cls_spatial")
+            if reg.token_mode not in {"cls", "spatial", "cls_spatial"}:
+                raise ValueError(
+                    "model.features.reg.token_mode must be cls, spatial, or cls_spatial"
+                )
             if reg.pool_size < 1 or reg.pool_size > 16:
                 raise ValueError(
                     "model.features.reg.pool_size must be within the native 16x16 grid"
@@ -296,6 +313,11 @@ class ExperimentConfig:
                 _positive(
                     "model.features.reg.early_prediction.projection_hidden_size",
                     reg.early_prediction.projection_hidden_size,
+                )
+            if reg.early_prediction.reinjection_mode not in {"replace", "add"}:
+                raise ValueError(
+                    "model.features.reg.early_prediction.reinjection_mode "
+                    "must be replace or add"
                 )
             timing = reg.timestep
             values = (
@@ -460,6 +482,14 @@ def load_config(
 
 
 def load_checkpoint_config(path: str | Path) -> ExperimentConfig:
-    """Load a resolved v2 checkpoint config; legacy checkpoints are rejected."""
-    values = _require_v2(json.loads(Path(path).read_text()), path)
+    """Load a resolved v2 checkpoint config with sampling-compatible old defaults."""
+    values = deepcopy(_require_v2(json.loads(Path(path).read_text()), path))
+    model = values.setdefault("model", {})
+    features = model.setdefault("features", {})
+    reg = features.setdefault("reg", {})
+    # These fields did not exist in early schema-v2 checkpoints. Enabling spatial
+    # RoPE or changing reinjection would alter their sampling behavior.
+    reg.setdefault("spatial_rope", False)
+    early = reg.setdefault("early_prediction", {})
+    early.setdefault("reinjection_mode", "replace")
     return _structured_config(values)

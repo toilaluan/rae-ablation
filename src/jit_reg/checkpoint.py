@@ -13,6 +13,8 @@ from torch import Tensor, nn
 
 from .model.compile import clean_state_dict
 
+TRAINING_STATE_SCHEMA_VERSION = 3
+
 
 def _contiguous(state: dict[str, object]) -> dict[str, Tensor]:
     return {
@@ -101,7 +103,7 @@ class CheckpointManager:
         save_file(_contiguous(raw_state), str(temporary / "model.safetensors"))
         save_file(_contiguous(ema.state_dict()), str(temporary / "ema.safetensors"))
         training = {
-            "schema_version": 2,
+            "schema_version": TRAINING_STATE_SCHEMA_VERSION,
             "epoch": completed_epoch,
             "global_step": global_step,
             "last_completed_validation_epoch": last_completed_validation_epoch,
@@ -205,14 +207,20 @@ class CheckpointManager:
             )
         from .config import load_checkpoint_config
 
+        state = torch.load(path / "training.pt", map_location="cpu", weights_only=False)
+        state_schema = state.get("schema_version")
+        if state_schema == 2:
+            raise ValueError(
+                "checkpoint training-state schema v2 is sampling-only after "
+                "optimizer routing change; exact training resume requires schema v3"
+            )
+        if state_schema != TRAINING_STATE_SCHEMA_VERSION:
+            raise ValueError(
+                "checkpoint training state is incompatible with schema v3"
+            )
         load_checkpoint_config(path / "config.json")
         model.load_state_dict(load_file(str(path / "model.safetensors")))
         ema.load_state_dict(load_file(str(path / "ema.safetensors")))
-        state = torch.load(path / "training.pt", map_location="cpu", weights_only=False)
-        if state.get("schema_version") != 2:
-            raise ValueError(
-                "checkpoint training state is incompatible with schema v2"
-            )
         if expected_data_fingerprint and state["data_fingerprint"] != expected_data_fingerprint:
             raise ValueError("checkpoint dataset/preprocessing fingerprint mismatch")
         if (

@@ -149,12 +149,12 @@ def save_checkpoint(tmp_path: Path) -> tuple[CheckpointManager, Path, SiT]:
     return manager, path, model
 
 
-def test_v2_checkpoint_bundle_and_resume(tmp_path: Path) -> None:
+def test_v2_checkpoint_bundle_and_v3_training_resume(tmp_path: Path) -> None:
     manager, checkpoint, model = save_checkpoint(tmp_path)
     metadata = json.loads((checkpoint / "metadata.json").read_text())
     assert metadata["schema_version"] == 2
     training = torch.load(checkpoint / "training.pt", weights_only=False)
-    assert training["schema_version"] == 2
+    assert training["schema_version"] == 3
     restored = SiT(model.config)
     resumed = manager.load(
         checkpoint,
@@ -167,6 +167,44 @@ def test_v2_checkpoint_bundle_and_resume(tmp_path: Path) -> None:
     bundle = load_checkpoint_bundle(tmp_path / "checkpoints")
     assert bundle.directory == checkpoint.resolve()
     assert bundle.config.schema_version == 2
+
+
+def test_old_v2_training_resume_is_rejected_before_model_mutation(
+    tmp_path: Path,
+) -> None:
+    manager, checkpoint, model = save_checkpoint(tmp_path)
+    training_path = checkpoint / "training.pt"
+    training = torch.load(training_path, weights_only=False)
+    training["schema_version"] = 2
+    torch.save(training, training_path)
+    restored = SiT(model.config)
+    before = {
+        name: value.detach().clone() for name, value in restored.state_dict().items()
+    }
+    with pytest.raises(ValueError, match="sampling-only after optimizer routing change"):
+        manager.load(checkpoint, restored, EMA(restored))
+    assert all(
+        torch.equal(value, before[name])
+        for name, value in restored.state_dict().items()
+    )
+
+
+def test_old_checkpoint_config_gets_sampling_compatibility_defaults(
+    tmp_path: Path,
+) -> None:
+    _manager, checkpoint, _model = save_checkpoint(tmp_path)
+    config_path = checkpoint / "config.json"
+    values = json.loads(config_path.read_text())
+    reg = values["model"]["features"]["reg"]
+    reg.pop("spatial_rope")
+    reg["early_prediction"].pop("reinjection_mode")
+    config_path.write_text(json.dumps(values))
+    bundle = load_checkpoint_bundle(checkpoint)
+    assert not bundle.config.model.features.reg.spatial_rope
+    assert (
+        bundle.config.model.features.reg.early_prediction.reinjection_mode
+        == "replace"
+    )
 
 
 def test_schema_v1_checkpoint_is_explicitly_rejected(tmp_path: Path) -> None:

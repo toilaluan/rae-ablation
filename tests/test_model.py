@@ -26,6 +26,7 @@ def tiny_config(
     token_mode: str = "cls",
     head: str = "standard",
     early: int | None = None,
+    reinjection_mode: str = "replace",
     scope: str = "image",
 ) -> ModelConfig:
     return ModelConfig(
@@ -51,6 +52,7 @@ def tiny_config(
                 early_prediction=REGEarlyPredictionConfig(
                     block=early,
                     projection_hidden_size=32,
+                    reinjection_mode=reinjection_mode,
                 ),
             ),
             repa=REPAConfig(
@@ -105,7 +107,7 @@ def test_feature_disabled_model_is_baseline_only() -> None:
     assert output.reg is None and output.repa is None
 
 
-@pytest.mark.parametrize("token_mode", ["cls", "cls_spatial"])
+@pytest.mark.parametrize("token_mode", ["cls", "spatial", "cls_spatial"])
 @pytest.mark.parametrize("head", ["standard", "wide_mlp"])
 @pytest.mark.parametrize("early", [None, 1])
 def test_reg_head_token_and_location_matrix(
@@ -184,6 +186,47 @@ def test_early_prediction_reinjects_exact_fc_gelu_fc_prefix() -> None:
         nn.GELU,
         nn.Linear,
     ]
+
+
+def test_additive_early_prediction_reinjects_into_existing_prefix() -> None:
+    config = tiny_config(
+        reg=True,
+        token_mode="spatial",
+        head="standard",
+        early=1,
+        reinjection_mode="add",
+    )
+    model = SiT(config)
+    previous: list[torch.Tensor] = []
+    captured: list[torch.Tensor] = []
+
+    def capture_previous(
+        _module: nn.Module, _args: tuple[object, ...], output: torch.Tensor
+    ) -> None:
+        previous.append(output.detach().clone())
+
+    first = model.blocks[0].register_forward_hook(capture_previous)
+    second = model.blocks[1].register_forward_pre_hook(
+        lambda _module, args: captured.append(args[0].detach().clone())
+    )
+    image, timestep, labels, noisy_reg = inputs(config)
+    output = model(
+        image,
+        timestep,
+        labels,
+        noisy_reg=noisy_reg,
+        reg_timestep=timestep,
+    )
+    first.remove()
+    second.remove()
+    assert output.reg is not None and model.reg_reinjection is not None
+    expected = (
+        previous[0][:, : model.num_reg_tokens]
+        + model.reg_reinjection(output.reg)
+    )
+    assert torch.allclose(
+        captured[0][:, : model.num_reg_tokens], expected, atol=1e-6
+    )
 
 
 def test_every_block_receives_separate_image_and_reg_conditioning() -> None:

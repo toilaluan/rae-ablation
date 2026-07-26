@@ -317,6 +317,11 @@ def train(
                     repa_target=repa_target,
                     reg_weight=config.model.features.reg.loss_weight,
                     repa_weight=config.model.features.repa.loss_weight,
+                    reg_num_cls_tokens=(
+                        config.model.features.reg.num_cls_tokens
+                        if config.model.features.reg.enabled
+                        else 0
+                    ),
                 )
                 (losses.total / accumulation).backward()
             if cuda_backward_finished is not None:
@@ -383,6 +388,12 @@ def train(
                 "train/reg_velocity_loss": losses.reg_velocity.item(),
                 "train/reg_x0_mse": losses.reg_x0_mse.item(),
                 "train/reg_x0_cosine": losses.reg_x0_cosine.item(),
+                "train/reg_cls_velocity_loss": losses.reg_cls_velocity.item(),
+                "train/reg_spatial_velocity_loss": losses.reg_spatial_velocity.item(),
+                "train/reg_cls_x0_mse": losses.reg_cls_x0_mse.item(),
+                "train/reg_spatial_x0_mse": losses.reg_spatial_x0_mse.item(),
+                "train/reg_cls_x0_cosine": losses.reg_cls_x0_cosine.item(),
+                "train/reg_spatial_x0_cosine": losses.reg_spatial_x0_cosine.item(),
                 "train/repa_loss": losses.repa.item(),
                 "train/image_timestep_mean": timesteps.mean().item(),
                 "train/reg_timestep_mean": (
