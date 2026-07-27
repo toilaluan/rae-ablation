@@ -22,6 +22,7 @@ from jit_reg.model.ddt import (
     ConditionEmbedder,
     DDTDecoderBlock,
     DDTEncoderBlock,
+    DDTInternalREGHead,
     DDTOutput,
     GaussianFourierEmbedding,
 )
@@ -61,6 +62,7 @@ def tiny_config(
             reg=REGConfig(
                 enabled=reg,
                 pool_size=2,
+                internal_guidance_block=1,
             ),
             repa=REPAConfig(
                 enabled=repa,
@@ -122,6 +124,7 @@ def test_feature_disabled_model_is_baseline_ddt() -> None:
     assert model.encoder_reg_projection is None
     assert model.decoder_reg_projection is None
     assert model.final_layer.reg_projection is None
+    assert model.internal_reg_head is None
     assert model.repa_projection is None
     assert not any(
         key.startswith(("encoder_reg_", "decoder_reg_", "repa_"))
@@ -130,7 +133,7 @@ def test_feature_disabled_model_is_baseline_ddt() -> None:
     image, timestep, labels, _ = inputs(model.config)
     output = model(image, timestep, labels)
     assert output.image.shape == image.shape
-    assert output.reg is None and output.repa is None
+    assert output.reg is None and output.repa is None and output.reg_early is None
 
 
 @pytest.mark.parametrize(
@@ -160,14 +163,15 @@ def test_output_shapes(
         config.features.encoder.feature_dim,
     )
     if reg:
-        assert output.reg is not None
+        assert output.reg is not None and output.reg_early is not None
         assert output.reg.shape == (
             2,
             config.features.reg.num_tokens,
             config.features.encoder.feature_dim,
         )
+        assert output.reg_early.shape == output.reg.shape
     else:
-        assert output.reg is None
+        assert output.reg is None and output.reg_early is None
 
 
 def test_reg_requires_explicit_reg_timestep() -> None:
@@ -334,17 +338,43 @@ def test_shared_final_layer_emits_image_and_reg_without_reg_head() -> None:
     model = DDT(tiny_config(reg=True))
     assert isinstance(model.final_layer.norm, nn.RMSNorm)
     assert model.final_layer.reg_projection is not None
-    assert not hasattr(model, "reg_head")
+    assert isinstance(model.internal_reg_head, DDTInternalREGHead)
     assert not hasattr(model, "reg_reinjection")
     state = model.state_dict()
     assert "final_layer.image_projection.weight" in state
     assert "final_layer.reg_projection.weight" in state
+    assert "internal_reg_head.projection.weight" in state
     assert not any(
-        "reg_head" in key
-        or "reinjection" in key
+        "reinjection" in key
         or "reg_position_embedding" in key
         for key in state
     )
+
+
+def test_internal_reg_head_is_zero_initialized_and_uses_selected_block() -> None:
+    config = tiny_config(reg=True)
+    config.features.reg.internal_guidance_block = 2
+    model = DDT(config)
+    assert model.internal_reg_head is not None
+    assert torch.count_nonzero(model.internal_reg_head.modulation[-1].weight) == 0
+    assert torch.count_nonzero(model.internal_reg_head.projection.weight) == 0
+
+    selected: list[torch.Tensor] = []
+    handle = model.encoder_blocks[1].register_forward_hook(
+        lambda _module, _args, output: selected.append(output.detach().clone())
+    )
+    image, timestep, labels, noisy_reg = inputs(config)
+    output = model(
+        image,
+        timestep,
+        labels,
+        noisy_reg=noisy_reg,
+        reg_timestep=timestep,
+    )
+    handle.remove()
+    assert output.reg_early is not None
+    assert torch.count_nonzero(output.reg_early) == 0
+    assert len(selected) == 1
 
 
 def test_gaussian_fourier_embedding_returns_base_and_context_tokens() -> None:
@@ -408,7 +438,6 @@ def test_removed_sit_and_independent_reg_components_are_absent() -> None:
     for retired in (
         "SiT",
         "WideREG",
-        "reg_head",
         "reg_reinjection",
         "early_prediction",
         "reg_position_embedding",

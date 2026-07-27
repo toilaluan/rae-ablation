@@ -41,6 +41,7 @@ def ode_sample(
     reg_noise: None = None,
     steps: int = 50,
     guidance_scale: float = 1.78,
+    reg_guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
     reg_timestep_shift: float = 1.0,
     img_denoising_interval: tuple[float, float] = (0.0, 1.0),
@@ -60,6 +61,7 @@ def ode_sample(
     reg_noise: Tensor,
     steps: int = 50,
     guidance_scale: float = 1.78,
+    reg_guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
     reg_timestep_shift: float = 1.0,
     img_denoising_interval: tuple[float, float] = (0.0, 1.0),
@@ -79,6 +81,7 @@ def ode_sample(
     reg_noise: Tensor | None = None,
     steps: int = 50,
     guidance_scale: float = 1.78,
+    reg_guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
     reg_timestep_shift: float = 1.0,
     img_denoising_interval: tuple[float, float] = (0.0, 1.0),
@@ -96,6 +99,8 @@ def ode_sample(
         raise ValueError("REG timestep shift must be finite and positive")
     if not math.isfinite(guidance_scale):
         raise ValueError("guidance scale must be finite")
+    if not math.isfinite(reg_guidance_scale):
+        raise ValueError("REG guidance scale must be finite")
     cfg_start, cfg_end = cfg_interval
     if not (0 <= cfg_start <= cfg_end <= 1):
         raise ValueError("CFG interval must satisfy 0 <= start <= end <= 1")
@@ -178,13 +183,21 @@ def ode_sample(
         if current_reg_state is not None:
             if output.reg is None:
                 raise RuntimeError("REG sampling requires a model REG-token prediction")
-            if use_cfg:
-                conditional_reg, unconditional_reg = output.reg.float().chunk(2)
-                reg_prediction = _guided(
-                    conditional_reg, unconditional_reg, guidance_scale
+            if output.reg_early is None:
+                raise RuntimeError(
+                    "REG sampling requires an early REG-token prediction"
                 )
+            if use_cfg:
+                conditional_reg = output.reg.float().chunk(2)[0]
+                early_reg = output.reg_early.float().chunk(2)[0]
             else:
-                reg_prediction = output.reg.float()
+                conditional_reg = output.reg.float()
+                early_reg = output.reg_early.float()
+            reg_prediction = _guided(
+                conditional_reg,
+                early_reg,
+                reg_guidance_scale,
+            )
         return image_prediction, reg_prediction
 
     image_pairs = pairwise(image_schedule)
@@ -247,6 +260,7 @@ def euler_sample(
     reg_noise: Tensor | None = None,
     steps: int = 50,
     guidance_scale: float = 1.78,
+    reg_guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
     reg_timestep_shift: float = 1.0,
     img_denoising_interval: tuple[float, float] = (0.0, 1.0),
@@ -262,6 +276,7 @@ def euler_sample(
         reg_noise=reg_noise,
         steps=steps,
         guidance_scale=guidance_scale,
+        reg_guidance_scale=reg_guidance_scale,
         timestep_shift=timestep_shift,
         reg_timestep_shift=reg_timestep_shift,
         img_denoising_interval=img_denoising_interval,
@@ -280,6 +295,7 @@ def heun_sample(
     reg_noise: Tensor | None = None,
     steps: int = 50,
     guidance_scale: float = 1.78,
+    reg_guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
     reg_timestep_shift: float = 1.0,
     img_denoising_interval: tuple[float, float] = (0.0, 1.0),
@@ -295,6 +311,7 @@ def heun_sample(
         reg_noise=reg_noise,
         steps=steps,
         guidance_scale=guidance_scale,
+        reg_guidance_scale=reg_guidance_scale,
         timestep_shift=timestep_shift,
         reg_timestep_shift=reg_timestep_shift,
         img_denoising_interval=img_denoising_interval,

@@ -15,6 +15,7 @@ class DDTOutput(NamedTuple):
     image: Tensor
     reg: Tensor | None = None
     repa: Tensor | None = None
+    reg_early: Tensor | None = None
 
 
 def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
@@ -426,6 +427,27 @@ class DDTFinalLayer(nn.Module):
         return image, reg
 
 
+class DDTInternalREGHead(nn.Module):
+    """Predict clean REG tokens from an intermediate encoder state."""
+
+    def __init__(self, hidden_size: int, output_size: int) -> None:
+        super().__init__()
+        self.norm = nn.RMSNorm(hidden_size, eps=1e-6)
+        self.modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size),
+        )
+        self.projection = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x: Tensor, conditioning: Tensor) -> Tensor:
+        if x.shape != conditioning.shape:
+            raise ValueError(
+                "internal REG states and conditioning must have equal shapes"
+            )
+        shift, scale = self.modulation(conditioning).chunk(2, dim=-1)
+        return self.projection(_modulate(self.norm(x), shift, scale))
+
+
 class REPAProjection(nn.Module):
     def __init__(
         self,
@@ -511,6 +533,14 @@ class DDT(nn.Module):
         if reg.enabled and not 1 <= reg.pool_size <= grid_size:
             raise ValueError(
                 "REG pool size must not exceed the model grid"
+            )
+        if reg.enabled and (
+            not isinstance(reg.internal_guidance_block, int)
+            or isinstance(reg.internal_guidance_block, bool)
+            or not 1 <= reg.internal_guidance_block <= config.depth
+        ):
+            raise ValueError(
+                "REG internal-guidance block must be within encoder depth"
             )
         if repa.enabled and not 1 <= repa.block <= config.depth:
             raise ValueError(
@@ -605,6 +635,11 @@ class DDT(nn.Module):
             patch_values,
             feature_dim if reg.enabled else None,
         )
+        self.internal_reg_head: DDTInternalREGHead | None = (
+            DDTInternalREGHead(config.hidden_size, feature_dim)
+            if reg.enabled
+            else None
+        )
         if reg.enabled:
             self.encoder_reg_projection: nn.Linear | None = nn.Linear(
                 feature_dim,
@@ -693,6 +728,11 @@ class DDT(nn.Module):
         if self.final_layer.reg_projection is not None:
             nn.init.zeros_(self.final_layer.reg_projection.weight)
             nn.init.zeros_(self.final_layer.reg_projection.bias)
+        if self.internal_reg_head is not None:
+            nn.init.zeros_(self.internal_reg_head.modulation[-1].weight)
+            nn.init.zeros_(self.internal_reg_head.modulation[-1].bias)
+            nn.init.zeros_(self.internal_reg_head.projection.weight)
+            nn.init.zeros_(self.internal_reg_head.projection.bias)
 
     def set_gradient_checkpointing(
         self,
@@ -827,6 +867,7 @@ class DDT(nn.Module):
         sequence = torch.cat(sequence_parts, dim=1)
 
         repa: Tensor | None = None
+        early_reg_state: Tensor | None = None
         for index, block in enumerate(
             self.encoder_blocks,
             start=1,
@@ -840,6 +881,11 @@ class DDT(nn.Module):
                 )
             else:
                 sequence = block(sequence)
+            if (
+                self.internal_reg_head is not None
+                and index == reg_config.internal_guidance_block
+            ):
+                early_reg_state = sequence[:, : self.num_reg_tokens]
             if (
                 return_repa
                 and self.repa_projection is not None
@@ -860,8 +906,18 @@ class DDT(nn.Module):
 
         encoded_primary = sequence[:, : self.num_primary_tokens]
         context_parts = []
+        reg_early: Tensor | None = None
         if self.num_reg_tokens:
-            assert reg_time_base is not None
+            assert (
+                reg_time_base is not None
+                and early_reg_state is not None
+                and self.internal_reg_head is not None
+            )
+            early_reg_context = F.silu(early_reg_state + reg_time_base)
+            reg_early = self.internal_reg_head(
+                early_reg_context,
+                early_reg_context,
+            )
             context_parts.append(
                 F.silu(
                     encoded_primary[:, : self.num_reg_tokens]
@@ -900,4 +956,9 @@ class DDT(nn.Module):
             self.num_reg_tokens,
         )
         image = self._unpatchify(image_tokens)
-        return DDTOutput(image=image, reg=reg, repa=repa)
+        return DDTOutput(
+            image=image,
+            reg=reg,
+            repa=repa,
+            reg_early=reg_early,
+        )

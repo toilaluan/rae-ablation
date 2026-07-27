@@ -16,7 +16,7 @@ def test_required_presets_load() -> None:
     baseline = load_config(ROOT / "configs/baseline-p16.yaml")
     paper = load_config(ROOT / "configs/reg-repa-p16.yaml")
     latent = load_config(ROOT / "configs/latent-baseline-p16.yaml")
-    assert baseline.schema_version == paper.schema_version == latent.schema_version == 7
+    assert baseline.schema_version == paper.schema_version == latent.schema_version == 8
     assert (
         baseline.train.optimizer.kind
         == paper.train.optimizer.kind
@@ -45,6 +45,8 @@ def test_required_presets_load() -> None:
     assert not baseline.model.features.enabled
     assert paper.model.features.reg.num_tokens == 16
     assert paper.model.features.reg.target_std == pytest.approx(0.53)
+    assert paper.model.features.reg.internal_guidance_block == 4
+    assert paper.sampling.reg_guidance_scale == pytest.approx(1.78)
     assert paper.model.features.repa.token_scope == "image_and_reg"
     assert latent.model.input_space == "flux2_latents"
     assert latent.model.in_channels == 128
@@ -159,12 +161,12 @@ def test_feature_combination_matrix(reg: bool, repa: bool, scope: str) -> None:
     config.validate()
 
 
-def test_reg_configuration_uses_shared_decoder() -> None:
+def test_reg_configuration_exposes_internal_guidance_block() -> None:
     config = ExperimentConfig()
     config.model.features.reg.enabled = True
     config.validate()
     assert not hasattr(config.model.features.reg, "head")
-    assert not hasattr(config.model.features.reg, "early_prediction")
+    assert config.model.features.reg.internal_guidance_block == 4
 
 
 @pytest.mark.parametrize(
@@ -200,6 +202,7 @@ def test_inactive_feature_sections_are_not_validated() -> None:
     config.model.features.encoder.model_name = ""
     config.model.features.encoder.feature_dim = -1
     config.model.features.reg.target_std = -1
+    config.model.features.reg.internal_guidance_block = -1
     config.train.reg_timestep_scale = -1
     config.model.features.repa.block = -1
     config.model.features.repa.token_scope = "retired"
@@ -242,14 +245,14 @@ def test_clean_break_rejects_old_and_unknown_configs(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="cannot be migrated"):
         load_checkpoint_config(old_checkpoint)
 
-    schema_v6 = tmp_path / "schema-v6.yaml"
-    schema_v6.write_text("schema_version: 6\n")
-    with pytest.raises(ValueError, match="schema_version: 7"):
-        load_config(schema_v6)
+    schema_v7 = tmp_path / "schema-v7.yaml"
+    schema_v7.write_text("schema_version: 7\n")
+    with pytest.raises(ValueError, match="schema_version: 8"):
+        load_config(schema_v7)
 
     unknown = tmp_path / "unknown.yaml"
-    unknown.write_text("schema_version: 7\nretired_experiment: true\n")
-    with pytest.raises(ValueError, match="invalid schema-v7"):
+    unknown.write_text("schema_version: 8\nretired_experiment: true\n")
+    with pytest.raises(ValueError, match="invalid schema-v8"):
         load_config(unknown)
 
 
@@ -272,6 +275,22 @@ def test_sampling_intervals_and_reg_shift_candidates_validate() -> None:
     config.sampling.reg_denoising_interval = [0.01, 0.02]
     config.sampling.sampling_steps = 10
     with pytest.raises(ValueError, match="collapses"):
+        config.validate()
+
+    config.sampling.reg_denoising_interval = [0.0, 1.0]
+    config.sampling.reg_guidance_scale = float("nan")
+    with pytest.raises(ValueError, match="reg_guidance_scale"):
+        config.validate()
+
+
+@pytest.mark.parametrize("block", [0, 13, True, 1.5])
+def test_internal_guidance_block_must_be_in_active_encoder(
+    block: object,
+) -> None:
+    config = ExperimentConfig()
+    config.model.features.reg.enabled = True
+    config.model.features.reg.internal_guidance_block = block  # type: ignore[assignment]
+    with pytest.raises(ValueError, match="internal_guidance_block"):
         config.validate()
 
 

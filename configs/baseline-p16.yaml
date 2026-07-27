@@ -1,4 +1,4 @@
-schema_version: 7
+schema_version: 8
 data:
   repository: benjamin-paine/imagenet-1k-256x256
   revision: 1bd0400450249a7fe90c0aece37d0d03e7ea956a
@@ -42,6 +42,7 @@ model:
       pool_size: 4
       target_std: 0.53
       loss_weight: 0.03
+      internal_guidance_block: 4
     repa:
       enabled: false
       block: 4
@@ -78,6 +79,7 @@ sampling:
   sampling_steps: 50
   solver: euler
   guidance_scale: 1.78
+  reg_guidance_scale: 1.78
   timestep_shift: 1.0
   reg_timestep_shifts: [1.0]
   img_denoising_interval: [0.0, 1.0]

@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=Path("configs/baseline-p16.yaml"),
-        help="schema-v7 experiment YAML (default: configs/baseline-p16.yaml)",
+        help="schema-v8 experiment YAML (default: configs/baseline-p16.yaml)",
     )
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
@@ -67,6 +67,7 @@ def main() -> None:
             sampling_steps=sampling_config.sampling_steps,
             solver=sampling_config.solver,
             guidance_scale=sampling_config.guidance_scale,
+            reg_guidance_scale=sampling_config.reg_guidance_scale,
             timestep_shift=sampling_config.timestep_shift,
             reg_timestep_shift=reg_shift,
             img_denoising_interval=tuple(

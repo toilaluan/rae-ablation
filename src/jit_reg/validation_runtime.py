@@ -152,6 +152,7 @@ def validate_ema(
                     reg_noise=reg_noise,
                     steps=parameters.sampling_steps,
                     guidance_scale=parameters.guidance_scale,
+                    reg_guidance_scale=parameters.reg_guidance_scale,
                     timestep_shift=parameters.timestep_shift,
                     reg_timestep_shift=parameters.reg_timestep_shift,
                     img_denoising_interval=parameters.img_denoising_interval,

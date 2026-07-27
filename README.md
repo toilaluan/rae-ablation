@@ -6,7 +6,7 @@ denoises DINOv3 representation tokens, while REPA aligns an intermediate DDT
 sequence with frozen DINOv3 targets. Pixel/latent input and REG/REPA are
 independent choices.
 
-This repository uses configuration schema v7. Older configs, checkpoints,
+This repository uses configuration schema v8. Older configs, checkpoints,
 training states, and sampling manifests are intentionally incompatible.
 Schema-v3 REG/REPA caches remain reusable.
 
@@ -33,6 +33,14 @@ states receive their matching base-time embeddings and become token-aligned
 decoder conditioning. Fresh REG and image embeddings are decoded jointly with
 adaLN-Zero. One final normalization/modulation is shared by both outputs, with
 only the dimension-specific linear projections kept separate.
+
+Following the
+[RAEv2 internal-guidance head](https://github.com/nanovisionx/RAEv2/blob/main/src/stage2/models/DDT.py#L212),
+REG also has a zero-initialized head at encoder block 4. It predicts clean REG
+tokens before the shared decoder and is trained with the same
+velocity-equivalent clean-prediction loss as the final REG output. Sampling
+treats the early prediction as the internal unconditional estimate:
+`early + reg_guidance_scale * (final - early)`.
 
 Image and REG time use independent Gaussian Fourier embedders. Conditioning
 token counts are configured with `model.num_img_t_tokens`,
@@ -296,6 +304,7 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
   --solver heun \
   --sampling-steps 50 \
   --guidance-scale 2.0 \
+  --reg-guidance-scale 1.78 \
   --reg-timestep-shift 1.0
 ```
 
@@ -347,7 +356,7 @@ Run any command with `--help` for its concise parser-generated reference.
 
 | Argument | Type/default | Description |
 | --- | --- | --- |
-| `--config` | path; `configs/latent-baseline-p16.yaml` | Schema-v7 latent experiment configuration. The input space must be `flux2_latents`. |
+| `--config` | path; `configs/latent-baseline-p16.yaml` | Schema-v8 latent experiment configuration. The input space must be `flux2_latents`. |
 | `--override KEY=VALUE` | repeatable; none | Structured configuration override. Common cache controls are `data.max_samples`, `data.workers`, `vae.micro_batch_size`, `vae.cache.directory`, `vae.cache.batch_size`, and `vae.cache.log_interval`. |
 
 The command writes under `vae.cache.directory/<fingerprint>` and never
@@ -357,7 +366,7 @@ overwrites an incompatible cache.
 
 | Argument | Type/default | Description |
 | --- | --- | --- |
-| `--config` | path; `configs/baseline-p16.yaml` | Schema-v7 experiment configuration. REG or REPA must be enabled. |
+| `--config` | path; `configs/baseline-p16.yaml` | Schema-v8 experiment configuration. REG or REPA must be enabled. |
 | `--override KEY=VALUE` | repeatable; none | Structured override controlling active components, dataset limits, cache directory, batch size, logging, or preprocessing identity. |
 
 The command writes independent `reg/<fingerprint>` and `repa/<fingerprint>`
@@ -367,7 +376,7 @@ components beneath `feature_cache.directory`.
 
 | Argument | Type/default | Description |
 | --- | --- | --- |
-| `--config` | path; `configs/baseline-p16.yaml` | Schema-v7 experiment configuration. |
+| `--config` | path; `configs/baseline-p16.yaml` | Schema-v8 experiment configuration. |
 | `--override KEY=VALUE` | repeatable; none | Structured override applied before final validation. |
 | `--output` | path; none | Run root. Rewrites checkpoint and validation-plan paths beneath this directory. Without it, configured paths are used directly. |
 | `--resume` | checkpoint path; none | Resume model, EMA, optimizer, RNG streams, epoch/step, validation state, and cache identities from a compatible checkpoint directory. |
@@ -386,6 +395,7 @@ validation is part of the run.
 | `--sampling-steps` | integer; checkpoint value | Number of global Euler/Heun solver steps. |
 | `--solver` | `euler` or `heun`; checkpoint value | ODE solver. Heun uses a final Euler step. |
 | `--guidance-scale` | float; checkpoint value | Classifier-free guidance scale. |
+| `--reg-guidance-scale` | float; checkpoint value | Internal REG guidance scale between the early and final clean-token predictions. |
 | `--timestep-shift` | positive float; checkpoint value | Image/latent local-clock shift. |
 | `--reg-timestep-shift` | positive float; first checkpoint candidate | REG local-clock shift used by standalone sampling. |
 | `--img-denoising-interval START END` | two floats; checkpoint value | Fractional global interval assigned to image/latent denoising. |
@@ -463,6 +473,7 @@ model:
       target_std: 0.53
       spatial_rope: true
       loss_weight: 0.03
+      internal_guidance_block: 4
     repa:
       enabled: true
       block: 4
@@ -473,4 +484,7 @@ model:
 
 Image/latent and REG times are independent sigmoid-normal draws. Sampling uses
 one global solver loop with independent local clocks and quantized denoising
-intervals.
+intervals. Image CFG uses class-conditional and null-class image predictions
+inside its configured window. REG instead uses early and final
+class-conditional REG predictions throughout the REG denoising interval;
+null-class REG predictions are ignored.

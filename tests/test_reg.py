@@ -124,12 +124,15 @@ def test_reg_velocity_loss_uses_reg_timestep() -> None:
         clean_reg=clean_reg,
         reg_noise=reg_noise,
         reg_prediction=reg_prediction,
+        reg_early_prediction=reg_prediction,
         reg_timestep=reg_time,
         reg_weight=1,
         repa_weight=0,
     )
     assert losses.image_velocity == 0
     assert losses.reg_velocity == pytest.approx((1 / 0.75) ** 2)
+    assert losses.reg_early_velocity == pytest.approx((1 / 0.75) ** 2)
+    assert losses.total == pytest.approx(2 * (1 / 0.75) ** 2)
 
 
 def test_reg_metrics_are_generic() -> None:
@@ -143,6 +146,7 @@ def test_reg_metrics_are_generic() -> None:
         clean_reg=clean_reg,
         reg_noise=torch.zeros_like(clean_reg),
         reg_prediction=prediction,
+        reg_early_prediction=prediction,
         reg_timestep=torch.tensor([0.5]),
     )
     assert losses.reg_x0_mse == pytest.approx(2.0)
@@ -178,6 +182,11 @@ class RecordingCleanModel(nn.Module):
         return DDTOutput(
             image=torch.full_like(image, 0.25),
             reg=torch.full_like(noisy_reg, -0.5) if noisy_reg is not None else None,
+            reg_early=(
+                torch.full_like(noisy_reg, -0.5)
+                if noisy_reg is not None
+                else None
+            ),
         )
 
 
@@ -250,4 +259,61 @@ def test_noisy_interpolation_uses_its_own_timestep() -> None:
     assert torch.allclose(
         noisy_interpolate(clean, noise, torch.tensor([0.25, 0.75])),
         torch.tensor([[0.25], [0.75]]),
+    )
+
+
+class DistinctGuidanceModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(num_classes=3)
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        timestep: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        noisy_reg: torch.Tensor | None = None,
+        reg_timestep: torch.Tensor | None = None,
+        return_repa: bool = False,
+    ) -> DDTOutput:
+        del timestep, reg_timestep, return_repa
+        conditional = labels != self.config.num_classes
+        image_values = torch.where(conditional, 2.0, 0.0)
+        final_values = torch.where(conditional, 3.0, 100.0)
+        early_values = torch.where(conditional, 1.0, 200.0)
+        assert noisy_reg is not None
+        return DDTOutput(
+            image=image_values[:, None, None, None].expand_as(image),
+            reg=final_values[:, None, None].expand_as(noisy_reg),
+            reg_early=early_values[:, None, None].expand_as(noisy_reg),
+        )
+
+
+@pytest.mark.parametrize(("cfg_interval", "expected_image"), [((0, 1), 4.0), ((1, 1), 2.0)])
+@pytest.mark.parametrize(("scale", "expected_reg"), [(0.0, 1.0), (1.0, 3.0), (1.78, 4.56)])
+def test_reg_internal_guidance_scale_identities(
+    scale: float,
+    expected_reg: float,
+    cfg_interval: tuple[int, int],
+    expected_image: float,
+) -> None:
+    output = ode_sample(
+        DistinctGuidanceModel(),
+        torch.zeros(1, 1, 1, 1),
+        torch.tensor([1]),
+        reg_noise=torch.zeros(1, 1, 1),
+        steps=1,
+        guidance_scale=2,
+        reg_guidance_scale=scale,
+        cfg_interval=cfg_interval,
+    )
+    assert isinstance(output, ODESample)
+    assert torch.allclose(
+        output.image,
+        torch.full_like(output.image, expected_image),
+    )
+    assert torch.allclose(
+        output.reg,
+        torch.full_like(output.reg, expected_reg),
     )

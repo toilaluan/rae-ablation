@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 7
+CONFIG_SCHEMA_VERSION = 8
 
 FLUX2_SPATIAL_COMPRESSION = 16
 FLUX2_LATENT_CHANNELS = 128
@@ -32,6 +32,7 @@ class REGConfig:
     target_std: float = 0.53
     spatial_rope: bool = True
     loss_weight: float = 0.03
+    internal_guidance_block: int = 4
 
     @property
     def num_tokens(self) -> int:
@@ -181,6 +182,7 @@ class SamplingConfig:
     sampling_steps: int = 50
     solver: str = "euler"
     guidance_scale: float = 1.78
+    reg_guidance_scale: float = 1.78
     timestep_shift: float = 1.0
     reg_timestep_shifts: list[float] = field(default_factory=lambda: [1.0])
     img_denoising_interval: list[float] = field(
@@ -367,6 +369,15 @@ class ExperimentConfig:
                 )
             if reg.loss_weight < 0:
                 raise ValueError("model.features.reg.loss_weight cannot be negative")
+            if (
+                not isinstance(reg.internal_guidance_block, int)
+                or isinstance(reg.internal_guidance_block, bool)
+                or not 1 <= reg.internal_guidance_block <= m.depth
+            ):
+                raise ValueError(
+                    "model.features.reg.internal_guidance_block must be within "
+                    "model.depth"
+                )
         if features.repa.enabled:
             repa = features.repa
             if not 1 <= repa.block <= m.depth:
@@ -462,6 +473,8 @@ class ExperimentConfig:
             raise ValueError("sampling.num_samples must be class balanced")
         if not math.isfinite(sampling.guidance_scale):
             raise ValueError("sampling.guidance_scale must be finite")
+        if not math.isfinite(sampling.reg_guidance_scale):
+            raise ValueError("sampling.reg_guidance_scale must be finite")
         if not math.isfinite(sampling.timestep_shift) or sampling.timestep_shift <= 0:
             raise ValueError("sampling.timestep_shift must be finite and positive")
         shifts = sampling.reg_timestep_shifts

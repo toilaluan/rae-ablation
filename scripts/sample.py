@@ -36,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sampling-steps", type=int)
     parser.add_argument("--solver", choices=("euler", "heun"))
     parser.add_argument("--guidance-scale", type=float)
+    parser.add_argument("--reg-guidance-scale", type=float)
     parser.add_argument("--timestep-shift", type=float)
     parser.add_argument("--reg-timestep-shift", type=float)
     parser.add_argument(
@@ -75,6 +76,9 @@ def main() -> None:
         solver=str(_value(args.solver, defaults.solver)),
         guidance_scale=float(
             _value(args.guidance_scale, defaults.guidance_scale)
+        ),
+        reg_guidance_scale=float(
+            _value(args.reg_guidance_scale, defaults.reg_guidance_scale)
         ),
         timestep_shift=float(
             _value(args.timestep_shift, defaults.timestep_shift)
@@ -150,6 +154,7 @@ def main() -> None:
                 reg_noise=reg_noise,
                 steps=parameters.sampling_steps,
                 guidance_scale=parameters.guidance_scale,
+                reg_guidance_scale=parameters.reg_guidance_scale,
                 timestep_shift=parameters.timestep_shift,
                 reg_timestep_shift=parameters.reg_timestep_shift,
                 img_denoising_interval=parameters.img_denoising_interval,

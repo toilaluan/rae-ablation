@@ -15,9 +15,12 @@ class JiTLoss(NamedTuple):
     total: Tensor
     image_velocity: Tensor
     reg_velocity: Tensor
+    reg_early_velocity: Tensor
     repa: Tensor
     reg_x0_mse: Tensor
     reg_x0_cosine: Tensor
+    reg_early_x0_mse: Tensor
+    reg_early_x0_cosine: Tensor
 
 
 def sample_timesteps(
@@ -113,6 +116,7 @@ def jit_losses(
     clean_reg: Tensor | None = None,
     reg_noise: Tensor | None = None,
     reg_prediction: Tensor | None = None,
+    reg_early_prediction: Tensor | None = None,
     reg_timestep: Tensor | None = None,
     repa_prediction: Tensor | None = None,
     repa_target: Tensor | None = None,
@@ -123,44 +127,76 @@ def jit_losses(
         clean_image, image_noise, timestep, image_prediction
     )
     zero = image_loss.new_zeros(())
-    reg_values = (clean_reg, reg_noise, reg_prediction, reg_timestep)
+    reg_values = (
+        clean_reg,
+        reg_noise,
+        reg_prediction,
+        reg_early_prediction,
+        reg_timestep,
+    )
     if any(value is not None for value in reg_values):
         if not all(value is not None for value in reg_values):
             raise ValueError(
-                "clean REG tokens, REG noise, REG prediction, and REG timestep "
-                "must be provided together"
+                "clean REG tokens, REG noise, final and early REG predictions, "
+                "and REG timestep must be provided together"
             )
         assert (
             clean_reg is not None
             and reg_noise is not None
             and reg_prediction is not None
+            and reg_early_prediction is not None
             and reg_timestep is not None
         )
         reg_loss = clean_prediction_velocity_loss(
             clean_reg, reg_noise, reg_timestep, reg_prediction
         )
+        reg_early_loss = clean_prediction_velocity_loss(
+            clean_reg,
+            reg_noise,
+            reg_timestep,
+            reg_early_prediction,
+        )
         reg_x0_mse = F.mse_loss(reg_prediction.float(), clean_reg.float())
         reg_x0_cosine = F.cosine_similarity(
             reg_prediction.float(), clean_reg.float(), dim=-1
         ).mean()
+        reg_early_x0_mse = F.mse_loss(
+            reg_early_prediction.float(),
+            clean_reg.float(),
+        )
+        reg_early_x0_cosine = F.cosine_similarity(
+            reg_early_prediction.float(),
+            clean_reg.float(),
+            dim=-1,
+        ).mean()
     else:
         reg_loss = zero
+        reg_early_loss = zero
         reg_x0_mse = zero
         reg_x0_cosine = zero
+        reg_early_x0_mse = zero
+        reg_early_x0_cosine = zero
     if repa_prediction is None and repa_target is None:
         repa_loss = zero
     elif repa_prediction is None or repa_target is None:
         raise ValueError("REPA prediction and target must be provided together")
     else:
         repa_loss = negative_cosine_repa_loss(repa_prediction, repa_target)
-    total = image_loss + reg_weight * reg_loss + repa_weight * repa_loss
+    total = (
+        image_loss
+        + reg_weight * (reg_loss + reg_early_loss)
+        + repa_weight * repa_loss
+    )
     return JiTLoss(
         total,
         image_loss,
         reg_loss,
+        reg_early_loss,
         repa_loss,
         reg_x0_mse,
         reg_x0_cosine,
+        reg_early_x0_mse,
+        reg_early_x0_cosine,
     )
 
 

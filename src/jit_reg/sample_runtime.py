@@ -27,6 +27,7 @@ class SamplingParameters:
     sampling_steps: int = 50
     solver: str = "euler"
     guidance_scale: float = 1.78
+    reg_guidance_scale: float = 1.78
     timestep_shift: float = 1.0
     reg_timestep_shift: float = 1.0
     img_denoising_interval: tuple[float, float] = (0.0, 1.0)
@@ -70,13 +71,15 @@ class SamplingParameters:
         denoising_step_bounds(self.reg_denoising_interval, self.sampling_steps)
         if not math.isfinite(self.guidance_scale):
             raise ValueError("guidance scale must be finite")
+        if not math.isfinite(self.reg_guidance_scale):
+            raise ValueError("REG guidance scale must be finite")
         if not 0 <= self.cfg_start <= self.cfg_end <= 1:
             raise ValueError("CFG interval must satisfy 0 <= start <= end <= 1")
 
 
 GenerateBatch = Callable[[Tensor, Tensor, Tensor], Tensor]
-SAMPLING_MANIFEST_SCHEMA_VERSION = 14
-FEATURE_SCHEMA_VERSION = 7
+SAMPLING_MANIFEST_SCHEMA_VERSION = 15
+FEATURE_SCHEMA_VERSION = 8
 
 
 def _float_slug(value: float) -> str:
@@ -90,6 +93,7 @@ def sampling_output_name(sample_count: int, parameters: SamplingParameters) -> s
     return (
         f"samples-{parameters.solver}-n{sample_count}-steps{parameters.sampling_steps}"
         f"-cfg{_float_slug(parameters.guidance_scale)}"
+        f"-regguide{_float_slug(parameters.reg_guidance_scale)}"
         f"-shift{_float_slug(parameters.timestep_shift)}"
         f"-regshift{_float_slug(parameters.reg_timestep_shift)}"
         f"-imgint{_float_slug(parameters.img_denoising_interval[0])}"
@@ -209,6 +213,7 @@ def _manifest_base(
             "sampling_steps": parameters.sampling_steps,
             "sampling_nfe": parameters.sampling_nfe,
             "guidance_scale": parameters.guidance_scale,
+            "reg_guidance_scale": parameters.reg_guidance_scale,
             "timestep_shift": parameters.timestep_shift,
             "reg_timestep_shift": parameters.reg_timestep_shift,
             "img_denoising_interval": list(parameters.img_denoising_interval),

@@ -28,7 +28,7 @@ from jit_reg.validation_runtime import validate_ema
 
 ROOT = Path(__file__).resolve().parents[1]
 FEATURE_SCHEMA = {
-    "schema_version": 7,
+    "schema_version": 8,
     "encoder": {},
     "reg": {"enabled": False},
     "repa": {"enabled": False},
@@ -46,11 +46,12 @@ def test_sampling_output_name_includes_asynchronous_reg_schedule() -> None:
             reg_denoising_interval=(0.0, 2 / 3),
         ),
     )
+    assert "-regguide1p78-" in name
     assert "-shift2p0-regshift0p5-imgint" in name
     assert "-regint0p0-" in name
 
 
-def test_sampling_manifest_has_v6_features_and_rejects_old_schema(
+def test_sampling_manifest_has_v8_features_and_rejects_old_schema(
     tmp_path: Path,
 ) -> None:
     plan = create_validation_plan(4, 2, 2, seed=4)
@@ -88,17 +89,18 @@ def test_sampling_manifest_has_v6_features_and_rejects_old_schema(
     )
     assert archive.is_file()
     manifest = json.loads((output / "samples.json").read_text())
-    assert manifest["schema_version"] == 14
+    assert manifest["schema_version"] == 15
     assert manifest["feature_schema"] == FEATURE_SCHEMA
     assert manifest["patch_size"] == 4
     assert manifest["jit_grid_size"] == 2
     assert manifest["sampling"]["reg_timestep_shift"] == 0.5
+    assert manifest["sampling"]["reg_guidance_scale"] == pytest.approx(1.78)
     assert manifest["sampling"]["img_denoising_steps"] == 1
     assert manifest["sampling"]["reg_denoising_steps"] == 1
 
     old = tmp_path / "old"
     old.mkdir()
-    (old / "samples.json").write_text(json.dumps({"schema_version": 13}))
+    (old / "samples.json").write_text(json.dumps({"schema_version": 14}))
     with pytest.raises(ValueError, match="old manifests"):
         sample_to_archive(
             output_dir=old,
@@ -340,6 +342,7 @@ def test_standalone_sampling_inherits_defaults_and_evaluate_writes_artifact(
     assert isinstance(parameters, SamplingParameters)
     assert parameters.batch_size == 3
     assert parameters.sampling_steps == 7
+    assert parameters.reg_guidance_scale == pytest.approx(1.78)
     output = Path(captured["output_dir"])  # type: ignore[arg-type]
     assert (output / "evaluation.json").is_file()
 
