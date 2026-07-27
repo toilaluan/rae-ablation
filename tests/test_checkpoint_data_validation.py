@@ -12,13 +12,12 @@ from torch.utils.data import TensorDataset
 from jit_reg.checkpoint import EMA, CheckpointManager
 from jit_reg.checkpoint_bundle import load_checkpoint_bundle
 from jit_reg.config import (
+    DDTDecoderConfig,
     EncoderConfig,
     ExperimentConfig,
     FeaturesConfig,
     ModelConfig,
     REGConfig,
-    REGEarlyPredictionConfig,
-    REGHeadConfig,
     REPAConfig,
     WandbConfig,
     load_config,
@@ -30,7 +29,7 @@ from jit_reg.feature_cache import (
     component_path,
     component_spec,
 )
-from jit_reg.model.sit import SiT
+from jit_reg.model.ddt import DDT
 from jit_reg.optim import build_optimizer
 from jit_reg.reg import FeatureTargets
 from jit_reg.rng import RNGStreams
@@ -44,31 +43,26 @@ ROOT = Path(__file__).resolve().parents[1]
 def tiny_experiment(kind: str = "baseline") -> ExperimentConfig:
     reg = kind != "baseline"
     repa = kind == "paper"
-    early = kind == "early"
     config = ExperimentConfig(
         model=ModelConfig(
             image_size=16,
             patch_size=8,
             hidden_size=16,
-            depth=2 if early else 1,
+            depth=1,
             num_heads=4,
             mlp_ratio=2,
             num_classes=2,
+            decoder=DDTDecoderConfig(
+                hidden_size=32,
+                depth=1,
+                num_heads=4,
+                mlp_ratio=2,
+            ),
             features=FeaturesConfig(
                 encoder=EncoderConfig(feature_dim=8),
                 reg=REGConfig(
                     enabled=reg,
                     pool_size=2,
-                    head=REGHeadConfig(
-                        kind="wide_mlp" if early else "standard",
-                        hidden_size=32,
-                        depth=2,
-                        mlp_ratio=2,
-                    ),
-                    early_prediction=REGEarlyPredictionConfig(
-                        block=1 if early else None,
-                        projection_hidden_size=32,
-                    ),
                 ),
                 repa=REPAConfig(
                     enabled=repa,
@@ -128,9 +122,9 @@ def save_checkpoint(
     *,
     fid: float | None = None,
     reg_timestep_shift: float | None = None,
-) -> tuple[CheckpointManager, Path, SiT]:
+) -> tuple[CheckpointManager, Path, DDT]:
     config = tiny_experiment()
-    model = SiT(config.model)
+    model = DDT(config.model)
     plan = create_validation_plan(2, 2, 2, seed=7)
     plan_path = tmp_path / "plan.pt"
     plan.save(plan_path)
@@ -164,13 +158,13 @@ def test_best_fid_metadata_tracks_reg_timestep_shift(tmp_path: Path) -> None:
     }
 
 
-def test_v4_checkpoint_bundle_and_training_resume(tmp_path: Path) -> None:
+def test_v7_checkpoint_bundle_and_training_resume(tmp_path: Path) -> None:
     manager, checkpoint, model = save_checkpoint(tmp_path)
     metadata = json.loads((checkpoint / "metadata.json").read_text())
-    assert metadata["schema_version"] == 5
+    assert metadata["schema_version"] == 7
     training = torch.load(checkpoint / "training.pt", weights_only=False)
-    assert training["schema_version"] == 5
-    restored = SiT(model.config)
+    assert training["schema_version"] == 7
+    restored = DDT(model.config)
     resumed = manager.load(
         checkpoint,
         restored,
@@ -181,7 +175,7 @@ def test_v4_checkpoint_bundle_and_training_resume(tmp_path: Path) -> None:
     assert resumed.epoch == 1
     bundle = load_checkpoint_bundle(tmp_path / "checkpoints")
     assert bundle.directory == checkpoint.resolve()
-    assert bundle.config.schema_version == 5
+    assert bundle.config.schema_version == 7
 
 
 def test_old_training_resume_is_rejected_before_model_mutation(
@@ -190,13 +184,13 @@ def test_old_training_resume_is_rejected_before_model_mutation(
     manager, checkpoint, model = save_checkpoint(tmp_path)
     training_path = checkpoint / "training.pt"
     training = torch.load(training_path, weights_only=False)
-    training["schema_version"] = 2
+    training["schema_version"] = 6
     torch.save(training, training_path)
-    restored = SiT(model.config)
+    restored = DDT(model.config)
     before = {
         name: value.detach().clone() for name, value in restored.state_dict().items()
     }
-    with pytest.raises(ValueError, match="incompatible with schema v5"):
+    with pytest.raises(ValueError, match="incompatible with schema v7"):
         manager.load(checkpoint, restored, EMA(restored))
     assert all(
         torch.equal(value, before[name])
@@ -212,24 +206,21 @@ def test_current_checkpoint_config_uses_structured_defaults(
     values = json.loads(config_path.read_text())
     reg = values["model"]["features"]["reg"]
     reg.pop("spatial_rope")
-    reg["early_prediction"].pop("reinjection_mode")
+    values["model"]["decoder"].pop("mlp_ratio")
     values["train"]["micro_batch_size"] = 1
     config_path.write_text(json.dumps(values))
     bundle = load_checkpoint_bundle(checkpoint)
     assert bundle.config.model.features.reg.spatial_rope
-    assert (
-        bundle.config.model.features.reg.early_prediction.reinjection_mode
-        == "replace"
-    )
+    assert bundle.config.model.decoder.mlp_ratio == pytest.approx(4.0)
     assert not hasattr(bundle.config.train, "micro_batch_size")
 
 
 def test_old_checkpoint_schema_is_explicitly_rejected(tmp_path: Path) -> None:
     manager, checkpoint, model = save_checkpoint(tmp_path)
     metadata = json.loads((checkpoint / "metadata.json").read_text())
-    metadata["schema_version"] = 1
+    metadata["schema_version"] = 6
     (checkpoint / "metadata.json").write_text(json.dumps(metadata))
-    restored = SiT(model.config)
+    restored = DDT(model.config)
     with pytest.raises(ValueError, match="old checkpoints"):
         manager.load(checkpoint, restored, EMA(restored))
     with pytest.raises(ValueError, match="old checkpoints"):
@@ -245,7 +236,7 @@ def test_rng_streams_checkpoint_independent_reg_timing() -> None:
     assert torch.equal(first, second)
     old = dict(saved)
     old.pop("reg_timesteps")
-    with pytest.raises(ValueError, match="incompatible with schema v5"):
+    with pytest.raises(ValueError, match="incompatible with schema v7"):
         streams.load_state_dict(old)
 
 
@@ -254,7 +245,6 @@ def test_rng_streams_checkpoint_independent_reg_timing() -> None:
     [
         ("baseline", False),
         ("paper", False),
-        ("early", False),
         ("paper", True),
     ],
 )
@@ -266,7 +256,6 @@ def test_required_preset_shapes_run_one_training_step(
     preset = {
         "baseline": "baseline-p16.yaml",
         "paper": "reg-repa-p16.yaml",
-        "early": "early-reg-p16.yaml",
     }[kind]
     config = load_config(
         ROOT / "configs" / preset,
@@ -277,18 +266,13 @@ def test_required_preset_shapes_run_one_training_step(
             "model.depth=2",
             "model.num_heads=4",
             "model.mlp_ratio=2",
+            "model.decoder.hidden_size=32",
+            "model.decoder.depth=1",
+            "model.decoder.num_heads=4",
+            "model.decoder.mlp_ratio=2",
             "model.num_classes=2",
             "model.features.encoder.feature_dim=8",
             "model.features.reg.pool_size=2",
-            "model.features.reg.head.hidden_size=32",
-            "model.features.reg.head.depth=2",
-            "model.features.reg.head.mlp_ratio=2",
-            "model.features.reg.early_prediction.projection_hidden_size=32",
-            (
-                "model.features.reg.early_prediction.block=1"
-                if kind == "early"
-                else "model.features.reg.early_prediction.block=null"
-            ),
             "model.features.repa.block=1",
             "model.features.repa.projection_hidden_size=16",
             "compile.enabled=false",
@@ -329,7 +313,7 @@ def test_required_preset_shapes_run_one_training_step(
     )
     streams = RNGStreams.create(3)
     loader, sampler = make_train_loader(dataset, config, streams)
-    model = SiT(config.model)
+    model = DDT(config.model)
     logger = RecordingLogger()
     state = train(
         canonical_model=model,

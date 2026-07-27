@@ -15,7 +15,7 @@ from .checkpoint import EMA, CheckpointManager, should_checkpoint
 from .config import ExperimentConfig
 from .feature_cache import FeatureCache
 from .latent_cache import LatentCache
-from .model.sit import classifier_free_labels
+from .model.ddt import classifier_free_labels
 from .objective import (
     jit_losses,
     noisy_interpolate,

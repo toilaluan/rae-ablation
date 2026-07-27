@@ -28,7 +28,7 @@ from jit_reg.validation_runtime import validate_ema
 
 ROOT = Path(__file__).resolve().parents[1]
 FEATURE_SCHEMA = {
-    "schema_version": 5,
+    "schema_version": 7,
     "encoder": {},
     "reg": {"enabled": False},
     "repa": {"enabled": False},
@@ -50,7 +50,7 @@ def test_sampling_output_name_includes_asynchronous_reg_schedule() -> None:
     assert "-regint0p0-" in name
 
 
-def test_sampling_manifest_has_v5_features_and_rejects_old_schema(
+def test_sampling_manifest_has_v6_features_and_rejects_old_schema(
     tmp_path: Path,
 ) -> None:
     plan = create_validation_plan(4, 2, 2, seed=4)
@@ -79,7 +79,8 @@ def test_sampling_manifest_has_v5_features_and_rejects_old_schema(
         num_classes=2,
         image_size=8,
         patch_size=4,
-        model_variant="SiT-Tiny/4",
+        grid_size=2,
+        model_variant="DDT-Tiny/4",
         feature_schema=FEATURE_SCHEMA,
         checkpoint_hash="abc",
         parameters=parameters,
@@ -87,15 +88,17 @@ def test_sampling_manifest_has_v5_features_and_rejects_old_schema(
     )
     assert archive.is_file()
     manifest = json.loads((output / "samples.json").read_text())
-    assert manifest["schema_version"] == 13
+    assert manifest["schema_version"] == 14
     assert manifest["feature_schema"] == FEATURE_SCHEMA
+    assert manifest["patch_size"] == 4
+    assert manifest["jit_grid_size"] == 2
     assert manifest["sampling"]["reg_timestep_shift"] == 0.5
     assert manifest["sampling"]["img_denoising_steps"] == 1
     assert manifest["sampling"]["reg_denoising_steps"] == 1
 
     old = tmp_path / "old"
     old.mkdir()
-    (old / "samples.json").write_text(json.dumps({"schema_version": 12}))
+    (old / "samples.json").write_text(json.dumps({"schema_version": 13}))
     with pytest.raises(ValueError, match="old manifests"):
         sample_to_archive(
             output_dir=old,
@@ -104,7 +107,8 @@ def test_sampling_manifest_has_v5_features_and_rejects_old_schema(
             num_classes=2,
             image_size=8,
             patch_size=4,
-            model_variant="SiT-Tiny/4",
+            grid_size=2,
+            model_variant="DDT-Tiny/4",
             feature_schema=FEATURE_SCHEMA,
             checkpoint_hash="abc",
             parameters=parameters,
@@ -164,7 +168,7 @@ def test_validation_fid_label_uses_actual_count(
             super().__init__()
             self.weight = nn.Parameter(torch.zeros(()))
 
-    monkeypatch.setattr(runtime, "SiT", TinyModel)
+    monkeypatch.setattr(runtime, "DDT", TinyModel)
     monkeypatch.setattr(runtime, "compile_model_regions", lambda model, config: model)
     monkeypatch.setattr(runtime, "ode_sample", lambda model, noise, labels, **kwargs: noise)
     monkeypatch.setattr(runtime, "evaluate_npz", lambda *args, **kwargs: {"FID": 12.5})
@@ -217,7 +221,7 @@ def test_validation_sweeps_reg_shifts_and_runs_final_once(
             return {"FID": 9.0}
         return {"FID": 3.0 if "regshift0p5" in name else 2.0}
 
-    monkeypatch.setattr(runtime, "SiT", TinyModel)
+    monkeypatch.setattr(runtime, "DDT", TinyModel)
     monkeypatch.setattr(runtime, "compile_model_regions", lambda model, config: model)
     monkeypatch.setattr(runtime, "ode_sample", lambda model, noise, labels, **kwargs: noise)
     monkeypatch.setattr(runtime, "evaluate_npz", fake_evaluate)
@@ -275,6 +279,10 @@ def test_standalone_sampling_inherits_defaults_and_evaluate_writes_artifact(
     config.model.hidden_size = 16
     config.model.depth = 1
     config.model.num_heads = 4
+    config.model.decoder.hidden_size = 32
+    config.model.decoder.depth = 1
+    config.model.decoder.num_heads = 4
+    config.model.decoder.mlp_ratio = 2
     config.model.num_classes = 2
     config.compile.enabled = False
     config.sampling.num_samples = 4
@@ -313,7 +321,7 @@ def test_standalone_sampling_inherits_defaults_and_evaluate_writes_artifact(
     )
     monkeypatch.setattr(module, "broadcast_string", lambda value, rank: value)
     monkeypatch.setattr(module, "load_file", lambda *args, **kwargs: {})
-    monkeypatch.setattr(module, "SiT", EmptyModel)
+    monkeypatch.setattr(module, "DDT", EmptyModel)
     monkeypatch.setattr(module, "compile_model_regions", lambda model, config: model)
     monkeypatch.setattr(module, "sample_to_archive", fake_archive)
     monkeypatch.setattr(module, "evaluate_npz", lambda *args, **kwargs: {"FID": 1.0})

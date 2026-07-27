@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "jit-reg"
 version = "0.1.0"
-description = "ImageNet-256 pixel/FLUX.2-latent JiT with optional DINOv3 REG and REPA"
+description = "ImageNet-256 pixel/FLUX.2-latent DDT with optional DINOv3 REG and REPA"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

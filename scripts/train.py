@@ -17,7 +17,7 @@ from jit_reg.distributed import initialize_distributed
 from jit_reg.feature_cache import FeatureCache
 from jit_reg.latent_cache import LatentCache
 from jit_reg.model.compile import compile_model_regions
-from jit_reg.model.sit import SiT
+from jit_reg.model.ddt import DDT
 from jit_reg.optim import build_optimizer
 from jit_reg.reg import DINOv3FeatureExtractor
 from jit_reg.rng import RNGStreams
@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=Path("configs/baseline-p16.yaml"),
-        help="schema-v5 experiment YAML (default: configs/baseline-p16.yaml)",
+        help="schema-v7 experiment YAML (default: configs/baseline-p16.yaml)",
     )
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
@@ -92,7 +92,7 @@ def main() -> None:
     streams = RNGStreams.create(config.train.seed, device)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(streams.initialization.initial_seed())
-        model = SiT(config.model).to(device)
+        model = DDT(config.model).to(device)
     cache_active = config.feature_cache.enabled and config.model.features.enabled
     latent_cache_active = (
         config.model.input_space == "flux2_latents"
@@ -227,7 +227,8 @@ def main() -> None:
         f"training initialized: variant={config.model.model_variant}, "
         f"input_shape={config.model.input_shape}, "
         f"reg={reg_config.enabled}, repa={config.model.features.repa.enabled}, "
-        f"reg_head={reg_config.head.kind if reg_config.enabled else 'disabled'}, "
+        f"decoder={config.model.decoder.depth}x"
+        f"{config.model.decoder.hidden_size}, "
         "parameters="
         f"{logged_config['model_parameters']['total']:,}"
     )

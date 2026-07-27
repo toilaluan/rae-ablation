@@ -4,14 +4,15 @@ import pytest
 import torch
 from torch import nn
 
+from jit_reg.model.ddt import Attention
 from jit_reg.model.rope import (
     apply_2d_rope,
     apply_2d_rope_positions,
     apply_aligned_spatial_rope,
     apply_rope_cos_sin,
+    precompute_ddt_rope_tables,
     precompute_rope_tables,
 )
-from jit_reg.model.sit import Attention
 from jit_reg.optim import _muon_eligible
 
 
@@ -33,8 +34,8 @@ def test_attention_rotates_entire_spatial_reg_prefix_and_image_tokens(
         8,
         1,
         grid_size=2,
-        spatial_pool_size=2,
-        spatial_rope=True,
+        reg_pool_size=2,
+        spatial_reg_rope=True,
     )
     with torch.no_grad():
         attention.qkv.weight.zero_()
@@ -60,7 +61,7 @@ def test_attention_rotates_entire_spatial_reg_prefix_and_image_tokens(
 
     monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", capture)
     tokens = torch.randn(1, 8, 8)
-    attention(tokens, height=2, width=2, patch_start=4)
+    attention(tokens)
     raw = attention.q_norm(tokens.reshape(1, 1, 8, 8))
     expected_spatial, _ = apply_aligned_spatial_rope(
         raw[:, :, :4], raw[:, :, :4], 2, 2, 2
@@ -111,6 +112,69 @@ def test_precomputed_prefix_rope_matches_identity_or_spatial_reference(
     assert torch.equal(actual_k, torch.cat((prefix_k, image_k), dim=2))
 
 
+def test_spatial_rope_can_be_embedded_between_conditioning_prefixes() -> None:
+    q = torch.randn(1, 2, 12, 8)
+    k = torch.randn_like(q)
+    cos, sin = precompute_rope_tables(
+        2,
+        2,
+        8,
+        prefix_tokens=8,
+        spatial_pool_size=2,
+        spatial_prefix_start=2,
+    )
+    actual_q, actual_k = apply_rope_cos_sin(q, k, cos, sin)
+    reg_q, reg_k = apply_aligned_spatial_rope(
+        q[:, :, 2:6], k[:, :, 2:6], 2, 2, 2
+    )
+    image_q, image_k = apply_2d_rope(
+        q[:, :, 8:], k[:, :, 8:], 2, 2
+    )
+    assert torch.equal(
+        actual_q,
+        torch.cat((q[:, :, :2], reg_q, q[:, :, 6:8], image_q), dim=2),
+    )
+    assert torch.equal(
+        actual_k,
+        torch.cat((k[:, :, :2], reg_k, k[:, :, 6:8], image_k), dim=2),
+    )
+
+
+def test_ddt_rope_orders_reg_image_then_identity_conditions() -> None:
+    q = torch.randn(1, 2, 11, 8)
+    k = torch.randn_like(q)
+    cos, sin = precompute_ddt_rope_tables(
+        2,
+        2,
+        8,
+        reg_pool_size=2,
+        condition_tokens=3,
+        spatial_reg_rope=True,
+    )
+    actual_q, actual_k = apply_rope_cos_sin(q, k, cos, sin)
+    reg_q, reg_k = apply_aligned_spatial_rope(
+        q[:, :, :4],
+        k[:, :, :4],
+        2,
+        2,
+        2,
+    )
+    image_q, image_k = apply_2d_rope(
+        q[:, :, 4:8],
+        k[:, :, 4:8],
+        2,
+        2,
+    )
+    assert torch.equal(
+        actual_q,
+        torch.cat((reg_q, image_q, q[:, :, 8:]), dim=2),
+    )
+    assert torch.equal(
+        actual_k,
+        torch.cat((reg_k, image_k, k[:, :, 8:]), dim=2),
+    )
+
+
 def test_attention_rope_tables_are_nonpersistent_and_forward_is_static(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -118,8 +182,8 @@ def test_attention_rope_tables_are_nonpersistent_and_forward_is_static(
         8,
         1,
         grid_size=2,
-        spatial_pool_size=2,
-        spatial_rope=False,
+        reg_pool_size=2,
+        spatial_reg_rope=False,
     )
     assert {
         "rope_cos_fp32",
@@ -136,20 +200,25 @@ def test_attention_rope_tables_are_nonpersistent_and_forward_is_static(
     monkeypatch.setattr(torch, "outer", unexpected)
     monkeypatch.setattr(torch.Tensor, "cos", unexpected)
     monkeypatch.setattr(torch.Tensor, "sin", unexpected)
-    assert attention(torch.randn(1, 8, 8), 2, 2, 4).shape == (1, 8, 8)
+    assert attention(torch.randn(1, 8, 8)).shape == (1, 8, 8)
 
 
 @pytest.mark.parametrize(
     ("name", "shape", "eligible"),
     [
-        ("reg_head.modulation.1.weight", (16, 16), True),
-        ("reg_head.layers.0.feed_forward.gate.weight", (32, 16), True),
-        ("reg_head.layers.0.norm.weight", (16,), False),
-        ("reg_head.layers.0.feed_forward.gate.bias", (32,), False),
-        ("reg_head.output.projection.weight", (8, 16), False),
-        ("reg_head.token_projection.weight", (32, 16), False),
+        ("decoder_blocks.0.modulation.1.weight", (96, 16), True),
+        ("decoder_blocks.0.feed_forward.gate.weight", (32, 16), True),
+        ("decoder_blocks.0.norm1.weight", (16,), False),
+        ("decoder_blocks.0.feed_forward.gate.bias", (32,), False),
+        ("final_layer.reg_projection.weight", (8, 16), False),
+        ("decoder_reg_projection.weight", (32, 8), False),
+        ("context_projection.weight", (32, 16), False),
     ],
 )
-def test_reg_head_muon_routing(name: str, shape: tuple[int, ...], eligible: bool) -> None:
+def test_ddt_parameter_muon_routing(
+    name: str,
+    shape: tuple[int, ...],
+    eligible: bool,
+) -> None:
     parameter = nn.Parameter(torch.empty(shape))
     assert _muon_eligible(name, parameter) is eligible

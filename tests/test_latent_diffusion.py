@@ -20,7 +20,7 @@ from jit_reg.latent_cache import (
     latent_cache_spec,
     required_latent_cache_bytes,
 )
-from jit_reg.model.sit import SiT
+from jit_reg.model.ddt import DDT
 from jit_reg.optim import build_optimizer
 from jit_reg.rng import RNGStreams
 from jit_reg.training import make_train_loader, train
@@ -74,7 +74,8 @@ def latent_config(tmp_path: Path, *, image_size: int = 32) -> ExperimentConfig:
     config = ExperimentConfig()
     config.model.input_space = "flux2_latents"
     config.model.image_size = image_size
-    config.model.patch_size = 16
+    config.model.in_channels = 128
+    config.model.patch_size = 1
     config.vae.cache.directory = str(tmp_path)
     config.validate()
     return config
@@ -101,6 +102,30 @@ def test_flux2_codec_uses_mode_bn_and_micro_batches() -> None:
     assert vae.decode_calls == 2
     assert not codec.training and not vae.training
     assert not any(parameter.requires_grad for parameter in codec.parameters())
+
+
+def test_ddt_supports_two_by_two_flux2_latent_patches(tmp_path: Path) -> None:
+    config = latent_config(tmp_path)
+    config.model.patch_size = 2
+    config.model.hidden_size = 16
+    config.model.depth = 1
+    config.model.num_heads = 4
+    config.model.mlp_ratio = 2
+    config.model.decoder.hidden_size = 32
+    config.model.decoder.depth = 1
+    config.model.decoder.num_heads = 4
+    config.model.decoder.mlp_ratio = 2
+    config.model.num_classes = 2
+    config.validate()
+    model = DDT(config.model)
+    noisy = torch.randn(2, *config.model.input_shape)
+    output = model(
+        noisy,
+        torch.rand(2),
+        torch.tensor([0, 1]),
+    )
+    assert model.grid_size == 1
+    assert output.image.shape == noisy.shape
 
 
 def test_latent_cache_fingerprint_and_exact_capacity(tmp_path: Path) -> None:
@@ -164,6 +189,10 @@ def test_cached_latents_train_without_rgb_pixels(tmp_path: Path) -> None:
     config.model.depth = 1
     config.model.num_heads = 4
     config.model.mlp_ratio = 2
+    config.model.decoder.hidden_size = 32
+    config.model.decoder.depth = 1
+    config.model.decoder.num_heads = 4
+    config.model.decoder.mlp_ratio = 2
     config.model.num_classes = 2
     config.compile.enabled = False
     config.train.optimizer.kind = "adamw"
@@ -192,7 +221,7 @@ def test_cached_latents_train_without_rgb_pixels(tmp_path: Path) -> None:
     assert batch.pixels is None
     assert batch.cached_latents is not None
 
-    model = SiT(config.model)
+    model = DDT(config.model)
     plan = create_validation_plan(2, 2, 2, seed=5)
     plan_path = tmp_path / "plan.pt"
     plan.save(plan_path)

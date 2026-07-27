@@ -75,8 +75,8 @@ class SamplingParameters:
 
 
 GenerateBatch = Callable[[Tensor, Tensor, Tensor], Tensor]
-SAMPLING_MANIFEST_SCHEMA_VERSION = 13
-FEATURE_SCHEMA_VERSION = 5
+SAMPLING_MANIFEST_SCHEMA_VERSION = 14
+FEATURE_SCHEMA_VERSION = 7
 
 
 def _float_slug(value: float) -> str:
@@ -182,6 +182,7 @@ def _manifest_base(
     num_classes: int,
     image_size: int,
     patch_size: int,
+    grid_size: int,
     model_variant: str,
     feature_schema: dict[str, Any],
     parameters: SamplingParameters,
@@ -195,7 +196,7 @@ def _manifest_base(
         "sample_ids_sha256": ids_digest,
         "image_size": image_size,
         "patch_size": patch_size,
-        "jit_grid_size": image_size // patch_size,
+        "jit_grid_size": grid_size,
         "model_variant": model_variant,
         "feature_schema": feature_schema,
         "sample_count": sample_count,
@@ -369,6 +370,7 @@ def sample_to_archive(
     num_classes: int,
     image_size: int,
     patch_size: int,
+    grid_size: int,
     model_variant: str,
     feature_schema: dict[str, Any],
     checkpoint_hash: str,
@@ -377,8 +379,8 @@ def sample_to_archive(
 ) -> Path:
     """Generate a resumable, class-balanced ADM-compatible sample archive."""
     parameters.validate()
-    if image_size < 1 or patch_size < 1 or image_size % patch_size:
-        raise ValueError("image size must be positive and divisible by patch size")
+    if image_size < 1 or patch_size < 1 or grid_size < 1:
+        raise ValueError("image size, patch size, and model grid must be positive")
     if not model_variant:
         raise ValueError("model variant cannot be empty")
     if feature_schema.get("schema_version") != FEATURE_SCHEMA_VERSION:
@@ -397,6 +399,7 @@ def sample_to_archive(
         num_classes=num_classes,
         image_size=image_size,
         patch_size=patch_size,
+        grid_size=grid_size,
         model_variant=model_variant,
         feature_schema=feature_schema,
         parameters=parameters,

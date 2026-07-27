@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from jit_reg.model.sit import SiTOutput
+from jit_reg.model.ddt import DDTOutput
 from jit_reg.objective import (
     denoising_step_bounds,
     jit_losses,
@@ -166,7 +166,7 @@ class RecordingCleanModel(nn.Module):
         noisy_reg: torch.Tensor | None = None,
         reg_timestep: torch.Tensor | None = None,
         return_repa: bool = False,
-    ) -> SiTOutput:
+    ) -> DDTOutput:
         del labels, return_repa
         self.calls.append(
             (
@@ -175,7 +175,7 @@ class RecordingCleanModel(nn.Module):
                 image.shape[0],
             )
         )
-        return SiTOutput(
+        return DDTOutput(
             image=torch.full_like(image, 0.25),
             reg=torch.full_like(noisy_reg, -0.5) if noisy_reg is not None else None,
         )

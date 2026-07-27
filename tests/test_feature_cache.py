@@ -74,7 +74,7 @@ def test_component_fingerprints_are_minimal_and_independent(tmp_path: Path) -> N
     original = fingerprints(config)
 
     irrelevant = copy.deepcopy(config)
-    irrelevant.model.features.reg.head.kind = "wide_mlp"
+    irrelevant.model.decoder.depth = 3
     irrelevant.model.features.reg.loss_weight = 99
     irrelevant.model.features.reg.target_std = 99
     irrelevant.train.reg_timestep_loc = 2.0

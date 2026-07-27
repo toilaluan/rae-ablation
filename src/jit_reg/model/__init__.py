@@ -1,3 +1,3 @@
-from .sit import SiT, SiTOutput, classifier_free_labels
+from .ddt import DDT, DDTOutput, classifier_free_labels
 
-__all__ = ["SiT", "SiTOutput", "classifier_free_labels"]
+__all__ = ["DDT", "DDTOutput", "classifier_free_labels"]

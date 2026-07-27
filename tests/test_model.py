@@ -4,54 +4,63 @@ import inspect
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
+import jit_reg
 from jit_reg.config import (
+    DDTDecoderConfig,
     EncoderConfig,
     FeaturesConfig,
     ModelConfig,
     REGConfig,
-    REGEarlyPredictionConfig,
-    REGHeadConfig,
     REPAConfig,
 )
-from jit_reg.model import sit
-from jit_reg.model.sit import SiT, SiTOutput
+from jit_reg.model import ddt
+from jit_reg.model.ddt import (
+    DDT,
+    ConditionEmbedder,
+    DDTDecoderBlock,
+    DDTEncoderBlock,
+    DDTOutput,
+    GaussianFourierEmbedding,
+)
 
 
 def tiny_config(
     *,
     reg: bool = False,
     repa: bool = False,
-    head: str = "standard",
-    early: int | None = None,
-    reinjection_mode: str = "replace",
     scope: str = "image",
+    num_img_t_tokens: int = 1,
+    num_reg_t_tokens: int = 0,
+    num_c_tokens: int = 1,
 ) -> ModelConfig:
     return ModelConfig(
         image_size=16,
         patch_size=8,
+        num_img_t_tokens=num_img_t_tokens,
+        num_reg_t_tokens=num_reg_t_tokens,
+        num_c_tokens=num_c_tokens,
         hidden_size=16,
         depth=2,
         num_heads=4,
         mlp_ratio=2,
         num_classes=3,
+        decoder=DDTDecoderConfig(
+            hidden_size=32,
+            depth=2,
+            num_heads=4,
+            mlp_ratio=2,
+        ),
         features=FeaturesConfig(
-            encoder=EncoderConfig(feature_dim=8, register_tokens=4),
+            encoder=EncoderConfig(
+                feature_dim=8,
+                register_tokens=4,
+            ),
             reg=REGConfig(
                 enabled=reg,
                 pool_size=2,
-                head=REGHeadConfig(
-                    kind=head,
-                    hidden_size=32,
-                    depth=2,
-                    mlp_ratio=2,
-                ),
-                early_prediction=REGEarlyPredictionConfig(
-                    block=early,
-                    projection_hidden_size=32,
-                    reinjection_mode=reinjection_mode,
-                ),
             ),
             repa=REPAConfig(
                 enabled=repa,
@@ -70,15 +79,23 @@ def inputs(config: ModelConfig) -> tuple[torch.Tensor, ...]:
     labels = torch.tensor([0, 2])
     reg = config.features.reg
     noisy_reg = (
-        torch.randn(batch, reg.num_tokens, config.features.encoder.feature_dim)
+        torch.randn(
+            batch,
+            reg.num_tokens,
+            config.features.encoder.feature_dim,
+        )
         if reg.enabled
         else None
     )
     return image, timestep, labels, noisy_reg
 
 
-def run(config: ModelConfig, *, return_repa: bool = False) -> SiTOutput:
-    model = SiT(config)
+def run(
+    config: ModelConfig,
+    *,
+    return_repa: bool = False,
+) -> DDTOutput:
+    model = DDT(config)
     image, timestep, labels, noisy_reg = inputs(config)
     return model(
         image,
@@ -90,14 +107,25 @@ def run(config: ModelConfig, *, return_repa: bool = False) -> SiTOutput:
     )
 
 
-def test_feature_disabled_model_is_baseline_only() -> None:
-    model = SiT(tiny_config())
-    assert model.reg_input is None
-    assert model.reg_head is None
-    assert model.reg_reinjection is None
+def test_feature_disabled_model_is_baseline_ddt() -> None:
+    model = DDT(tiny_config())
+    assert len(model.encoder_blocks) == 2
+    assert len(model.decoder_blocks) == 2
+    assert all(
+        isinstance(block, DDTEncoderBlock)
+        for block in model.encoder_blocks
+    )
+    assert all(
+        isinstance(block, DDTDecoderBlock)
+        for block in model.decoder_blocks
+    )
+    assert model.encoder_reg_projection is None
+    assert model.decoder_reg_projection is None
+    assert model.final_layer.reg_projection is None
     assert model.repa_projection is None
     assert not any(
-        key.startswith(("reg_", "repa_")) for key in model.state_dict()
+        key.startswith(("encoder_reg_", "decoder_reg_", "repa_"))
+        for key in model.state_dict()
     )
     image, timestep, labels, _ = inputs(model.config)
     output = model(image, timestep, labels)
@@ -105,136 +133,84 @@ def test_feature_disabled_model_is_baseline_only() -> None:
     assert output.reg is None and output.repa is None
 
 
-@pytest.mark.parametrize("head", ["standard", "wide_mlp"])
-@pytest.mark.parametrize("early", [None, 1])
-def test_reg_head_token_and_location_matrix(head: str, early: int | None) -> None:
+@pytest.mark.parametrize(
+    ("reg", "scope", "expected_repa_tokens"),
+    [
+        (False, "image", 4),
+        (True, "image", 4),
+        (True, "image_and_reg", 8),
+    ],
+)
+def test_output_shapes(
+    reg: bool,
+    scope: str,
+    expected_repa_tokens: int,
+) -> None:
     config = tiny_config(
-        reg=True,
-        head=head,
-        early=early,
+        reg=reg,
+        repa=True,
+        scope=scope,
     )
-    output = run(config)
-    assert output.reg is not None
-    assert output.reg.shape == (
+    output = run(config, return_repa=True)
+    assert output.image.shape == (2, 3, 16, 16)
+    assert output.repa is not None
+    assert output.repa.shape == (
         2,
-        config.features.reg.num_tokens,
+        expected_repa_tokens,
         config.features.encoder.feature_dim,
     )
-
-
-@pytest.mark.parametrize(
-    ("reg", "scope", "expected_tokens"),
-    [(False, "image", 4), (True, "image", 4), (True, "image_and_reg", 8)],
-)
-def test_repa_scope_shapes(reg: bool, scope: str, expected_tokens: int) -> None:
-    output = run(
-        tiny_config(reg=reg, repa=True, scope=scope),
-        return_repa=True,
-    )
-    assert output.repa is not None
-    assert output.repa.shape == (2, expected_tokens, 8)
+    if reg:
+        assert output.reg is not None
+        assert output.reg.shape == (
+            2,
+            config.features.reg.num_tokens,
+            config.features.encoder.feature_dim,
+        )
+    else:
+        assert output.reg is None
 
 
 def test_reg_requires_explicit_reg_timestep() -> None:
     config = tiny_config(reg=True)
-    model = SiT(config)
+    model = DDT(config)
     image, timestep, labels, noisy_reg = inputs(config)
     with pytest.raises(ValueError, match="reg_timestep"):
-        model(image, timestep, labels, noisy_reg=noisy_reg)
+        model(
+            image,
+            timestep,
+            labels,
+            noisy_reg=noisy_reg,
+        )
 
 
-def test_early_prediction_reinjects_exact_fc_gelu_fc_prefix() -> None:
+def test_encoder_is_unconditioned_and_decoder_is_joint() -> None:
     config = tiny_config(
         reg=True,
-        head="standard",
-        early=1,
+        num_img_t_tokens=2,
+        num_reg_t_tokens=3,
+        num_c_tokens=2,
     )
-    model = SiT(config)
-    captured: list[torch.Tensor] = []
+    model = DDT(config)
+    assert len(inspect.signature(model.encoder_blocks[0].forward).parameters) == 1
+    assert len(inspect.signature(model.decoder_blocks[0].forward).parameters) == 2
 
-    def capture(_module: nn.Module, args: tuple[object, ...]) -> None:
-        captured.append(args[0].detach().clone())  # type: ignore[union-attr]
-
-    handle = model.blocks[1].register_forward_pre_hook(capture)
-    image, timestep, labels, noisy_reg = inputs(config)
-    output = model(
-        image,
-        timestep,
-        labels,
-        noisy_reg=noisy_reg,
-        reg_timestep=timestep * 0.5,
+    encoder_inputs: list[torch.Tensor] = []
+    decoder_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+    encoder_handle = model.encoder_blocks[0].register_forward_pre_hook(
+        lambda _module, args: encoder_inputs.append(
+            args[0].detach().clone()
+        )
     )
-    handle.remove()
-    assert output.reg is not None and model.reg_reinjection is not None
-    expected = model._add_reg_positions(model.reg_reinjection(output.reg))
-    assert len(captured) == 1
-    assert torch.allclose(
-        captured[0][:, : model.num_reg_tokens],
-        expected,
-        atol=1e-6,
-    )
-    assert captured[0].shape[1] == model.num_reg_tokens + model.num_patches
-    assert [type(layer) for layer in model.reg_reinjection] == [
-        nn.Linear,
-        nn.GELU,
-        nn.Linear,
-    ]
-
-
-def test_additive_early_prediction_reinjects_into_existing_prefix() -> None:
-    config = tiny_config(
-        reg=True,
-        head="standard",
-        early=1,
-        reinjection_mode="add",
-    )
-    model = SiT(config)
-    previous: list[torch.Tensor] = []
-    captured: list[torch.Tensor] = []
-
-    def capture_previous(
-        _module: nn.Module, _args: tuple[object, ...], output: torch.Tensor
-    ) -> None:
-        previous.append(output.detach().clone())
-
-    first = model.blocks[0].register_forward_hook(capture_previous)
-    second = model.blocks[1].register_forward_pre_hook(
-        lambda _module, args: captured.append(args[0].detach().clone())
-    )
-    image, timestep, labels, noisy_reg = inputs(config)
-    output = model(
-        image,
-        timestep,
-        labels,
-        noisy_reg=noisy_reg,
-        reg_timestep=timestep,
-    )
-    first.remove()
-    second.remove()
-    assert output.reg is not None and model.reg_reinjection is not None
-    expected = (
-        previous[0][:, : model.num_reg_tokens]
-        + model.reg_reinjection(output.reg)
-    )
-    assert torch.allclose(
-        captured[0][:, : model.num_reg_tokens], expected, atol=1e-6
-    )
-
-
-def test_every_block_receives_separate_image_and_reg_conditioning() -> None:
-    config = tiny_config(reg=True)
-    model = SiT(config)
-    conditionings: list[tuple[torch.Tensor, torch.Tensor]] = []
-    handles = []
-    for block in model.blocks:
-        handles.append(
-            block.register_forward_pre_hook(
-                lambda _module, args: conditionings.append(
-                    (args[1].detach().clone(), args[5].detach().clone())
-                )
+    decoder_handle = model.decoder_blocks[0].register_forward_pre_hook(
+        lambda _module, args: decoder_inputs.append(
+            (
+                args[0].detach().clone(),
+                args[1].detach().clone(),
             )
         )
+    )
     image, timestep, labels, noisy_reg = inputs(config)
+    assert noisy_reg is not None
     reg_timestep = torch.tensor([0.8, 0.9])
     model(
         image,
@@ -243,27 +219,209 @@ def test_every_block_receives_separate_image_and_reg_conditioning() -> None:
         noisy_reg=noisy_reg,
         reg_timestep=reg_timestep,
     )
-    for handle in handles:
-        handle.remove()
-    assert len(conditionings) == config.depth
-    for image_conditioning, reg_conditioning in conditionings:
-        assert image_conditioning.shape == reg_conditioning.shape == (
-            2,
-            config.hidden_size,
+    encoder_handle.remove()
+    decoder_handle.remove()
+
+    reg_result = model.reg_t_embedder(
+        reg_timestep,
+        return_base_embed=True,
+    )
+    image_result = model.img_t_embedder(
+        timestep,
+        return_base_embed=True,
+    )
+    assert isinstance(reg_result, tuple)
+    assert isinstance(image_result, tuple)
+    _reg_base, reg_tokens = reg_result
+    _image_base, image_tokens = image_result
+    assert model.encoder_reg_projection is not None
+    expected_encoder = torch.cat(
+        (
+            model.encoder_reg_projection(noisy_reg),
+            model.encoder_patch_projection(image)
+            .flatten(2)
+            .transpose(1, 2),
+            reg_tokens,
+            image_tokens,
+            model.condition_embedder(labels),
+        ),
+        dim=1,
+    )
+    assert len(encoder_inputs) == 1
+    assert torch.allclose(encoder_inputs[0], expected_encoder)
+    assert encoder_inputs[0].shape == (
+        2,
+        model.num_primary_tokens + model.num_condition_tokens,
+        config.hidden_size,
+    )
+
+    assert len(decoder_inputs) == 1
+    decoder_state, decoder_context = decoder_inputs[0]
+    assert model.decoder_reg_projection is not None
+    expected_decoder = torch.cat(
+        (
+            model.decoder_reg_projection(noisy_reg),
+            model.decoder_patch_projection(image)
+            .flatten(2)
+            .transpose(1, 2),
+        ),
+        dim=1,
+    )
+    assert torch.allclose(decoder_state, expected_decoder)
+    assert decoder_state.shape == decoder_context.shape == (
+        2,
+        model.num_primary_tokens,
+        config.decoder.hidden_size,
+    )
+
+
+def test_decoder_context_uses_token_specific_base_times() -> None:
+    config = tiny_config(
+        reg=True,
+        num_reg_t_tokens=1,
+    )
+    model = DDT(config)
+    encoder_output: list[torch.Tensor] = []
+    decoder_context: list[torch.Tensor] = []
+    encoder_handle = model.encoder_blocks[-1].register_forward_hook(
+        lambda _module, _args, output: encoder_output.append(
+            output.detach().clone()
         )
-        assert not torch.allclose(image_conditioning, reg_conditioning)
+    )
+    decoder_handle = model.decoder_blocks[0].register_forward_pre_hook(
+        lambda _module, args: decoder_context.append(
+            args[1].detach().clone()
+        )
+    )
+    image, timestep, labels, noisy_reg = inputs(config)
+    assert noisy_reg is not None
+    reg_timestep = torch.tensor([0.8, 0.9])
+    model(
+        image,
+        timestep,
+        labels,
+        noisy_reg=noisy_reg,
+        reg_timestep=reg_timestep,
+    )
+    encoder_handle.remove()
+    decoder_handle.remove()
+    reg_result = model.reg_t_embedder(
+        reg_timestep,
+        return_base_embed=True,
+    )
+    image_result = model.img_t_embedder(
+        timestep,
+        return_base_embed=True,
+    )
+    assert isinstance(reg_result, tuple)
+    assert isinstance(image_result, tuple)
+    reg_base, _reg_tokens = reg_result
+    image_base, _image_tokens = image_result
+    primary = encoder_output[0][:, : model.num_primary_tokens]
+    expected = model.context_projection(
+        torch.cat(
+            (
+                F.silu(primary[:, : model.num_reg_tokens] + reg_base),
+                F.silu(primary[:, model.image_token_start :] + image_base),
+            ),
+            dim=1,
+        )
+    )
+    assert torch.allclose(decoder_context[0], expected)
 
 
-def test_removed_experiment_parameters_and_classes_are_absent() -> None:
-    source = inspect.getsource(sit)
+def test_shared_final_layer_emits_image_and_reg_without_reg_head() -> None:
+    model = DDT(tiny_config(reg=True))
+    assert isinstance(model.final_layer.norm, nn.RMSNorm)
+    assert model.final_layer.reg_projection is not None
+    assert not hasattr(model, "reg_head")
+    assert not hasattr(model, "reg_reinjection")
+    state = model.state_dict()
+    assert "final_layer.image_projection.weight" in state
+    assert "final_layer.reg_projection.weight" in state
+    assert not any(
+        "reg_head" in key
+        or "reinjection" in key
+        or "reg_position_embedding" in key
+        for key in state
+    )
+
+
+def test_gaussian_fourier_embedding_returns_base_and_context_tokens() -> None:
+    embedder = GaussianFourierEmbedding(
+        hidden_size=8,
+        n_tokens=3,
+        embedding_size=4,
+        scale=0.5,
+    )
+    timestep = torch.tensor([0.2, 0.7])
+    result = embedder(timestep, return_base_embed=True)
+    assert isinstance(result, tuple)
+    base, context = result
+    assert base.shape == (2, 1, 8)
+    assert context.shape == (2, 3, 8)
+    assert torch.allclose(
+        context,
+        embedder.learnable_tokens + base,
+    )
+    assert not embedder.W.requires_grad
+
+
+def test_label_condition_embedder_returns_learned_context_tokens() -> None:
+    embedder = ConditionEmbedder(
+        hidden_size=8,
+        num_classes=3,
+        condition_type="label",
+        n_tokens=2,
+    )
+    labels = torch.tensor([0, 3])
+    base = embedder.base_embedding(labels)
+    context = embedder(labels)
+    assert base.shape == (2, 8)
+    assert context.shape == (2, 2, 8)
+    assert torch.allclose(
+        context,
+        embedder.learnable_tokens + base.unsqueeze(1),
+    )
+
+
+def test_conditioning_tokens_are_excluded_from_repa_outputs() -> None:
+    config = tiny_config(
+        reg=True,
+        repa=True,
+        scope="image_and_reg",
+        num_img_t_tokens=2,
+        num_reg_t_tokens=3,
+        num_c_tokens=4,
+    )
+    output = run(config, return_repa=True)
+    assert output.repa is not None
+    assert output.repa.shape == (
+        2,
+        config.features.reg.num_tokens + 4,
+        config.features.encoder.feature_dim,
+    )
+
+
+def test_removed_sit_and_independent_reg_components_are_absent() -> None:
+    source = inspect.getsource(ddt)
     for retired in (
-        "continuation_tokens",
-        "x0_conditioning",
-        "PatchReprojection",
-        "wide_intermediate",
-        "terminal_wide",
+        "SiT",
+        "WideREG",
+        "reg_head",
+        "reg_reinjection",
+        "early_prediction",
+        "reg_position_embedding",
     ):
         assert retired not in source
-    model = SiT(tiny_config(reg=True, head="wide_mlp", early=1))
-    for retired in ("continuation", "reprojection", "reg_x0_conditioning"):
-        assert not any(retired in key for key in model.state_dict())
+
+
+def test_public_api_exposes_ddt_without_sit_aliases() -> None:
+    assert jit_reg.DDT is DDT
+    assert jit_reg.DDTOutput is DDTOutput
+    assert "DDT" in jit_reg.__all__
+    assert "DDTOutput" in jit_reg.__all__
+    assert "SiT" not in jit_reg.__all__
+    assert "SiTOutput" not in jit_reg.__all__
+    assert not hasattr(jit_reg, "SiT")
+    assert not hasattr(jit_reg, "SiTOutput")

@@ -13,7 +13,7 @@ from .config import ExperimentConfig
 from .distributed import broadcast_string
 from .evaluation import evaluate_npz, save_evaluation
 from .model.compile import compile_model_regions
-from .model.sit import SiT
+from .model.ddt import DDT
 from .rng import preserving_global_rng
 from .sample_runtime import (
     FEATURE_SCHEMA_VERSION,
@@ -75,6 +75,11 @@ def validate_ema(
         "schema_version": FEATURE_SCHEMA_VERSION,
         "input_space": config.model.input_space,
         "input_shape": list(config.model.input_shape),
+        "conditioning_tokens": {
+            "image_timestep": config.model.num_img_t_tokens,
+            "reg_timestep": config.model.num_reg_t_tokens,
+            "class": config.model.num_c_tokens,
+        },
         "vae": (
             {
                 "model_name": config.vae.model_name,
@@ -97,8 +102,8 @@ def validate_ema(
     )
     started = time.perf_counter()
 
-    def build_model() -> tuple[SiT, torch.nn.Module]:
-        model = SiT(config.model).to(device)
+    def build_model() -> tuple[DDT, torch.nn.Module]:
+        model = DDT(config.model).to(device)
         model.load_state_dict(ema.state_dict())
         model.eval()
         return model, compile_model_regions(model, config.compile)
@@ -167,6 +172,7 @@ def validate_ema(
             num_classes=config.model.num_classes,
             image_size=config.model.image_size,
             patch_size=config.model.patch_size,
+            grid_size=config.model.grid_size,
             model_variant=config.model.model_variant,
             feature_schema=feature_schema,
             checkpoint_hash=digest,
@@ -175,7 +181,7 @@ def validate_ema(
         )
         return archive, output
 
-    def release_model(model: SiT, execution_model: torch.nn.Module) -> None:
+    def release_model(model: DDT, execution_model: torch.nn.Module) -> None:
         model.cpu()
         del execution_model, model
         if device.type == "cuda":

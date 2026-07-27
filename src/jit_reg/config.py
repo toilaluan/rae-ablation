@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 5
+CONFIG_SCHEMA_VERSION = 7
 
 FLUX2_SPATIAL_COMPRESSION = 16
 FLUX2_LATENT_CHANNELS = 128
@@ -26,31 +26,12 @@ class EncoderConfig:
 
 
 @dataclass
-class REGHeadConfig:
-    kind: str = "standard"
-    hidden_size: int = 2048
-    depth: int = 2
-    mlp_ratio: float = 4.0
-
-
-@dataclass
-class REGEarlyPredictionConfig:
-    block: int | None = None
-    projection_hidden_size: int = 2048
-    reinjection_mode: str = "replace"
-
-
-@dataclass
 class REGConfig:
     enabled: bool = False
     pool_size: int = 4
     target_std: float = 0.53
     spatial_rope: bool = True
     loss_weight: float = 0.03
-    head: REGHeadConfig = field(default_factory=REGHeadConfig)
-    early_prediction: REGEarlyPredictionConfig = field(
-        default_factory=REGEarlyPredictionConfig
-    )
 
     @property
     def num_tokens(self) -> int:
@@ -78,10 +59,22 @@ class FeaturesConfig:
 
 
 @dataclass
+class DDTDecoderConfig:
+    hidden_size: int = 2048
+    depth: int = 2
+    num_heads: int = 16
+    mlp_ratio: float = 4.0
+
+
+@dataclass
 class ModelConfig:
     input_space: str = "pixels"
     image_size: int = 256
+    in_channels: int = 3
     patch_size: int = 16
+    num_img_t_tokens: int = 1
+    num_reg_t_tokens: int = 0
+    num_c_tokens: int = 1
     hidden_size: int = 768
     depth: int = 12
     num_heads: int = 12
@@ -89,20 +82,17 @@ class ModelConfig:
     num_classes: int = 1000
     class_dropout_prob: float = 0.1
     gradient_checkpointing: bool = False
-    variant: str = "SiT-B"
+    variant: str = "DDT-B"
+    decoder: DDTDecoderConfig = field(default_factory=DDTDecoderConfig)
     features: FeaturesConfig = field(default_factory=FeaturesConfig)
 
     @property
     def grid_size(self) -> int:
-        return self.image_size // self.patch_size
+        return self.input_size // self.patch_size
 
     @property
     def model_variant(self) -> str:
         return f"{self.variant}/{self.patch_size}-{self.input_space}"
-
-    @property
-    def input_channels(self) -> int:
-        return 3 if self.input_space == "pixels" else FLUX2_LATENT_CHANNELS
 
     @property
     def input_size(self) -> int:
@@ -111,14 +101,8 @@ class ModelConfig:
         return self.image_size // FLUX2_SPATIAL_COMPRESSION
 
     @property
-    def input_patch_size(self) -> int:
-        if self.input_space == "pixels":
-            return self.patch_size
-        return self.patch_size // FLUX2_SPATIAL_COMPRESSION
-
-    @property
     def input_shape(self) -> tuple[int, int, int]:
-        return (self.input_channels, self.input_size, self.input_size)
+        return (self.in_channels, self.input_size, self.input_size)
 
 
 @dataclass
@@ -273,6 +257,7 @@ class ExperimentConfig:
         _positive(
             "model dimensions",
             m.image_size,
+            m.in_channels,
             m.patch_size,
             m.hidden_size,
             m.depth,
@@ -280,20 +265,23 @@ class ExperimentConfig:
             m.num_classes,
             m.mlp_ratio,
         )
-        if m.image_size % m.patch_size:
-            raise ValueError("model.image_size must be exactly divisible by model.patch_size")
         if m.input_space not in {"pixels", "flux2_latents"}:
             raise ValueError(
                 "model.input_space must be pixels or flux2_latents"
             )
+        expected_channels = (
+            3 if m.input_space == "pixels" else FLUX2_LATENT_CHANNELS
+        )
+        if m.in_channels != expected_channels:
+            raise ValueError(
+                f"model.in_channels must be {expected_channels} for "
+                f"model.input_space={m.input_space}"
+            )
         if m.input_space == "flux2_latents":
-            if (
-                m.image_size % FLUX2_SPATIAL_COMPRESSION
-                or m.patch_size % FLUX2_SPATIAL_COMPRESSION
-            ):
+            if m.image_size % FLUX2_SPATIAL_COMPRESSION:
                 raise ValueError(
-                    "FLUX.2 latent mode requires model.image_size and "
-                    "model.patch_size to be divisible by 16"
+                    "FLUX.2 latent mode requires model.image_size to be "
+                    "divisible by 16"
                 )
             vae = self.vae
             if not vae.model_name or not vae.revision or not vae.subfolder:
@@ -312,10 +300,45 @@ class ExperimentConfig:
             raise ValueError(
                 "vae.cache.enabled requires model.input_space=flux2_latents"
             )
+        if m.input_size % m.patch_size:
+            raise ValueError(
+                "the diffusion input size must be exactly divisible by "
+                "model.patch_size"
+            )
+        conditioning_token_counts = {
+            "model.num_img_t_tokens": m.num_img_t_tokens,
+            "model.num_reg_t_tokens": m.num_reg_t_tokens,
+            "model.num_c_tokens": m.num_c_tokens,
+        }
+        for name, count in conditioning_token_counts.items():
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if m.num_reg_t_tokens and not m.features.reg.enabled:
+            raise ValueError(
+                "model.num_reg_t_tokens requires model.features.reg.enabled=true"
+            )
         if m.hidden_size % m.num_heads:
             raise ValueError("model.hidden_size must be divisible by model.num_heads")
         if (m.hidden_size // m.num_heads) % 4:
             raise ValueError("model attention head dimension must be divisible by 4 for 2D RoPE")
+        decoder = m.decoder
+        _positive(
+            "model.decoder dimensions",
+            decoder.hidden_size,
+            decoder.depth,
+            decoder.num_heads,
+            decoder.mlp_ratio,
+        )
+        if decoder.hidden_size % decoder.num_heads:
+            raise ValueError(
+                "model.decoder.hidden_size must be divisible by "
+                "model.decoder.num_heads"
+            )
+        if (decoder.hidden_size // decoder.num_heads) % 4:
+            raise ValueError(
+                "model decoder attention head dimension must be divisible by 4 "
+                "for 2D RoPE"
+            )
         if not 0 <= m.class_dropout_prob < 1:
             raise ValueError("model.class_dropout_prob must be in [0, 1)")
         if not m.variant:
@@ -334,9 +357,9 @@ class ExperimentConfig:
                 raise ValueError("model.features.encoder.model_name cannot be empty")
         if features.reg.enabled:
             reg = features.reg
-            if reg.pool_size < 1 or reg.pool_size > 16:
+            if reg.pool_size < 1 or reg.pool_size > m.grid_size:
                 raise ValueError(
-                    "model.features.reg.pool_size must be within the native 16x16 grid"
+                    "model.features.reg.pool_size must not exceed the model grid"
                 )
             if not math.isfinite(reg.target_std) or reg.target_std <= 0:
                 raise ValueError(
@@ -344,33 +367,6 @@ class ExperimentConfig:
                 )
             if reg.loss_weight < 0:
                 raise ValueError("model.features.reg.loss_weight cannot be negative")
-            if reg.head.kind not in {"standard", "wide_mlp"}:
-                raise ValueError(
-                    "model.features.reg.head.kind must be standard or wide_mlp"
-                )
-            if reg.head.kind == "wide_mlp":
-                _positive(
-                    "model.features.reg.head dimensions",
-                    reg.head.hidden_size,
-                    reg.head.depth,
-                    reg.head.mlp_ratio,
-                )
-            block = reg.early_prediction.block
-            if block is not None and not 1 <= block < m.depth:
-                raise ValueError(
-                    "model.features.reg.early_prediction.block must be null or before "
-                    "model.depth"
-                )
-            if block is not None:
-                _positive(
-                    "model.features.reg.early_prediction.projection_hidden_size",
-                    reg.early_prediction.projection_hidden_size,
-                )
-            if reg.early_prediction.reinjection_mode not in {"replace", "add"}:
-                raise ValueError(
-                    "model.features.reg.early_prediction.reinjection_mode "
-                    "must be replace or add"
-                )
         if features.repa.enabled:
             repa = features.repa
             if not 1 <= repa.block <= m.depth:

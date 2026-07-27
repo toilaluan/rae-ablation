@@ -13,8 +13,8 @@ from torch import Tensor, nn
 
 from .model.compile import clean_state_dict
 
-CHECKPOINT_SCHEMA_VERSION = 5
-TRAINING_STATE_SCHEMA_VERSION = 5
+CHECKPOINT_SCHEMA_VERSION = 7
+TRAINING_STATE_SCHEMA_VERSION = 7
 
 
 def _contiguous(state: dict[str, object]) -> dict[str, Tensor]:
@@ -214,7 +214,7 @@ class CheckpointManager:
         metadata_path = path / "metadata.json"
         if not metadata_path.is_file():
             raise ValueError(
-                "checkpoint predates schema v5; old checkpoints are not supported"
+                "checkpoint predates schema v7; old checkpoints are not supported"
             )
         metadata = json.loads(metadata_path.read_text())
         if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:

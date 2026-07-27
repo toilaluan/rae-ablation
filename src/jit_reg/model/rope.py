@@ -75,6 +75,7 @@ def precompute_rope_tables(
     *,
     prefix_tokens: int = 0,
     spatial_pool_size: int | None = None,
+    spatial_prefix_start: int = 0,
     dtype: torch.dtype = torch.float32,
 ) -> tuple[Tensor, Tensor]:
     """Build one image-plus-prefix RoPE table for a static attention layout."""
@@ -82,6 +83,8 @@ def precompute_rope_tables(
         raise ValueError("RoPE grid dimensions must be positive")
     if prefix_tokens < 0:
         raise ValueError("RoPE prefix token count cannot be negative")
+    if spatial_prefix_start < 0:
+        raise ValueError("spatial RoPE prefix start cannot be negative")
     image_y = torch.arange(image_height, dtype=torch.float32)
     image_x = torch.arange(image_width, dtype=torch.float32)
     image_y = (
@@ -95,13 +98,13 @@ def precompute_rope_tables(
     )
     if prefix_tokens == 0:
         return image_cos, image_sin
-    if spatial_pool_size is None:
-        prefix_cos = torch.ones(prefix_tokens, head_dim, dtype=dtype)
-        prefix_sin = torch.zeros(prefix_tokens, head_dim, dtype=dtype)
-    else:
-        if spatial_pool_size**2 != prefix_tokens:
+    prefix_cos = torch.ones(prefix_tokens, head_dim, dtype=dtype)
+    prefix_sin = torch.zeros(prefix_tokens, head_dim, dtype=dtype)
+    if spatial_pool_size is not None:
+        spatial_tokens = spatial_pool_size**2
+        if spatial_prefix_start + spatial_tokens > prefix_tokens:
             raise ValueError(
-                "spatial RoPE pool size must match the prefix token count"
+                "spatial RoPE tokens must fit within the prefix"
             )
         cell = torch.arange(spatial_pool_size, dtype=torch.float32) + 0.5
         prefix_y = cell * (image_height / spatial_pool_size) - 0.5
@@ -116,12 +119,60 @@ def precompute_rope_tables(
             .expand(spatial_pool_size, spatial_pool_size)
             .reshape(-1)
         )
-        prefix_cos, prefix_sin = rope_cos_sin(
+        spatial_cos, spatial_sin = rope_cos_sin(
             prefix_y, prefix_x, head_dim, dtype
+        )
+        prefix_cos[spatial_prefix_start : spatial_prefix_start + spatial_tokens] = (
+            spatial_cos
+        )
+        prefix_sin[spatial_prefix_start : spatial_prefix_start + spatial_tokens] = (
+            spatial_sin
         )
     return (
         torch.cat((prefix_cos, image_cos), dim=0),
         torch.cat((prefix_sin, image_sin), dim=0),
+    )
+
+
+def precompute_ddt_rope_tables(
+    image_height: int,
+    image_width: int,
+    head_dim: int,
+    *,
+    reg_pool_size: int | None = None,
+    condition_tokens: int = 0,
+    spatial_reg_rope: bool = False,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[Tensor, Tensor]:
+    """Build static RoPE for ``[REG, image, condition]`` DDT sequences."""
+    if condition_tokens < 0:
+        raise ValueError("DDT condition token count cannot be negative")
+    reg_tokens = reg_pool_size**2 if reg_pool_size is not None else 0
+    primary_cos, primary_sin = precompute_rope_tables(
+        image_height,
+        image_width,
+        head_dim,
+        prefix_tokens=reg_tokens,
+        spatial_pool_size=(
+            reg_pool_size if spatial_reg_rope else None
+        ),
+        dtype=dtype,
+    )
+    if condition_tokens == 0:
+        return primary_cos, primary_sin
+    condition_cos = torch.ones(
+        condition_tokens,
+        head_dim,
+        dtype=dtype,
+    )
+    condition_sin = torch.zeros(
+        condition_tokens,
+        head_dim,
+        dtype=dtype,
+    )
+    return (
+        torch.cat((primary_cos, condition_cos), dim=0),
+        torch.cat((primary_sin, condition_sin), dim=0),
     )
 
 

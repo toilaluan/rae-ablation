@@ -1,6 +1,7 @@
-"""Pixel- and FLUX.2-latent JiT training with optional DINOv3 REG and REPA."""
+"""Pixel- and FLUX.2-latent DDT training with optional DINOv3 REG and REPA."""
 
 from .config import (
+    DDTDecoderConfig,
     ExperimentConfig,
     FeaturesConfig,
     ModelConfig,
@@ -8,15 +9,16 @@ from .config import (
     VAEConfig,
     load_config,
 )
-from .model import SiT, SiTOutput
+from .model import DDT, DDTOutput
 
 __all__ = [
+    "DDT",
+    "DDTDecoderConfig",
+    "DDTOutput",
     "ExperimentConfig",
     "FeaturesConfig",
     "ModelConfig",
     "REGConfig",
-    "SiT",
-    "SiTOutput",
     "VAEConfig",
     "load_config",
 ]

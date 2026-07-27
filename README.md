@@ -1,24 +1,43 @@
-# JiT with pixel or FLUX.2 latent diffusion
+# DDT with pixel or FLUX.2 latent diffusion
 
-`jit-reg` trains a class-conditional SiT-B/16 on ImageNet-256. The diffusion
+`jit-reg` trains a class-conditional DDT-B/16 on ImageNet-256. The diffusion
 state can be either RGB pixels or normalized FLUX.2 VAE latents. REG jointly
-denoises DINOv3 representation tokens, while REPA aligns an intermediate SiT
+denoises DINOv3 representation tokens, while REPA aligns an intermediate DDT
 sequence with frozen DINOv3 targets. Pixel/latent input and REG/REPA are
 independent choices.
 
-This repository uses configuration schema v5. Older configs, checkpoints,
+This repository uses configuration schema v7. Older configs, checkpoints,
 training states, and sampling manifests are intentionally incompatible.
 Schema-v3 REG/REPA caches remain reusable.
 
-| Input space | Diffusion tensor | SiT patch | SiT grid |
+| Input space | Diffusion tensor | `model.patch_size` | DDT grid |
 | --- | ---: | ---: | ---: |
 | `pixels` | `3×256×256` | `16×16` | `16×16` |
 | `flux2_latents` | `128×16×16` | `1×1` | `16×16` |
+| `flux2_latents` | `128×16×16` | `2×2` | `8×8` |
 
 FLUX.2 first produces a raw `32×32×32` posterior mode for a 256×256 image.
 Its official 2×2 patchification and stored batch-normalization statistics turn
-that into the `128×16×16` tensor used for diffusion. Both input spaces
-therefore retain the same 256 image-token layout and the same REPA target grid.
+that into the `128×16×16` tensor used for diffusion. `model.in_channels` and
+`model.patch_size` describe this diffusion tensor directly: pixels use 3
+channels and patch size 16, while FLUX.2 uses 128 channels and can use any
+latent patch size that divides 16. REPA targets are resized to the resulting
+DDT grid.
+
+Following the
+[DiffusionBench DDT design](https://github.com/End2End-Diffusion/diffusion-bench/blob/main/src/stage2/models/DDT.py),
+DDT uses an unconditioned 12-layer, width-768 encoder followed by a shared
+2-layer, width-2048 decoder. The encoder sequence is REG data, image patches,
+REG-time tokens, image-time tokens, then class tokens. The primary REG/image
+states receive their matching base-time embeddings and become token-aligned
+decoder conditioning. Fresh REG and image embeddings are decoded jointly with
+adaLN-Zero. One final normalization/modulation is shared by both outputs, with
+only the dimension-specific linear projections kept separate.
+
+Image and REG time use independent Gaussian Fourier embedders. Conditioning
+token counts are configured with `model.num_img_t_tokens`,
+`model.num_reg_t_tokens`, and `model.num_c_tokens`. Conditioning tokens use
+identity RoPE and are excluded from image/REG prediction and REPA targets.
 
 Horizontal flipping is not performed anywhere in the data, cache, or training
 pipelines.
@@ -51,15 +70,24 @@ curl -L \
 
 The presets are:
 
-- `configs/baseline-p16.yaml`: pixel SiT-B/16 baseline.
+- `configs/baseline-p16.yaml`: pixel DDT-B/16 baseline.
 - `configs/latent-baseline-p16.yaml`: online FLUX.2 latent baseline.
 - `configs/reg-repa-p16.yaml`: pooled 4×4 REG plus block-4 REPA.
-- `configs/early-reg-p16.yaml`: block-4 early REG prediction and reinjection.
 
-Any pixel feature preset becomes a latent preset with:
+Any pixel feature preset becomes a patch-1 latent preset with:
 
 ```bash
---override model.input_space=flux2_latents
+--override model.input_space=flux2_latents \
+--override model.in_channels=128 \
+--override model.patch_size=1
+```
+
+To test 2×2 latent patches and an 8×8 DDT grid, use:
+
+```bash
+--override model.input_space=flux2_latents \
+--override model.in_channels=128 \
+--override model.patch_size=2
 ```
 
 Overrides are structured OmegaConf dot-list values. Repeat `--override` once
@@ -86,7 +114,9 @@ For a latent REG/REPA run:
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/cache_latents.py \
   --config configs/reg-repa-p16.yaml \
-  --override model.input_space=flux2_latents
+  --override model.input_space=flux2_latents \
+  --override model.in_channels=128 \
+  --override model.patch_size=1
 ```
 
 The cache stores deterministic posterior modes after FLUX.2 patchification and
@@ -104,6 +134,10 @@ For the pinned ImageNet training split of 1,281,167 images:
 | Latents + REG | 107.5 GiB |
 | Latents + REPA | 547.4 GiB |
 | Latents + REG + REPA | 576.7 GiB |
+
+The REPA rows above assume patch size 1 and a 16×16 target grid. With latent
+patch size 2, REPA uses an 8×8 grid and approximately 117.3 GiB; the latent
+cache itself remains 78.2 GiB because VAE output shape does not change.
 
 The latent formula is:
 
@@ -135,7 +169,9 @@ For a latent REG/REPA experiment, use the same input-space override as training:
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/cache_features.py \
   --config configs/reg-repa-p16.yaml \
-  --override model.input_space=flux2_latents
+  --override model.input_space=flux2_latents \
+  --override model.in_channels=128 \
+  --override model.patch_size=1
 ```
 
 REG and REPA have independent fingerprints. Changing heads, losses, optimizer
@@ -189,6 +225,8 @@ Build both caches using the commands in step 1, then run:
 uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --config configs/reg-repa-p16.yaml \
   --override model.input_space=flux2_latents \
+  --override model.in_channels=128 \
+  --override model.patch_size=1 \
   --override vae.cache.enabled=true \
   --override feature_cache.enabled=true \
   --override data.prefetch_factor=1 \
@@ -309,7 +347,7 @@ Run any command with `--help` for its concise parser-generated reference.
 
 | Argument | Type/default | Description |
 | --- | --- | --- |
-| `--config` | path; `configs/latent-baseline-p16.yaml` | Schema-v5 latent experiment configuration. The input space must be `flux2_latents`. |
+| `--config` | path; `configs/latent-baseline-p16.yaml` | Schema-v7 latent experiment configuration. The input space must be `flux2_latents`. |
 | `--override KEY=VALUE` | repeatable; none | Structured configuration override. Common cache controls are `data.max_samples`, `data.workers`, `vae.micro_batch_size`, `vae.cache.directory`, `vae.cache.batch_size`, and `vae.cache.log_interval`. |
 
 The command writes under `vae.cache.directory/<fingerprint>` and never
@@ -319,7 +357,7 @@ overwrites an incompatible cache.
 
 | Argument | Type/default | Description |
 | --- | --- | --- |
-| `--config` | path; `configs/baseline-p16.yaml` | Schema-v5 experiment configuration. REG or REPA must be enabled. |
+| `--config` | path; `configs/baseline-p16.yaml` | Schema-v7 experiment configuration. REG or REPA must be enabled. |
 | `--override KEY=VALUE` | repeatable; none | Structured override controlling active components, dataset limits, cache directory, batch size, logging, or preprocessing identity. |
 
 The command writes independent `reg/<fingerprint>` and `repa/<fingerprint>`
@@ -329,7 +367,7 @@ components beneath `feature_cache.directory`.
 
 | Argument | Type/default | Description |
 | --- | --- | --- |
-| `--config` | path; `configs/baseline-p16.yaml` | Schema-v5 experiment configuration. |
+| `--config` | path; `configs/baseline-p16.yaml` | Schema-v7 experiment configuration. |
 | `--override KEY=VALUE` | repeatable; none | Structured override applied before final validation. |
 | `--output` | path; none | Run root. Rewrites checkpoint and validation-plan paths beneath this directory. Without it, configured paths are used directly. |
 | `--resume` | checkpoint path; none | Resume model, EMA, optimizer, RNG streams, epoch/step, validation state, and cache identities from a compatible checkpoint directory. |
@@ -381,11 +419,35 @@ start/end endpoints.
 | `second` | path; required positional | Second `evaluation.json`. |
 | `--output` | path; optional | Write the comparison JSON. The comparison is always printed to stdout. |
 
+## Model conditioning tokens
+
+The standard presets use one image-timestep token and one class token. REG
+presets also use one REG-timestep token:
+
+```yaml
+model:
+  num_img_t_tokens: 1
+  num_reg_t_tokens: 1  # must be 0 when REG is disabled
+  num_c_tokens: 1
+  decoder:
+    hidden_size: 2048
+    depth: 2
+    num_heads: 16
+    mlp_ratio: 4.0
+```
+
+Each count may be zero. `GaussianFourierEmbedding` uses a fixed random Fourier
+frequency vector, an MLP, and learned token offsets initialized with standard
+deviation `1/sqrt(hidden_size)`. `ConditionEmbedder` applies the same learned
+offset construction to the label embedding. Encoder outputs plus their
+matching image or REG base-time embeddings provide token-aligned decoder
+conditioning.
+
 ## Feature configuration
 
 REG and REPA remain configured under `model.features`. REG predicts clean
 DINOv3 tokens and has its own time distribution. REPA aligns an intermediate
-SiT sequence with frozen targets and can cover image tokens or image plus REG
+DDT encoder sequence with frozen targets and can cover image tokens or image plus REG
 tokens.
 
 ```yaml
@@ -401,15 +463,6 @@ model:
       target_std: 0.53
       spatial_rope: true
       loss_weight: 0.03
-      head:
-        kind: standard       # standard | wide_mlp
-        hidden_size: 2048
-        depth: 2
-        mlp_ratio: 4.0
-      early_prediction:
-        block: null
-        projection_hidden_size: 2048
-        reinjection_mode: replace  # replace | add
     repa:
       enabled: true
       block: 4

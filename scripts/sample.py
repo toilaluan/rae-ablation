@@ -11,7 +11,7 @@ from jit_reg.checkpoint_bundle import load_checkpoint_bundle
 from jit_reg.distributed import broadcast_string, initialize_distributed
 from jit_reg.evaluation import evaluate_npz, save_evaluation
 from jit_reg.model.compile import compile_model_regions
-from jit_reg.model.sit import SiT
+from jit_reg.model.ddt import DDT
 from jit_reg.sample_runtime import (
     FEATURE_SCHEMA_VERSION,
     SamplingParameters,
@@ -100,7 +100,7 @@ def main() -> None:
     digest = checkpoint_sha256(bundle.weights) if rank == 0 else None
     digest = broadcast_string(digest, rank)
 
-    model = SiT(config.model).to(device)
+    model = DDT(config.model).to(device)
     model.load_state_dict(load_file(str(bundle.weights), device=str(device)))
     model.eval()
     execution_model = compile_model_regions(model, config.compile)
@@ -171,11 +171,17 @@ def main() -> None:
         num_classes=config.model.num_classes,
         image_size=config.model.image_size,
         patch_size=config.model.patch_size,
+        grid_size=config.model.grid_size,
         model_variant=config.model.model_variant,
         feature_schema={
             "schema_version": FEATURE_SCHEMA_VERSION,
             "input_space": config.model.input_space,
             "input_shape": list(config.model.input_shape),
+            "conditioning_tokens": {
+                "image_timestep": config.model.num_img_t_tokens,
+                "reg_timestep": config.model.num_reg_t_tokens,
+                "class": config.model.num_c_tokens,
+            },
             "vae": (
                 {
                     "model_name": config.vae.model_name,
