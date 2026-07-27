@@ -36,7 +36,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--solver", choices=("euler", "heun"))
     parser.add_argument("--guidance-scale", type=float)
     parser.add_argument("--timestep-shift", type=float)
-    parser.add_argument("--reg-timestep-ratio", type=float)
+    parser.add_argument("--reg-timestep-shift", type=float)
+    parser.add_argument(
+        "--img-denoising-interval", type=float, nargs=2, metavar=("START", "END")
+    )
+    parser.add_argument(
+        "--reg-denoising-interval", type=float, nargs=2, metavar=("START", "END")
+    )
     parser.add_argument("--cfg-start", type=float)
     parser.add_argument("--cfg-end", type=float)
     parser.add_argument("--log-interval", type=int)
@@ -72,11 +78,14 @@ def main() -> None:
         timestep_shift=float(
             _value(args.timestep_shift, defaults.timestep_shift)
         ),
-        reg_timestep_ratio=float(
-            _value(
-                args.reg_timestep_ratio,
-                reg.timestep.sample_ratio if reg.enabled else 1.0,
-            )
+        reg_timestep_shift=float(
+            _value(args.reg_timestep_shift, defaults.reg_timestep_shifts[0])
+        ),
+        img_denoising_interval=tuple(
+            _value(args.img_denoising_interval, defaults.img_denoising_interval)
+        ),
+        reg_denoising_interval=tuple(
+            _value(args.reg_denoising_interval, defaults.reg_denoising_interval)
         ),
         cfg_start=float(_value(args.cfg_start, defaults.cfg_start)),
         cfg_end=float(_value(args.cfg_end, defaults.cfg_end)),
@@ -132,7 +141,9 @@ def main() -> None:
                 steps=parameters.sampling_steps,
                 guidance_scale=parameters.guidance_scale,
                 timestep_shift=parameters.timestep_shift,
-                reg_timestep_ratio=parameters.reg_timestep_ratio,
+                reg_timestep_shift=parameters.reg_timestep_shift,
+                img_denoising_interval=parameters.img_denoising_interval,
+                reg_denoising_interval=parameters.reg_denoising_interval,
                 cfg_interval=(parameters.cfg_start, parameters.cfg_end),
                 solver=parameters.solver,
                 num_classes=config.model.num_classes,

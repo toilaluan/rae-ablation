@@ -28,26 +28,29 @@ from jit_reg.validation_runtime import validate_ema
 
 ROOT = Path(__file__).resolve().parents[1]
 FEATURE_SCHEMA = {
-    "schema_version": 3,
+    "schema_version": 4,
     "encoder": {},
     "reg": {"enabled": False},
     "repa": {"enabled": False},
 }
 
 
-def test_sampling_output_name_includes_relative_reg_schedule() -> None:
+def test_sampling_output_name_includes_asynchronous_reg_schedule() -> None:
     name = sampling_output_name(
         10,
         SamplingParameters(
             sampling_steps=3,
             timestep_shift=2,
-            reg_timestep_ratio=0.5,
+            reg_timestep_shift=0.5,
+            img_denoising_interval=(1 / 3, 1.0),
+            reg_denoising_interval=(0.0, 2 / 3),
         ),
     )
-    assert "-shift2p0-regshift0p5-" in name
+    assert "-shift2p0-regshift0p5-imgint" in name
+    assert "-regint0p0-" in name
 
 
-def test_sampling_manifest_has_v3_features_and_rejects_old_schema(
+def test_sampling_manifest_has_v4_features_and_rejects_old_schema(
     tmp_path: Path,
 ) -> None:
     plan = create_validation_plan(4, 2, 2, seed=4)
@@ -63,7 +66,9 @@ def test_sampling_manifest_has_v3_features_and_rejects_old_schema(
     parameters = SamplingParameters(
         batch_size=2,
         sampling_steps=2,
-        reg_timestep_ratio=0.5,
+        reg_timestep_shift=0.5,
+        img_denoising_interval=(0.5, 1.0),
+        reg_denoising_interval=(0.0, 0.5),
         log_interval=1,
     )
     output = tmp_path / "samples"
@@ -82,13 +87,15 @@ def test_sampling_manifest_has_v3_features_and_rejects_old_schema(
     )
     assert archive.is_file()
     manifest = json.loads((output / "samples.json").read_text())
-    assert manifest["schema_version"] == 11
+    assert manifest["schema_version"] == 12
     assert manifest["feature_schema"] == FEATURE_SCHEMA
-    assert manifest["sampling"]["reg_timestep_ratio"] == 0.5
+    assert manifest["sampling"]["reg_timestep_shift"] == 0.5
+    assert manifest["sampling"]["img_denoising_steps"] == 1
+    assert manifest["sampling"]["reg_denoising_steps"] == 1
 
     old = tmp_path / "old"
     old.mkdir()
-    (old / "samples.json").write_text(json.dumps({"schema_version": 10}))
+    (old / "samples.json").write_text(json.dumps({"schema_version": 11}))
     with pytest.raises(ValueError, match="old manifests"):
         sample_to_archive(
             output_dir=old,
@@ -186,6 +193,71 @@ def test_validation_fid_label_uses_actual_count(
     )
     assert metrics["validation/FID-2"] == 12.5
     assert (output / "evaluation.json").is_file()
+
+
+def test_validation_sweeps_reg_shifts_and_runs_final_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import jit_reg.validation_runtime as runtime
+
+    class TinyModel(nn.Module):
+        def __init__(self, config: object) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(()))
+
+    evaluated: list[tuple[int, str]] = []
+
+    def fake_evaluate(path: Path, *args: object, **kwargs: object) -> dict[str, float]:
+        del args, kwargs
+        with np.load(path) as values:
+            count = len(values["arr_0"])
+        name = str(path)
+        evaluated.append((count, name))
+        if count == 4:
+            return {"FID": 9.0}
+        return {"FID": 3.0 if "regshift0p5" in name else 2.0}
+
+    monkeypatch.setattr(runtime, "SiT", TinyModel)
+    monkeypatch.setattr(runtime, "compile_model_regions", lambda model, config: model)
+    monkeypatch.setattr(runtime, "ode_sample", lambda model, noise, labels, **kwargs: noise)
+    monkeypatch.setattr(runtime, "evaluate_npz", fake_evaluate)
+    config = ExperimentConfig()
+    config.model.image_size = 8
+    config.model.patch_size = 4
+    config.model.num_classes = 2
+    config.model.features.reg.enabled = True
+    config.model.features.reg.pool_size = 1
+    config.model.features.encoder.feature_dim = 2
+    config.validation.periodic_samples = 2
+    config.validation.final_samples = 4
+    config.compile.enabled = False
+    plan = create_validation_plan(4, 2, 2, seed=5)
+    ema = SimpleNamespace(state_dict=lambda: {"weight": torch.zeros(())})
+    candidates = [
+        SamplingParameters(
+            batch_size=1,
+            sampling_steps=2,
+            reg_timestep_shift=shift,
+            log_interval=1,
+        )
+        for shift in (0.5, 1.5)
+    ]
+    metrics, output = validate_ema(
+        ema=ema,  # type: ignore[arg-type]
+        config=config,
+        plan=plan,
+        completed_epoch=1,
+        final=True,
+        output_root=tmp_path,
+        sampling=candidates,
+    )
+    assert metrics["validation/FID-2"] == 2.0
+    assert metrics["validation/best_reg_timestep_shift"] == 1.5
+    assert metrics["validation/FID-4"] == 9.0
+    assert [count for count, _name in evaluated] == [2, 2, 4]
+    assert "selected-final" in str(output)
+    summary = json.loads((tmp_path / "epoch-0001-final" / "sweep.json").read_text())
+    assert summary["best_reg_timestep_shift"] == 1.5
 
 
 def test_standalone_sampling_inherits_defaults_and_evaluate_writes_artifact(

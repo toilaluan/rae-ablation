@@ -5,7 +5,7 @@ jointly denoises DINOv3 representation tokens; REPA aligns an intermediate SiT
 sequence with frozen DINOv3 targets. Either feature can be enabled independently,
 and disabling both leaves the baseline model and objective unchanged.
 
-This repository uses configuration schema v3. Older configs, checkpoints, REG
+This repository uses configuration schema v4. Older configs, checkpoints, REG
 feature caches, and sampling manifests are intentionally incompatible and must be
 rebuilt. Independent REPA caches remain reusable.
 
@@ -13,12 +13,12 @@ rebuilt. Independent REPA caches remain reusable.
 
 - `configs/baseline-p16.yaml`: feature-free SiT-B/16 baseline.
 - `configs/reg-repa-p16.yaml`: pooled 4×4 spatial REG plus block-4,
-  full-sequence REPA; equal image and REG time.
+  full-sequence REPA; REG leads image denoising.
 - `configs/early-reg-p16.yaml`: pooled 4×4 spatial REG with aligned 2D RoPE, a
-  block-4 2048-wide depth-2 head, additive FC–GELU–FC reinjection, and equal
-  image and REG time.
+  block-4 2048-wide depth-2 head, additive FC–GELU–FC reinjection, and leading
+  REG denoising.
 
-The v3 feature configuration lives under `model.features`:
+The v4 feature configuration lives under `model.features`:
 
 ```yaml
 model:
@@ -38,10 +38,6 @@ model:
         hidden_size: 2048
         depth: 2
         mlp_ratio: 4.0
-      timestep:
-        train_ratio_min: 1.0
-        train_ratio_max: 1.0
-        sample_ratio: 1.0
       early_prediction:
         block: null          # null predicts after the final block
         projection_hidden_size: 2048
@@ -58,6 +54,30 @@ Every transformer block uses the same adaLN weights for both streams while apply
 image-time parameters to image tokens and REG-time parameters to REG tokens. REG
 heads predict clean x₀. The REG velocity objective is derived from that x₀ using
 REG time; the pixel objective uses image time.
+
+Image and REG training times are independent sigmoid-normal draws:
+
+```yaml
+train:
+  timestep_loc: -0.8
+  timestep_scale: 0.8
+  reg_timestep_loc: -0.8
+  reg_timestep_scale: 0.8
+```
+
+Sampling uses one global solver loop with independent local clocks. Fractional
+intervals are rounded to the nearest global step edge. For 50 steps, the example
+below gives each stream 35 updates: REG runs on steps 0–35 and image runs on
+steps 15–50.
+
+```yaml
+sampling:
+  sampling_steps: 50
+  timestep_shift: 1.0
+  reg_timestep_shifts: [0.7, 1.0, 1.3]
+  img_denoising_interval: [0.3, 1.0]
+  reg_denoising_interval: [0.0, 0.7]
+```
 
 ## Environment
 
@@ -176,6 +196,8 @@ or 498.5 GiB for both.
 Standalone sampling inherits `sampling.*` from the checkpoint. Explicit sampling
 flags override individual defaults. REG checkpoints jointly integrate distinct
 image and REG schedules with Euler or Heun; CFG-window decisions use image time.
+Standalone sampling uses the first configured REG timestep shift unless
+`--reg-timestep-shift` overrides it.
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
@@ -187,8 +209,14 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
   --evaluate
 ```
 
+During training validation, every configured `sampling.reg_timestep_shifts`
+candidate is evaluated on the shared periodic subset. The lowest FID is reported
+as `validation/FID-10K` by the default presets, and its shift is reported as
+`validation/best_reg_timestep_shift`. Final validation repeats the 10K sweep and
+runs the 50K evaluation once with the winner.
+
 `--evaluate` computes FID on rank zero using the checkpoint’s `evaluation.*`
 settings and writes `evaluation.json` beside `samples.npz`. Output names and
-manifests record the relative REG schedule and complete schema-v3 feature
-description. Sampling is rank-partitioned and resumable only from a compatible
-schema-v3 manifest.
+manifests record both denoising intervals, effective step counts, and image/REG
+timestep shifts. Sampling is rank-partitioned and resumable only from a compatible
+schema-v12 manifest.

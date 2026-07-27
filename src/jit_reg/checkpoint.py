@@ -13,7 +13,7 @@ from torch import Tensor, nn
 
 from .model.compile import clean_state_dict
 
-CHECKPOINT_SCHEMA_VERSION = 3
+CHECKPOINT_SCHEMA_VERSION = 4
 TRAINING_STATE_SCHEMA_VERSION = 4
 
 
@@ -93,6 +93,7 @@ class CheckpointManager:
         resolved_config: dict[str, Any],
         feature_cache_fingerprints: dict[str, str] | None = None,
         fid: float | None = None,
+        best_reg_timestep_shift: float | None = None,
     ) -> Path:
         name = f"epoch-{completed_epoch:04d}"
         target = self.directory / name
@@ -147,7 +148,16 @@ class CheckpointManager:
             best_path = self.directory / "best-fid.json"
             previous = json.loads(best_path.read_text()) if best_path.exists() else None
             if previous is None or fid < previous["fid"]:
-                best_path.write_text(json.dumps({"fid": fid, "checkpoint": name}) + "\n")
+                best_path.write_text(
+                    json.dumps(
+                        {
+                            "fid": fid,
+                            "checkpoint": name,
+                            "reg_timestep_shift": best_reg_timestep_shift,
+                        }
+                    )
+                    + "\n"
+                )
                 self._point("best-fid", name)
         self._retain()
         return target
@@ -199,7 +209,7 @@ class CheckpointManager:
         metadata_path = path / "metadata.json"
         if not metadata_path.is_file():
             raise ValueError(
-                "checkpoint predates schema v3; old checkpoints are not supported"
+                "checkpoint predates schema v4; old checkpoints are not supported"
             )
         metadata = json.loads(metadata_path.read_text())
         if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:

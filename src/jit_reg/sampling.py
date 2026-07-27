@@ -7,7 +7,7 @@ from typing import Literal, NamedTuple, overload
 import torch
 from torch import Tensor, nn
 
-from .objective import shift_timestep
+from .objective import local_denoising_schedule, shift_timestep
 
 Solver = Literal["euler", "heun"]
 
@@ -42,7 +42,9 @@ def ode_sample(
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
-    reg_timestep_ratio: float = 1.0,
+    reg_timestep_shift: float = 1.0,
+    img_denoising_interval: tuple[float, float] = (0.0, 1.0),
+    reg_denoising_interval: tuple[float, float] = (0.0, 1.0),
     cfg_interval: tuple[float, float] = (0.0, 0.9),
     solver: Solver = "euler",
     num_classes: int | None = None,
@@ -59,7 +61,9 @@ def ode_sample(
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
-    reg_timestep_ratio: float = 1.0,
+    reg_timestep_shift: float = 1.0,
+    img_denoising_interval: tuple[float, float] = (0.0, 1.0),
+    reg_denoising_interval: tuple[float, float] = (0.0, 1.0),
     cfg_interval: tuple[float, float] = (0.0, 0.9),
     solver: Solver = "euler",
     num_classes: int | None = None,
@@ -76,7 +80,9 @@ def ode_sample(
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
-    reg_timestep_ratio: float = 1.0,
+    reg_timestep_shift: float = 1.0,
+    img_denoising_interval: tuple[float, float] = (0.0, 1.0),
+    reg_denoising_interval: tuple[float, float] = (0.0, 1.0),
     cfg_interval: tuple[float, float] = (0.0, 0.9),
     solver: Solver = "euler",
     num_classes: int | None = None,
@@ -86,8 +92,8 @@ def ode_sample(
         raise ValueError("sampling steps must be positive")
     if not math.isfinite(timestep_shift) or timestep_shift <= 0:
         raise ValueError("timestep shift must be finite and positive")
-    if not math.isfinite(reg_timestep_ratio) or reg_timestep_ratio <= 0:
-        raise ValueError("REG timestep ratio must be finite and positive")
+    if not math.isfinite(reg_timestep_shift) or reg_timestep_shift <= 0:
+        raise ValueError("REG timestep shift must be finite and positive")
     if not math.isfinite(guidance_scale):
         raise ValueError("guidance scale must be finite")
     cfg_start, cfg_end = cfg_interval
@@ -109,9 +115,18 @@ def ode_sample(
     reg_state = reg_noise.float() if reg_noise is not None else None
     null_labels = torch.full_like(labels, num_classes)
     combined_labels = torch.cat((labels, null_labels))
-    u = torch.linspace(0, 1, steps + 1, device=noise.device, dtype=torch.float32)
-    image_schedule = shift_timestep(u, timestep_shift)
-    reg_schedule = shift_timestep(image_schedule, reg_timestep_ratio)
+    image_schedule = shift_timestep(
+        local_denoising_schedule(
+            img_denoising_interval, steps, device=noise.device
+        ),
+        timestep_shift,
+    )
+    reg_schedule = shift_timestep(
+        local_denoising_schedule(
+            reg_denoising_interval, steps, device=noise.device
+        ),
+        reg_timestep_shift,
+    )
 
     def predict_clean(
         image_state: Tensor,
@@ -233,7 +248,9 @@ def euler_sample(
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
-    reg_timestep_ratio: float = 1.0,
+    reg_timestep_shift: float = 1.0,
+    img_denoising_interval: tuple[float, float] = (0.0, 1.0),
+    reg_denoising_interval: tuple[float, float] = (0.0, 1.0),
     cfg_interval: tuple[float, float] = (0.0, 0.9),
     num_classes: int | None = None,
 ) -> Tensor | ODESample:
@@ -246,7 +263,9 @@ def euler_sample(
         steps=steps,
         guidance_scale=guidance_scale,
         timestep_shift=timestep_shift,
-        reg_timestep_ratio=reg_timestep_ratio,
+        reg_timestep_shift=reg_timestep_shift,
+        img_denoising_interval=img_denoising_interval,
+        reg_denoising_interval=reg_denoising_interval,
         cfg_interval=cfg_interval,
         solver="euler",
         num_classes=num_classes,
@@ -262,7 +281,9 @@ def heun_sample(
     steps: int = 50,
     guidance_scale: float = 1.78,
     timestep_shift: float = 1.0,
-    reg_timestep_ratio: float = 1.0,
+    reg_timestep_shift: float = 1.0,
+    img_denoising_interval: tuple[float, float] = (0.0, 1.0),
+    reg_denoising_interval: tuple[float, float] = (0.0, 1.0),
     cfg_interval: tuple[float, float] = (0.0, 0.9),
     num_classes: int | None = None,
 ) -> Tensor | ODESample:
@@ -275,7 +296,9 @@ def heun_sample(
         steps=steps,
         guidance_scale=guidance_scale,
         timestep_shift=timestep_shift,
-        reg_timestep_ratio=reg_timestep_ratio,
+        reg_timestep_shift=reg_timestep_shift,
+        img_denoising_interval=img_denoising_interval,
+        reg_denoising_interval=reg_denoising_interval,
         cfg_interval=cfg_interval,
         solver="heun",
         num_classes=num_classes,

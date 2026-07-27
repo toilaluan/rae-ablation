@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=Path("configs/baseline-p16.yaml"),
-        help="schema-v3 experiment YAML (default: configs/baseline-p16.yaml)",
+        help="schema-v4 experiment YAML (default: configs/baseline-p16.yaml)",
     )
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
@@ -54,20 +54,31 @@ def main() -> None:
     config.validate()
     sampling_config = config.sampling
     reg_config = config.model.features.reg
-    sampling = SamplingParameters(
-        batch_size=sampling_config.batch_size,
-        sampling_steps=sampling_config.sampling_steps,
-        solver=sampling_config.solver,
-        guidance_scale=sampling_config.guidance_scale,
-        timestep_shift=sampling_config.timestep_shift,
-        reg_timestep_ratio=(
-            reg_config.timestep.sample_ratio if reg_config.enabled else 1.0
-        ),
-        cfg_start=sampling_config.cfg_start,
-        cfg_end=sampling_config.cfg_end,
-        log_interval=sampling_config.log_interval,
+    reg_shifts = (
+        sampling_config.reg_timestep_shifts if reg_config.enabled else [1.0]
     )
-    sampling.validate()
+    sampling_candidates = [
+        SamplingParameters(
+            batch_size=sampling_config.batch_size,
+            sampling_steps=sampling_config.sampling_steps,
+            solver=sampling_config.solver,
+            guidance_scale=sampling_config.guidance_scale,
+            timestep_shift=sampling_config.timestep_shift,
+            reg_timestep_shift=reg_shift,
+            img_denoising_interval=tuple(
+                sampling_config.img_denoising_interval
+            ),
+            reg_denoising_interval=tuple(
+                sampling_config.reg_denoising_interval
+            ),
+            cfg_start=sampling_config.cfg_start,
+            cfg_end=sampling_config.cfg_end,
+            log_interval=sampling_config.log_interval,
+        )
+        for reg_shift in reg_shifts
+    ]
+    for sampling in sampling_candidates:
+        sampling.validate()
     if not Path(config.evaluation.reference_npz).is_file():
         raise FileNotFoundError(config.evaluation.reference_npz)
 
@@ -183,7 +194,7 @@ def main() -> None:
             completed_epoch=epoch,
             final=final,
             output_root=output_root,
-            sampling=sampling,
+            sampling=sampling_candidates,
         )
         if rank == 0:
             labels = ", ".join(str(value) for value in plan.labels[:16].tolist())

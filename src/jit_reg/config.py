@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 4
 
 
 def _positive(name: str, *values: int | float) -> None:
@@ -38,13 +38,6 @@ class REGEarlyPredictionConfig:
 
 
 @dataclass
-class REGTimestepConfig:
-    train_ratio_min: float = 1.0
-    train_ratio_max: float = 1.0
-    sample_ratio: float = 1.0
-
-
-@dataclass
 class REGConfig:
     enabled: bool = False
     pool_size: int = 4
@@ -52,7 +45,6 @@ class REGConfig:
     spatial_rope: bool = True
     loss_weight: float = 0.03
     head: REGHeadConfig = field(default_factory=REGHeadConfig)
-    timestep: REGTimestepConfig = field(default_factory=REGTimestepConfig)
     early_prediction: REGEarlyPredictionConfig = field(
         default_factory=REGEarlyPredictionConfig
     )
@@ -153,6 +145,8 @@ class TrainConfig:
     seed: int = 0
     timestep_loc: float = 0.0
     timestep_scale: float = 1.0
+    reg_timestep_loc: float = 0.0
+    reg_timestep_scale: float = 1.0
     horizontal_flip_probability: float = 0.5
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
@@ -165,6 +159,13 @@ class SamplingConfig:
     solver: str = "euler"
     guidance_scale: float = 1.78
     timestep_shift: float = 1.0
+    reg_timestep_shifts: list[float] = field(default_factory=lambda: [1.0])
+    img_denoising_interval: list[float] = field(
+        default_factory=lambda: [0.0, 1.0]
+    )
+    reg_denoising_interval: list[float] = field(
+        default_factory=lambda: [0.0, 1.0]
+    )
     cfg_start: float = 0.0
     cfg_end: float = 0.9
     log_interval: int = 10
@@ -302,16 +303,6 @@ class ExperimentConfig:
                     "model.features.reg.early_prediction.reinjection_mode "
                     "must be replace or add"
                 )
-            timing = reg.timestep
-            values = (
-                timing.train_ratio_min,
-                timing.train_ratio_max,
-                timing.sample_ratio,
-            )
-            if any(not math.isfinite(value) or value <= 0 for value in values):
-                raise ValueError("REG timestep ratios must be finite and positive")
-            if timing.train_ratio_min > timing.train_ratio_max:
-                raise ValueError("REG train timestep ratio minimum cannot exceed maximum")
         if features.repa.enabled:
             repa = features.repa
             if not 1 <= repa.block <= m.depth:
@@ -366,6 +357,16 @@ class ExperimentConfig:
             raise ValueError("train.timestep_loc must be finite")
         if not math.isfinite(self.train.timestep_scale) or self.train.timestep_scale <= 0:
             raise ValueError("train.timestep_scale must be finite and positive")
+        if features.reg.enabled:
+            if not math.isfinite(self.train.reg_timestep_loc):
+                raise ValueError("train.reg_timestep_loc must be finite")
+            if (
+                not math.isfinite(self.train.reg_timestep_scale)
+                or self.train.reg_timestep_scale <= 0
+            ):
+                raise ValueError(
+                    "train.reg_timestep_scale must be finite and positive"
+                )
         if not 0 <= self.train.horizontal_flip_probability <= 1:
             raise ValueError("train.horizontal_flip_probability must be in [0, 1]")
         if features.enabled:
@@ -408,6 +409,35 @@ class ExperimentConfig:
             raise ValueError("sampling.guidance_scale must be finite")
         if not math.isfinite(sampling.timestep_shift) or sampling.timestep_shift <= 0:
             raise ValueError("sampling.timestep_shift must be finite and positive")
+        shifts = sampling.reg_timestep_shifts
+        if (
+            not shifts
+            or any(not math.isfinite(value) or value <= 0 for value in shifts)
+            or len(set(shifts)) != len(shifts)
+        ):
+            raise ValueError(
+                "sampling.reg_timestep_shifts must be non-empty, unique, finite, "
+                "and positive"
+            )
+        for name, interval in (
+            ("sampling.img_denoising_interval", sampling.img_denoising_interval),
+            ("sampling.reg_denoising_interval", sampling.reg_denoising_interval),
+        ):
+            if len(interval) != 2:
+                raise ValueError(f"{name} must contain exactly [start, end]")
+            start, end = interval
+            if (
+                not math.isfinite(start)
+                or not math.isfinite(end)
+                or not 0 <= start < end <= 1
+            ):
+                raise ValueError(f"{name} must satisfy 0 <= start < end <= 1")
+            start_step = math.floor(start * sampling.sampling_steps + 0.5)
+            end_step = math.floor(end * sampling.sampling_steps + 0.5)
+            if start_step >= end_step:
+                raise ValueError(
+                    f"{name} collapses to zero steps after rounding"
+                )
         if not 0 <= sampling.cfg_start <= sampling.cfg_end <= 1:
             raise ValueError("sampling CFG interval must satisfy 0 <= start <= end <= 1")
 
@@ -475,7 +505,7 @@ def load_checkpoint_config(path: str | Path) -> ExperimentConfig:
     )
     train = values.get("train")
     if isinstance(train, dict):
-        # Retired runtime-only field from schema-v3 checkpoints. Per-rank batch
+        # Retired runtime-only field from pre-v4 checkpoints. Per-rank batch
         # size is now derived from global_batch_size and distributed world size.
         train.pop("micro_batch_size", None)
     return _structured_config(values)

@@ -123,7 +123,12 @@ class RecordingLogger(RunLogger):
         self.metrics.append(metrics)
 
 
-def save_checkpoint(tmp_path: Path) -> tuple[CheckpointManager, Path, SiT]:
+def save_checkpoint(
+    tmp_path: Path,
+    *,
+    fid: float | None = None,
+    reg_timestep_shift: float | None = None,
+) -> tuple[CheckpointManager, Path, SiT]:
     config = tiny_experiment()
     model = SiT(config.model)
     plan = create_validation_plan(2, 2, 2, seed=7)
@@ -143,14 +148,26 @@ def save_checkpoint(tmp_path: Path) -> tuple[CheckpointManager, Path, SiT]:
         last_completed_validation_epoch=None,
         wandb_run_id=None,
         resolved_config=config.as_dict(),
+        fid=fid,
+        best_reg_timestep_shift=reg_timestep_shift,
     )
     return manager, path, model
 
 
-def test_v3_checkpoint_bundle_and_v4_training_resume(tmp_path: Path) -> None:
+def test_best_fid_metadata_tracks_reg_timestep_shift(tmp_path: Path) -> None:
+    save_checkpoint(tmp_path, fid=3.5, reg_timestep_shift=1.3)
+    best = json.loads((tmp_path / "checkpoints" / "best-fid.json").read_text())
+    assert best == {
+        "fid": 3.5,
+        "checkpoint": "epoch-0001",
+        "reg_timestep_shift": 1.3,
+    }
+
+
+def test_v4_checkpoint_bundle_and_training_resume(tmp_path: Path) -> None:
     manager, checkpoint, model = save_checkpoint(tmp_path)
     metadata = json.loads((checkpoint / "metadata.json").read_text())
-    assert metadata["schema_version"] == 3
+    assert metadata["schema_version"] == 4
     training = torch.load(checkpoint / "training.pt", weights_only=False)
     assert training["schema_version"] == 4
     restored = SiT(model.config)
@@ -164,7 +181,7 @@ def test_v3_checkpoint_bundle_and_v4_training_resume(tmp_path: Path) -> None:
     assert resumed.epoch == 1
     bundle = load_checkpoint_bundle(tmp_path / "checkpoints")
     assert bundle.directory == checkpoint.resolve()
-    assert bundle.config.schema_version == 3
+    assert bundle.config.schema_version == 4
 
 
 def test_old_training_resume_is_rejected_before_model_mutation(
@@ -219,7 +236,7 @@ def test_old_checkpoint_schema_is_explicitly_rejected(tmp_path: Path) -> None:
         load_checkpoint_bundle(checkpoint)
 
 
-def test_rng_streams_checkpoint_relative_reg_timing() -> None:
+def test_rng_streams_checkpoint_independent_reg_timing() -> None:
     streams = RNGStreams.create(12)
     saved = streams.state_dict()
     first = torch.rand(5, generator=streams.reg_timesteps)
@@ -228,7 +245,7 @@ def test_rng_streams_checkpoint_relative_reg_timing() -> None:
     assert torch.equal(first, second)
     old = dict(saved)
     old.pop("reg_timesteps")
-    with pytest.raises(ValueError, match="incompatible with schema v3"):
+    with pytest.raises(ValueError, match="incompatible with schema v4"):
         streams.load_state_dict(old)
 
 

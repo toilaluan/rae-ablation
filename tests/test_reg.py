@@ -9,10 +9,11 @@ from torch import nn
 
 from jit_reg.model.sit import SiTOutput
 from jit_reg.objective import (
+    denoising_step_bounds,
     jit_losses,
+    local_denoising_schedule,
     noisy_interpolate,
-    sample_reg_timesteps,
-    shift_timestep,
+    sample_timesteps,
 )
 from jit_reg.reg import (
     FeatureTargets,
@@ -79,24 +80,32 @@ def test_negative_cosine_repa_loss() -> None:
     assert negative_cosine_repa_loss(target, target) == pytest.approx(-1.0)
 
 
-def test_log_uniform_reg_timing_is_deterministic_and_equal_time_is_exact() -> None:
-    image_time = torch.linspace(0.1, 0.9, 8)
-    first = sample_reg_timesteps(
-        image_time, 0.5, 2.0, torch.Generator().manual_seed(7)
+def test_independent_reg_timing_is_deterministic() -> None:
+    image_time = sample_timesteps(
+        8, torch.Generator().manual_seed(7), "cpu", loc=-0.8, scale=0.8
     )
-    second = sample_reg_timesteps(
-        image_time, 0.5, 2.0, torch.Generator().manual_seed(7)
+    first = sample_timesteps(
+        8, torch.Generator().manual_seed(11), "cpu", loc=-0.8, scale=0.8
     )
-    assert torch.equal(first[0], second[0])
-    assert torch.equal(first[1], second[1])
-    assert torch.all((first[1] >= 0.5) & (first[1] <= 2.0))
-    assert torch.allclose(first[0], shift_timestep(image_time, first[1]))
+    second = sample_timesteps(
+        8, torch.Generator().manual_seed(11), "cpu", loc=-0.8, scale=0.8
+    )
+    assert torch.equal(first, second)
+    assert not torch.equal(first, image_time)
 
-    equal_time, ratio = sample_reg_timesteps(
-        image_time, 1.0, 1.0, torch.Generator().manual_seed(1)
-    )
-    assert torch.equal(equal_time, image_time)
-    assert torch.equal(ratio, torch.ones_like(image_time))
+
+def test_denoising_intervals_quantize_and_freeze_local_clocks() -> None:
+    assert denoising_step_bounds((0.0, 0.7), 50) == (0, 35)
+    assert denoising_step_bounds((0.3, 1.0), 50) == (15, 50)
+    assert denoising_step_bounds((0.25, 0.75), 2) == (1, 2)
+    reg = local_denoising_schedule((0.0, 0.7), 10, device="cpu")
+    image = local_denoising_schedule((0.3, 1.0), 10, device="cpu")
+    assert torch.equal(reg[:1], torch.tensor([0.0]))
+    assert torch.all(reg[7:] == 1)
+    assert torch.all(image[:4] == 0)
+    assert image[-1] == 1
+    with pytest.raises(ValueError, match="collapses"):
+        denoising_step_bounds((0.01, 0.02), 10)
 
 
 def test_reg_velocity_loss_uses_reg_timestep() -> None:
@@ -186,7 +195,7 @@ def test_sampler_jointly_integrates_dual_schedules_and_x0(solver: str) -> None:
         solver=solver,
         guidance_scale=1,
         timestep_shift=1,
-        reg_timestep_ratio=0.5,
+        reg_timestep_shift=0.5,
         cfg_interval=(1, 1),
     )
     assert isinstance(output, ODESample)
@@ -208,10 +217,31 @@ def test_cfg_window_uses_image_time_with_heterogeneous_reg_time() -> None:
         reg_noise=torch.randn(1, 1, 3),
         steps=2,
         guidance_scale=2,
-        reg_timestep_ratio=0.1,
+        reg_timestep_shift=0.1,
         cfg_interval=(0.4, 0.6),
     )
     assert [call[2] for call in model.calls] == [1, 2]
+
+
+def test_sampler_runs_asynchronous_reg_lead_and_image_follow() -> None:
+    model = RecordingCleanModel()
+    output = ode_sample(
+        model,
+        torch.randn(1, 1, 2, 2),
+        torch.tensor([1]),
+        reg_noise=torch.randn(1, 1, 3),
+        steps=10,
+        guidance_scale=1,
+        img_denoising_interval=(0.3, 1.0),
+        reg_denoising_interval=(0.0, 0.7),
+        cfg_interval=(1, 1),
+    )
+    assert isinstance(output, ODESample)
+    assert len(model.calls) == 10
+    assert all(call[0][0] == 0 for call in model.calls[:3])
+    assert all(call[1] is not None and call[1][0] == 1 for call in model.calls[7:])
+    assert torch.allclose(output.image, torch.full_like(output.image, 0.25))
+    assert torch.allclose(output.reg, torch.full_like(output.reg, -0.5))
 
 
 def test_noisy_interpolation_uses_its_own_timestep() -> None:

@@ -78,7 +78,8 @@ def test_component_fingerprints_are_minimal_and_independent(tmp_path: Path) -> N
     irrelevant.model.features.reg.head.kind = "wide_mlp"
     irrelevant.model.features.reg.loss_weight = 99
     irrelevant.model.features.reg.target_std = 99
-    irrelevant.model.features.reg.timestep.sample_ratio = 0.25
+    irrelevant.train.reg_timestep_loc = 2.0
+    irrelevant.sampling.reg_timestep_shifts = [0.25, 1.0]
     irrelevant.model.features.repa.block = 2
     irrelevant.model.features.repa.loss_weight = 99
     irrelevant.train.optimizer.lr = 1

@@ -19,7 +19,6 @@ from .model.sit import classifier_free_labels
 from .objective import (
     jit_losses,
     noisy_interpolate,
-    sample_reg_timesteps,
     sample_timesteps,
 )
 from .optim import CompositeOptimizer, learning_rate_at_epoch, set_learning_rate
@@ -425,7 +424,6 @@ def train(
             reg_noise = None
             noisy_reg = None
             reg_timesteps = None
-            reg_ratios = None
             if feature_cache is not None:
                 if cached_targets is None:
                     raise RuntimeError(
@@ -448,12 +446,12 @@ def train(
                     targets, config.model.features.reg.target_std
                 )
             if targets is not None and targets.reg is not None:
-                timing = config.model.features.reg.timestep
-                reg_timesteps, reg_ratios = sample_reg_timesteps(
-                    timesteps,
-                    timing.train_ratio_min,
-                    timing.train_ratio_max,
+                reg_timesteps = sample_timesteps(
+                    clean.shape[0],
                     streams.reg_timesteps,
+                    device,
+                    loc=config.train.reg_timestep_loc,
+                    scale=config.train.reg_timestep_scale,
                 )
                 reg_noise = torch.randn(
                     targets.reg.shape,
@@ -576,9 +574,6 @@ def train(
                     if reg_timesteps is not None
                     else 0.0
                 ),
-                "train/reg_timestep_ratio_mean": (
-                    reg_ratios.mean().item() if reg_ratios is not None else 0.0
-                ),
                 "train/lr": lr,
                 "train/lr_adamw": lr,
                 "train/lr_muon": (
@@ -655,14 +650,21 @@ def train(
             or final_epoch
         ):
             checkpoint_started = time.perf_counter()
-            fid = next(
-                (
-                    value
-                    for name, value in validation_metrics.items()
-                    if name.startswith("validation/FID-")
-                ),
-                None,
+            checkpoint_fid_count = (
+                config.validation.periodic_samples
+                if config.model.features.reg.enabled or not final_epoch
+                else config.validation.final_samples
             )
+            checkpoint_fid_suffix = (
+                f"{checkpoint_fid_count // 1000}K"
+                if checkpoint_fid_count % 1000 == 0
+                else str(checkpoint_fid_count)
+            )
+            fid = validation_metrics.get(
+                f"validation/FID-{checkpoint_fid_suffix}"
+            )
+            if not config.checkpoint.save_best_fid:
+                fid = None
             path = checkpoint_manager.save(
                 completed_epoch=state.epoch,
                 global_step=state.global_step,
@@ -680,6 +682,9 @@ def train(
                     feature_cache.fingerprints if feature_cache is not None else None
                 ),
                 fid=fid,
+                best_reg_timestep_shift=validation_metrics.get(
+                    "validation/best_reg_timestep_shift"
+                ),
             )
             if config.wandb.checkpoint_artifacts:
                 logger.log_checkpoint(str(path), f"checkpoint-epoch-{state.epoch:04d}")

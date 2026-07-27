@@ -17,6 +17,7 @@ import torch
 from PIL import Image, ImageDraw
 from torch import Tensor
 
+from .objective import denoising_step_bounds
 from .validation import ValidationPlan
 
 
@@ -27,7 +28,9 @@ class SamplingParameters:
     solver: str = "euler"
     guidance_scale: float = 1.78
     timestep_shift: float = 1.0
-    reg_timestep_ratio: float = 1.0
+    reg_timestep_shift: float = 1.0
+    img_denoising_interval: tuple[float, float] = (0.0, 1.0)
+    reg_denoising_interval: tuple[float, float] = (0.0, 1.0)
     cfg_start: float = 0.0
     cfg_end: float = 0.9
     log_interval: int = 10
@@ -40,6 +43,20 @@ class SamplingParameters:
             return 2 * self.sampling_steps - 1
         raise ValueError("sampling solver must be euler or heun")
 
+    @property
+    def img_denoising_steps(self) -> int:
+        start, end = denoising_step_bounds(
+            self.img_denoising_interval, self.sampling_steps
+        )
+        return end - start
+
+    @property
+    def reg_denoising_steps(self) -> int:
+        start, end = denoising_step_bounds(
+            self.reg_denoising_interval, self.sampling_steps
+        )
+        return end - start
+
     def validate(self) -> None:
         if self.batch_size < 1 or self.sampling_steps < 1 or self.log_interval < 1:
             raise ValueError("sampling batch size, steps, and log interval must be positive")
@@ -47,11 +64,10 @@ class SamplingParameters:
             raise ValueError("sampling solver must be euler or heun")
         if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
             raise ValueError("timestep shift must be finite and positive")
-        if (
-            not math.isfinite(self.reg_timestep_ratio)
-            or self.reg_timestep_ratio <= 0
-        ):
-            raise ValueError("REG timestep ratio must be finite and positive")
+        if not math.isfinite(self.reg_timestep_shift) or self.reg_timestep_shift <= 0:
+            raise ValueError("REG timestep shift must be finite and positive")
+        denoising_step_bounds(self.img_denoising_interval, self.sampling_steps)
+        denoising_step_bounds(self.reg_denoising_interval, self.sampling_steps)
         if not math.isfinite(self.guidance_scale):
             raise ValueError("guidance scale must be finite")
         if not 0 <= self.cfg_start <= self.cfg_end <= 1:
@@ -59,8 +75,8 @@ class SamplingParameters:
 
 
 GenerateBatch = Callable[[Tensor, Tensor, Tensor], Tensor]
-SAMPLING_MANIFEST_SCHEMA_VERSION = 11
-FEATURE_SCHEMA_VERSION = 3
+SAMPLING_MANIFEST_SCHEMA_VERSION = 12
+FEATURE_SCHEMA_VERSION = 4
 
 
 def _float_slug(value: float) -> str:
@@ -75,7 +91,11 @@ def sampling_output_name(sample_count: int, parameters: SamplingParameters) -> s
         f"samples-{parameters.solver}-n{sample_count}-steps{parameters.sampling_steps}"
         f"-cfg{_float_slug(parameters.guidance_scale)}"
         f"-shift{_float_slug(parameters.timestep_shift)}"
-        f"-regshift{_float_slug(parameters.reg_timestep_ratio)}"
+        f"-regshift{_float_slug(parameters.reg_timestep_shift)}"
+        f"-imgint{_float_slug(parameters.img_denoising_interval[0])}"
+        f"-{_float_slug(parameters.img_denoising_interval[1])}"
+        f"-regint{_float_slug(parameters.reg_denoising_interval[0])}"
+        f"-{_float_slug(parameters.reg_denoising_interval[1])}"
         f"-window{_float_slug(parameters.cfg_start)}-{_float_slug(parameters.cfg_end)}"
     )
 
@@ -189,7 +209,11 @@ def _manifest_base(
             "sampling_nfe": parameters.sampling_nfe,
             "guidance_scale": parameters.guidance_scale,
             "timestep_shift": parameters.timestep_shift,
-            "reg_timestep_ratio": parameters.reg_timestep_ratio,
+            "reg_timestep_shift": parameters.reg_timestep_shift,
+            "img_denoising_interval": list(parameters.img_denoising_interval),
+            "reg_denoising_interval": list(parameters.reg_denoising_interval),
+            "img_denoising_steps": parameters.img_denoising_steps,
+            "reg_denoising_steps": parameters.reg_denoising_steps,
             "cfg_interval": [parameters.cfg_start, parameters.cfg_end],
         },
     }
@@ -399,6 +423,9 @@ def sample_to_archive(
             f"steps={parameters.sampling_steps} nfe={parameters.sampling_nfe} "
             f"guidance={parameters.guidance_scale:g} "
             f"timestep_shift={parameters.timestep_shift:g} "
+            f"reg_timestep_shift={parameters.reg_timestep_shift:g} "
+            f"img_interval={list(parameters.img_denoising_interval)} "
+            f"reg_interval={list(parameters.reg_denoising_interval)} "
             f"cfg_interval=[{parameters.cfg_start:g}, {parameters.cfg_end:g}]"
         )
         print(f"sampling state: {status}, completed={state[1]}/{sample_count}")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import torch
@@ -31,34 +32,38 @@ def sample_timesteps(
     return (loc + scale * normal).sigmoid()
 
 
-def sample_reg_timesteps(
-    image_timestep: Tensor,
-    ratio_min: float,
-    ratio_max: float,
-    generator: torch.Generator,
-) -> tuple[Tensor, Tensor]:
-    """Draw a log-uniform relative schedule and shift image time for REG."""
+def denoising_step_bounds(
+    interval: Sequence[float], steps: int
+) -> tuple[int, int]:
+    """Quantize a fractional denoising interval onto global solver-step edges."""
+    if steps < 1:
+        raise ValueError("sampling steps must be positive")
+    if len(interval) != 2:
+        raise ValueError("denoising interval must contain exactly [start, end]")
+    start, end = interval
     if (
-        not math.isfinite(ratio_min)
-        or not math.isfinite(ratio_max)
-        or ratio_min <= 0
-        or ratio_max < ratio_min
+        not math.isfinite(start)
+        or not math.isfinite(end)
+        or not 0 <= start < end <= 1
     ):
-        raise ValueError("REG timestep ratios must be finite, positive, and ordered")
-    if ratio_min == ratio_max:
-        ratio = torch.full_like(image_timestep, ratio_min, dtype=torch.float32)
-    else:
-        uniform = torch.rand(
-            image_timestep.shape,
-            generator=generator,
-            device=image_timestep.device,
-            dtype=torch.float32,
-        )
-        log_ratio = math.log(ratio_min) + uniform * (
-            math.log(ratio_max) - math.log(ratio_min)
-        )
-        ratio = log_ratio.exp()
-    return shift_timestep(image_timestep, ratio), ratio
+        raise ValueError("denoising interval must satisfy 0 <= start < end <= 1")
+    start_step = math.floor(start * steps + 0.5)
+    end_step = math.floor(end * steps + 0.5)
+    if start_step >= end_step:
+        raise ValueError("denoising interval collapses to zero steps after rounding")
+    return start_step, end_step
+
+
+def local_denoising_schedule(
+    interval: Sequence[float],
+    steps: int,
+    *,
+    device: torch.device | str,
+) -> Tensor:
+    """Return a local 0-to-1 clock frozen outside its quantized interval."""
+    start_step, end_step = denoising_step_bounds(interval, steps)
+    edges = torch.arange(steps + 1, device=device, dtype=torch.float32)
+    return ((edges - start_step) / (end_step - start_step)).clamp(0, 1)
 
 
 def _expand(timestep: Tensor, like: Tensor) -> Tensor:

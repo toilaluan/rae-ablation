@@ -16,7 +16,7 @@ def test_required_presets_load() -> None:
     baseline = load_config(ROOT / "configs/baseline-p16.yaml")
     paper = load_config(ROOT / "configs/reg-repa-p16.yaml")
     early = load_config(ROOT / "configs/early-reg-p16.yaml")
-    assert baseline.schema_version == paper.schema_version == early.schema_version == 3
+    assert baseline.schema_version == paper.schema_version == early.schema_version == 4
     assert (
         baseline.train.optimizer.kind
         == paper.train.optimizer.kind
@@ -33,8 +33,11 @@ def test_required_presets_load() -> None:
     assert early.model.features.reg.head.kind == "wide_mlp"
     assert early.model.features.reg.early_prediction.block == 4
     assert early.model.features.reg.early_prediction.reinjection_mode == "add"
-    assert early.model.features.reg.timestep.train_ratio_min == 1.0
-    assert early.model.features.reg.timestep.sample_ratio == 1.0
+    assert early.train.reg_timestep_loc == pytest.approx(-0.8)
+    assert early.train.reg_timestep_scale == pytest.approx(0.8)
+    assert early.sampling.img_denoising_interval == [0.3, 1.0]
+    assert early.sampling.reg_denoising_interval == [0.0, 0.7]
+    assert early.sampling.reg_timestep_shifts == [1.0]
 
 
 @pytest.mark.parametrize("kind", ["adamw", "muon", "fused_muon"])
@@ -102,7 +105,7 @@ def test_inactive_feature_sections_are_not_validated() -> None:
     config.model.features.encoder.feature_dim = -1
     config.model.features.reg.head.kind = "retired"
     config.model.features.reg.target_std = -1
-    config.model.features.reg.timestep.train_ratio_min = -1
+    config.train.reg_timestep_scale = -1
     config.model.features.repa.block = -1
     config.model.features.repa.token_scope = "retired"
     config.feature_cache.enabled = True
@@ -116,7 +119,7 @@ def test_active_sections_validate_only_their_own_fields() -> None:
     repa_only.model.features.repa.enabled = True
     repa_only.model.features.reg.head.kind = "irrelevant"
     repa_only.model.features.reg.target_std = -1
-    repa_only.model.features.reg.timestep.train_ratio_min = -1
+    repa_only.train.reg_timestep_scale = -1
     repa_only.validate()
 
     reg_only = ExperimentConfig()
@@ -146,9 +149,31 @@ def test_clean_break_rejects_old_and_unknown_configs(tmp_path: Path) -> None:
         load_checkpoint_config(old_checkpoint)
 
     unknown = tmp_path / "unknown.yaml"
-    unknown.write_text("schema_version: 3\nretired_experiment: true\n")
-    with pytest.raises(ValueError, match="invalid schema-v3"):
+    unknown.write_text("schema_version: 4\nretired_experiment: true\n")
+    with pytest.raises(ValueError, match="invalid schema-v4"):
         load_config(unknown)
+
+
+def test_sampling_intervals_and_reg_shift_candidates_validate() -> None:
+    config = ExperimentConfig()
+    config.sampling.img_denoising_interval = [0.3, 1.0]
+    config.sampling.reg_denoising_interval = [0.0, 0.7]
+    config.sampling.reg_timestep_shifts = [0.7, 1.0, 1.3]
+    config.validate()
+
+    config.sampling.reg_timestep_shifts = [1.0, 1.0]
+    with pytest.raises(ValueError, match="unique"):
+        config.validate()
+
+    config.sampling.reg_timestep_shifts = [1.0]
+    config.sampling.reg_denoising_interval = [0.7, 0.7]
+    with pytest.raises(ValueError, match="start < end"):
+        config.validate()
+
+    config.sampling.reg_denoising_interval = [0.01, 0.02]
+    config.sampling.sampling_steps = 10
+    with pytest.raises(ValueError, match="collapses"):
+        config.validate()
 
 
 @pytest.mark.parametrize("target_std", [0.0, -1.0, float("inf"), float("nan")])

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import time
+from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from .sample_runtime import (
     FEATURE_SCHEMA_VERSION,
     SamplingParameters,
     sample_to_archive,
+    sampling_output_name,
     state_dict_sha256,
 )
 from .sampling import ODESample, ode_sample
@@ -44,108 +47,242 @@ def validate_ema(
     completed_epoch: int,
     final: bool,
     output_root: str | Path,
-    sampling: SamplingParameters,
+    sampling: SamplingParameters | Sequence[SamplingParameters],
 ) -> tuple[dict[str, float], Path]:
     rank, _world_size = _distributed()
     device = torch.device(
         f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
     )
-    count = config.validation.final_samples if final else config.validation.periodic_samples
-    name = f"{'final' if final else 'periodic'}-{count}"
-    output = Path(output_root) / f"epoch-{completed_epoch:04d}-{name}"
-    output.mkdir(parents=True, exist_ok=True)
+    candidates = (
+        [sampling] if isinstance(sampling, SamplingParameters) else list(sampling)
+    )
+    if not candidates:
+        raise ValueError("validation requires at least one sampling candidate")
+    if not config.model.features.reg.enabled:
+        candidates = candidates[:1]
+    for candidate in candidates:
+        candidate.validate()
 
-    model = SiT(config.model).to(device)
-    model.load_state_dict(ema.state_dict())
-    model.eval()
-    execution_model = compile_model_regions(model, config.compile)
+    tune_count = config.validation.periodic_samples
+    run_kind = "final" if final else "periodic"
+    root = Path(output_root) / f"epoch-{completed_epoch:04d}-{run_kind}"
+    root.mkdir(parents=True, exist_ok=True)
     reg = config.model.features.reg
-
-    @torch.inference_mode()
-    def generate_batch(
-        _positions: torch.Tensor, labels: torch.Tensor, noise_seeds: torch.Tensor
-    ) -> torch.Tensor:
-        batch_labels = labels.to(device)
-        dtype = torch.float16 if device.type == "cuda" else torch.float32
-        noise = noise_for_samples(
-            noise_seeds,
-            (3, config.model.image_size, config.model.image_size),
-            device,
-            dtype=dtype,
-        )
-        reg_noise = (
-            noise_for_samples(
-                noise_seeds,
-                (reg.num_tokens, config.model.features.encoder.feature_dim),
-                device,
-                dtype=dtype,
-                seed_offset=1_000_003,
-            )
-            if reg.enabled
-            else None
-        )
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            generated = ode_sample(
-                execution_model,
-                noise,
-                batch_labels,
-                reg_noise=reg_noise,
-                steps=sampling.sampling_steps,
-                guidance_scale=sampling.guidance_scale,
-                timestep_shift=sampling.timestep_shift,
-                reg_timestep_ratio=sampling.reg_timestep_ratio,
-                cfg_interval=(sampling.cfg_start, sampling.cfg_end),
-                solver=sampling.solver,
-                num_classes=config.model.num_classes,
-            )
-        image = generated.image if isinstance(generated, ODESample) else generated
-        return image.float().add(1).div(2)
-
     digest = state_dict_sha256(ema.state_dict()) if rank == 0 else None
     digest = broadcast_string(digest, rank)
+    feature_schema = {
+        "schema_version": FEATURE_SCHEMA_VERSION,
+        **asdict(config.model.features),
+    }
     started = time.perf_counter()
-    archive = sample_to_archive(
-        output_dir=output,
-        plan=plan,
-        sample_count=count,
-        num_classes=config.model.num_classes,
-        image_size=config.model.image_size,
-        patch_size=config.model.patch_size,
-        model_variant=config.model.model_variant,
-        feature_schema={
-            "schema_version": FEATURE_SCHEMA_VERSION,
-            **asdict(config.model.features),
-        },
-        checkpoint_hash=digest,
-        parameters=sampling,
-        generate_batch=generate_batch,
+
+    def build_model() -> tuple[SiT, torch.nn.Module]:
+        model = SiT(config.model).to(device)
+        model.load_state_dict(ema.state_dict())
+        model.eval()
+        return model, compile_model_regions(model, config.compile)
+
+    def generate_archive(
+        *,
+        execution_model: torch.nn.Module,
+        parameters: SamplingParameters,
+        count: int,
+        parent: Path,
+    ) -> tuple[Path, Path]:
+        output = parent / sampling_output_name(count, parameters)
+
+        @torch.inference_mode()
+        def generate_batch(
+            _positions: torch.Tensor, labels: torch.Tensor, noise_seeds: torch.Tensor
+        ) -> torch.Tensor:
+            batch_labels = labels.to(device)
+            dtype = torch.float16 if device.type == "cuda" else torch.float32
+            noise = noise_for_samples(
+                noise_seeds,
+                (3, config.model.image_size, config.model.image_size),
+                device,
+                dtype=dtype,
+            )
+            reg_noise = (
+                noise_for_samples(
+                    noise_seeds,
+                    (reg.num_tokens, config.model.features.encoder.feature_dim),
+                    device,
+                    dtype=dtype,
+                    seed_offset=1_000_003,
+                )
+                if reg.enabled
+                else None
+            )
+            with torch.autocast(
+                device.type,
+                dtype=torch.bfloat16,
+                enabled=device.type == "cuda",
+            ):
+                generated = ode_sample(
+                    execution_model,
+                    noise,
+                    batch_labels,
+                    reg_noise=reg_noise,
+                    steps=parameters.sampling_steps,
+                    guidance_scale=parameters.guidance_scale,
+                    timestep_shift=parameters.timestep_shift,
+                    reg_timestep_shift=parameters.reg_timestep_shift,
+                    img_denoising_interval=parameters.img_denoising_interval,
+                    reg_denoising_interval=parameters.reg_denoising_interval,
+                    cfg_interval=(parameters.cfg_start, parameters.cfg_end),
+                    solver=parameters.solver,
+                    num_classes=config.model.num_classes,
+                )
+            image = generated.image if isinstance(generated, ODESample) else generated
+            return image.float().add(1).div(2)
+
+        archive = sample_to_archive(
+            output_dir=output,
+            plan=plan,
+            sample_count=count,
+            num_classes=config.model.num_classes,
+            image_size=config.model.image_size,
+            patch_size=config.model.patch_size,
+            model_variant=config.model.model_variant,
+            feature_schema=feature_schema,
+            checkpoint_hash=digest,
+            parameters=parameters,
+            generate_batch=generate_batch,
+        )
+        return archive, output
+
+    def release_model(model: SiT, execution_model: torch.nn.Module) -> None:
+        model.cpu()
+        del execution_model, model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    sample_count = (
+        tune_count
+        if reg.enabled
+        else config.validation.final_samples
+        if final
+        else tune_count
     )
-    del generate_batch
+    model, execution_model = build_model()
+    tune_results = [
+        (
+            candidate,
+            *generate_archive(
+                execution_model=execution_model,
+                parameters=candidate,
+                count=sample_count,
+                parent=root,
+            ),
+        )
+        for candidate in candidates
+    ]
+    release_model(model, execution_model)
     execution_model = None
     model = None
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+
     metrics: dict[str, float] = {}
+    fid_values: list[float] = []
     if rank == 0:
         eval_device = (
             device
             if config.evaluation.device == "auto"
             else torch.device(config.evaluation.device)
         )
-        raw = evaluate_npz(
-            archive,
-            config.evaluation.reference_npz,
-            batch_size=config.evaluation.batch_size,
-            device=eval_device,
-            log_interval=config.evaluation.log_interval,
+        for candidate, archive, output in tune_results:
+            raw = evaluate_npz(
+                archive,
+                config.evaluation.reference_npz,
+                batch_size=config.evaluation.batch_size,
+                device=eval_device,
+                log_interval=config.evaluation.log_interval,
+            )
+            save_evaluation(output / "evaluation.json", raw, plan.plan_hash)
+            fid = float(raw["FID"])
+            fid_values.append(fid)
+            if reg.enabled:
+                shift_slug = repr(candidate.reg_timestep_shift).replace(".", "p")
+                metrics[f"validation/reg_shift_sweep/FID-{shift_slug}"] = fid
+    winner_state: list[int | None] = [
+        min(range(len(fid_values)), key=lambda index: (fid_values[index], index))
+        if rank == 0
+        else None
+    ]
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.broadcast_object_list(winner_state, src=0)
+    winner_index = winner_state[0]
+    if winner_index is None:
+        raise RuntimeError("validation failed to select a REG timestep shift")
+    winner, _winner_archive, winner_output = tune_results[winner_index]
+
+    if rank == 0:
+        suffix = (
+            f"{sample_count // 1000}K"
+            if sample_count % 1000 == 0
+            else str(sample_count)
         )
-        save_evaluation(output / "evaluation.json", raw, plan.plan_hash)
-        suffix = f"{count // 1000}K" if count % 1000 == 0 else str(count)
-        metrics[f"validation/FID-{suffix}"] = raw["FID"]
-        metrics["validation/images_per_second"] = count / max(time.perf_counter() - started, 1e-9)
-        metrics["validation/sampling_nfe"] = float(sampling.sampling_nfe)
+        metrics[f"validation/FID-{suffix}"] = fid_values[winner_index]
+        if reg.enabled:
+            metrics["validation/best_reg_timestep_shift"] = (
+                winner.reg_timestep_shift
+            )
+            summary = {
+                "sample_count": sample_count,
+                "candidates": [
+                    {
+                        "reg_timestep_shift": candidate.reg_timestep_shift,
+                        "FID": fid,
+                    }
+                    for (candidate, _archive, _output), fid in zip(
+                        tune_results, fid_values, strict=True
+                    )
+                ],
+                "best_reg_timestep_shift": winner.reg_timestep_shift,
+                "best_fid": fid_values[winner_index],
+            }
+            (root / "sweep.json").write_text(
+                json.dumps(summary, indent=2, sort_keys=True) + "\n"
+            )
+
+    total_generated = sample_count * len(candidates)
+    if final and reg.enabled:
+        model, execution_model = build_model()
+        final_archive, final_output = generate_archive(
+            execution_model=execution_model,
+            parameters=winner,
+            count=config.validation.final_samples,
+            parent=root / "selected-final",
+        )
+        release_model(model, execution_model)
+        execution_model = None
+        model = None
+        if rank == 0:
+            raw = evaluate_npz(
+                final_archive,
+                config.evaluation.reference_npz,
+                batch_size=config.evaluation.batch_size,
+                device=eval_device,
+                log_interval=config.evaluation.log_interval,
+            )
+            save_evaluation(final_output / "evaluation.json", raw, plan.plan_hash)
+            final_count = config.validation.final_samples
+            suffix = (
+                f"{final_count // 1000}K"
+                if final_count % 1000 == 0
+                else str(final_count)
+            )
+            metrics[f"validation/FID-{suffix}"] = float(raw["FID"])
+        total_generated += config.validation.final_samples
+        winner_output = final_output
+
+    if rank == 0:
+        metrics["validation/images_per_second"] = total_generated / max(
+            time.perf_counter() - started, 1e-9
+        )
+        metrics["validation/sampling_nfe"] = float(winner.sampling_nfe)
         metrics["validation/peak_memory_gib"] = (
             torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0
         )
     _barrier()
-    return metrics, output
+    return metrics, winner_output
