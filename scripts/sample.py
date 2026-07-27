@@ -20,6 +20,7 @@ from jit_reg.sample_runtime import (
     sampling_output_name,
 )
 from jit_reg.sampling import ODESample, ode_sample
+from jit_reg.vae import load_flux2_codec
 from jit_reg.validation import noise_for_samples
 
 torch._dynamo.config.cache_size_limit = 1000
@@ -103,6 +104,15 @@ def main() -> None:
     model.load_state_dict(load_file(str(bundle.weights), device=str(device)))
     model.eval()
     execution_model = compile_model_regions(model, config.compile)
+    codec = (
+        load_flux2_codec(
+            config.vae,
+            image_size=config.model.image_size,
+            device=device,
+        )
+        if config.model.input_space == "flux2_latents"
+        else None
+    )
 
     @torch.inference_mode()
     def generate_batch(
@@ -112,7 +122,7 @@ def main() -> None:
         dtype = torch.float16 if device.type == "cuda" else torch.float32
         noise = noise_for_samples(
             noise_seeds,
-            (3, config.model.image_size, config.model.image_size),
+            config.model.input_shape,
             device,
             dtype=dtype,
         )
@@ -149,6 +159,8 @@ def main() -> None:
                 num_classes=config.model.num_classes,
             )
         image = generated.image if isinstance(generated, ODESample) else generated
+        if codec is not None:
+            return codec.decode(image)
         return image.float().add(1).div(2)
 
     output_dir = bundle.directory / sampling_output_name(sample_count, parameters)
@@ -162,6 +174,17 @@ def main() -> None:
         model_variant=config.model.model_variant,
         feature_schema={
             "schema_version": FEATURE_SCHEMA_VERSION,
+            "input_space": config.model.input_space,
+            "input_shape": list(config.model.input_shape),
+            "vae": (
+                {
+                    "model_name": config.vae.model_name,
+                    "revision": config.vae.revision,
+                    "subfolder": config.vae.subfolder,
+                }
+                if config.model.input_space == "flux2_latents"
+                else None
+            ),
             **asdict(config.model.features),
         },
         checkpoint_hash=digest,
@@ -169,7 +192,7 @@ def main() -> None:
         generate_batch=generate_batch,
     )
     if args.evaluate and rank == 0:
-        del execution_model, model
+        del execution_model, model, codec
         if device.type == "cuda":
             torch.cuda.empty_cache()
         reference = args.reference_npz or Path(config.evaluation.reference_npz)

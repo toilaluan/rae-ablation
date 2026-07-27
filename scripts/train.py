@@ -15,6 +15,7 @@ from jit_reg.data import (
 )
 from jit_reg.distributed import initialize_distributed
 from jit_reg.feature_cache import FeatureCache
+from jit_reg.latent_cache import LatentCache
 from jit_reg.model.compile import compile_model_regions
 from jit_reg.model.sit import SiT
 from jit_reg.optim import build_optimizer
@@ -22,6 +23,7 @@ from jit_reg.reg import DINOv3FeatureExtractor
 from jit_reg.rng import RNGStreams
 from jit_reg.sample_runtime import SamplingParameters
 from jit_reg.training import TrainState, make_train_loader, train
+from jit_reg.vae import load_flux2_codec
 from jit_reg.validation import ValidationPlan, create_validation_plan
 from jit_reg.validation_runtime import validate_ema
 from jit_reg.wandb_utils import RunLogger
@@ -30,12 +32,14 @@ torch._dynamo.config.cache_size_limit = 1000
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train pixel-space JiT on ImageNet-256")
+    parser = argparse.ArgumentParser(
+        description="Train pixel- or FLUX.2-latent JiT on ImageNet-256"
+    )
     parser.add_argument(
         "--config",
         type=Path,
         default=Path("configs/baseline-p16.yaml"),
-        help="schema-v4 experiment YAML (default: configs/baseline-p16.yaml)",
+        help="schema-v5 experiment YAML (default: configs/baseline-p16.yaml)",
     )
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
@@ -89,9 +93,28 @@ def main() -> None:
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(streams.initialization.initial_seed())
         model = SiT(config.model).to(device)
-    dataset = load_imagenet(config.data, config.model.image_size)
     cache_active = config.feature_cache.enabled and config.model.features.enabled
+    latent_cache_active = (
+        config.model.input_space == "flux2_latents"
+        and config.vae.cache.enabled
+    )
+    pixels_required = (
+        config.model.input_space == "pixels"
+        or (
+            config.model.input_space == "flux2_latents"
+            and not latent_cache_active
+        )
+        or (config.model.features.enabled and not cache_active)
+    )
+    dataset = load_imagenet(
+        config.data,
+        config.model.image_size,
+        load_pixels=pixels_required,
+    )
     feature_cache = FeatureCache(config, len(dataset)) if cache_active else None
+    latent_cache = (
+        LatentCache(config, len(dataset)) if latent_cache_active else None
+    )
     fingerprint = data_fingerprint(config.data, config.model.image_size)
     plan_path = Path(config.validation.plan_path)
     if rank == 0 and not plan_path.exists():
@@ -118,6 +141,7 @@ def main() -> None:
             fingerprint,
             plan.plan_hash,
             feature_cache.fingerprints if feature_cache is not None else None,
+            latent_cache.fingerprint if latent_cache is not None else None,
         )
         optimizer.load_state_dict(resumed.optimizer)
         streams.load_state_dict(resumed.rng_streams)
@@ -147,6 +171,16 @@ def main() -> None:
                 fullgraph=config.compile.fullgraph,
                 dynamic=config.compile.dynamic,
             )
+    vae_codec = (
+        load_flux2_codec(
+            config.vae,
+            image_size=config.model.image_size,
+            device=device,
+        )
+        if config.model.input_space == "flux2_latents"
+        and latent_cache is None
+        else None
+    )
     loader, sampler = make_train_loader(dataset, config, streams)
     logged_config = config.as_dict()
     logged_config["provenance"] = {
@@ -160,6 +194,20 @@ def main() -> None:
         ),
         "feature_cache_fingerprints": (
             feature_cache.fingerprints if feature_cache is not None else None
+        ),
+        "latent_cache_fingerprint": (
+            latent_cache.fingerprint if latent_cache is not None else None
+        ),
+        "input_space": config.model.input_space,
+        "diffusion_input_shape": list(config.model.input_shape),
+        "vae": (
+            {
+                "model_name": config.vae.model_name,
+                "revision": config.vae.revision,
+                "subfolder": config.vae.subfolder,
+            }
+            if config.model.input_space == "flux2_latents"
+            else None
         ),
     }
     logged_config["model_parameters"] = {
@@ -177,6 +225,7 @@ def main() -> None:
     )
     logger.event(
         f"training initialized: variant={config.model.model_variant}, "
+        f"input_shape={config.model.input_shape}, "
         f"reg={reg_config.enabled}, repa={config.model.features.repa.enabled}, "
         f"reg_head={reg_config.head.kind if reg_config.enabled else 'disabled'}, "
         "parameters="
@@ -232,6 +281,8 @@ def main() -> None:
             logger=logger,
             feature_encoder=feature_encoder,
             feature_cache=feature_cache,
+            vae_codec=vae_codec,
+            latent_cache=latent_cache,
             state=state,
             validation_callback=validate_callback,
         )

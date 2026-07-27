@@ -23,6 +23,7 @@ from .sample_runtime import (
     state_dict_sha256,
 )
 from .sampling import ODESample, ode_sample
+from .vae import load_flux2_codec
 from .validation import ValidationPlan, noise_for_samples
 
 
@@ -72,8 +73,28 @@ def validate_ema(
     digest = broadcast_string(digest, rank)
     feature_schema = {
         "schema_version": FEATURE_SCHEMA_VERSION,
+        "input_space": config.model.input_space,
+        "input_shape": list(config.model.input_shape),
+        "vae": (
+            {
+                "model_name": config.vae.model_name,
+                "revision": config.vae.revision,
+                "subfolder": config.vae.subfolder,
+            }
+            if config.model.input_space == "flux2_latents"
+            else None
+        ),
         **asdict(config.model.features),
     }
+    codec = (
+        load_flux2_codec(
+            config.vae,
+            image_size=config.model.image_size,
+            device=device,
+        )
+        if config.model.input_space == "flux2_latents"
+        else None
+    )
     started = time.perf_counter()
 
     def build_model() -> tuple[SiT, torch.nn.Module]:
@@ -99,7 +120,7 @@ def validate_ema(
             dtype = torch.float16 if device.type == "cuda" else torch.float32
             noise = noise_for_samples(
                 noise_seeds,
-                (3, config.model.image_size, config.model.image_size),
+                config.model.input_shape,
                 device,
                 dtype=dtype,
             )
@@ -135,6 +156,8 @@ def validate_ema(
                     num_classes=config.model.num_classes,
                 )
             image = generated.image if isinstance(generated, ODESample) else generated
+            if codec is not None:
+                return codec.decode(image)
             return image.float().add(1).div(2)
 
         archive = sample_to_archive(
@@ -181,6 +204,10 @@ def validate_ema(
     release_model(model, execution_model)
     execution_model = None
     model = None
+    if codec is not None:
+        codec.cpu()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     metrics: dict[str, float] = {}
     fid_values: list[float] = []
@@ -247,6 +274,8 @@ def validate_ema(
 
     total_generated = sample_count * len(candidates)
     if final and reg.enabled:
+        if codec is not None:
+            codec.to(device)
         model, execution_model = build_model()
         final_archive, final_output = generate_archive(
             execution_model=execution_model,
@@ -257,6 +286,10 @@ def validate_ema(
         release_model(model, execution_model)
         execution_model = None
         model = None
+        if codec is not None:
+            codec.cpu()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
         if rank == 0:
             raw = evaluate_npz(
                 final_archive,

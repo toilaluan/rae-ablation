@@ -13,8 +13,8 @@ from torch.utils.data.distributed import DistributedSampler
 
 from .checkpoint import EMA, CheckpointManager, should_checkpoint
 from .config import ExperimentConfig
-from .data import random_horizontal_flip
 from .feature_cache import FeatureCache
+from .latent_cache import LatentCache
 from .model.sit import classifier_free_labels
 from .objective import (
     jit_losses,
@@ -29,6 +29,7 @@ from .reg import (
     scale_reg_targets,
 )
 from .rng import RNGStreams
+from .vae import Flux2Codec
 from .validation import should_validate
 from .wandb_utils import RunLogger
 
@@ -44,9 +45,10 @@ ValidationCallback = Callable[[int, bool], dict[str, float]]
 
 
 class TrainBatch(NamedTuple):
-    pixels: Tensor
+    pixels: Tensor | None
     labels: Tensor
     indices: Tensor
+    cached_latents: Tensor | None
     cached_targets: FeatureTargets | None
 
 
@@ -76,6 +78,15 @@ def prepare_train_batch(
     """Move and convert a loader batch without changing its pixel values."""
     device = torch.device(device)
     cached_targets = batch.cached_targets
+    cached_latents = (
+        batch.cached_latents.to(
+            device=device,
+            dtype=torch.float32,
+            non_blocking=non_blocking,
+        )
+        if batch.cached_latents is not None
+        else None
+    )
     prepared_targets = (
         FeatureTargets(
             (
@@ -101,9 +112,14 @@ def prepare_train_batch(
         else None
     )
     return TrainBatch(
-        _prepare_pixels(batch.pixels, device, non_blocking=non_blocking),
+        (
+            _prepare_pixels(batch.pixels, device, non_blocking=non_blocking)
+            if batch.pixels is not None
+            else None
+        ),
         batch.labels.to(device=device, non_blocking=non_blocking),
         batch.indices,
+        cached_latents,
         prepared_targets,
     )
 
@@ -112,8 +128,11 @@ def _record_destination_stream(
     batch: TrainBatch,
     stream: torch.cuda.Stream,
 ) -> None:
-    batch.pixels.record_stream(stream)
+    if batch.pixels is not None:
+        batch.pixels.record_stream(stream)
     batch.labels.record_stream(stream)
+    if batch.cached_latents is not None:
+        batch.cached_latents.record_stream(stream)
     if batch.cached_targets is not None:
         if batch.cached_targets.reg is not None:
             batch.cached_targets.reg.record_stream(stream)
@@ -232,24 +251,51 @@ class _TrainBatchCollator:
 
     def __init__(
         self,
-        cache_config: ExperimentConfig | None,
+        config: ExperimentConfig,
         dataset_size: int,
     ) -> None:
-        self.cache_config = cache_config
+        self.config = config
         self.dataset_size = dataset_size
         self._feature_cache: FeatureCache | None = None
+        self._latent_cache: LatentCache | None = None
 
     def __call__(self, samples: list[Any]) -> TrainBatch:
-        pixels, labels, indices = default_collate(samples)
+        pixel_values, label_values, index_values = zip(*samples, strict=True)
+        if all(value is None for value in pixel_values):
+            pixels = None
+        elif any(value is None for value in pixel_values):
+            raise ValueError("loader batch mixes examples with and without pixels")
+        else:
+            pixels = default_collate(pixel_values)
+        labels = default_collate(label_values)
+        indices = default_collate(index_values)
         cached_targets = None
-        if self.cache_config is not None:
+        cache_active = (
+            self.config.feature_cache.enabled
+            and self.config.model.features.enabled
+        )
+        if cache_active:
             if self._feature_cache is None:
                 self._feature_cache = FeatureCache(
-                    self.cache_config,
+                    self.config,
                     self.dataset_size,
                 )
             cached_targets = self._feature_cache.lookup(indices)
-        return TrainBatch(pixels, labels, indices, cached_targets)
+        cached_latents = None
+        if self.config.vae.cache.enabled:
+            if self._latent_cache is None:
+                self._latent_cache = LatentCache(
+                    self.config,
+                    self.dataset_size,
+                )
+            cached_latents = self._latent_cache.lookup(indices)
+        return TrainBatch(
+            pixels,
+            labels,
+            indices,
+            cached_latents,
+            cached_targets,
+        )
 
 
 def distributed_info() -> tuple[int, int]:
@@ -278,7 +324,6 @@ def make_train_loader(
     rank_batch_size = local_batch_size(
         config.train.global_batch_size, world_size
     )
-    cache_active = config.feature_cache.enabled and config.model.features.enabled
     sampler = (
         DistributedSampler(
             dataset,
@@ -303,7 +348,7 @@ def make_train_loader(
             persistent_workers=config.data.workers > 0,
             prefetch_factor=config.data.prefetch_factor if config.data.workers > 0 else None,
             collate_fn=_TrainBatchCollator(
-                config if cache_active else None,
+                config,
                 len(dataset),
             ),
             drop_last=True,
@@ -329,6 +374,8 @@ def train(
     logger: RunLogger,
     feature_encoder: DINOv3FeatureExtractor | None = None,
     feature_cache: FeatureCache | None = None,
+    vae_codec: Flux2Codec | None = None,
+    latent_cache: LatentCache | None = None,
     state: TrainState | None = None,
     validation_callback: ValidationCallback | None = None,
 ) -> TrainState:
@@ -347,6 +394,14 @@ def train(
         raise ValueError(
             "active REG/REPA features require exactly one online or cached target source"
         )
+    input_sources = int(vae_codec is not None) + int(latent_cache is not None)
+    if config.model.input_space == "flux2_latents":
+        if input_sources != 1:
+            raise ValueError(
+                "latent training requires exactly one online VAE or latent-cache source"
+            )
+    elif input_sources:
+        raise ValueError("pixel training cannot use a VAE or latent cache")
     optimizer.zero_grad()
 
     for epoch_index in range(state.epoch, config.train.epochs):
@@ -356,6 +411,8 @@ def train(
         execution_model.train()
         if feature_encoder is not None:
             feature_encoder.eval()
+        if vae_codec is not None:
+            vae_codec.eval()
         epoch_started = time.perf_counter()
         step_started = epoch_started
         previous_logging_seconds = 0.0
@@ -392,13 +449,30 @@ def train(
                 cuda_backward_finished = torch.cuda.Event(enable_timing=True)
             pixels = batch.pixels
             labels = batch.labels
+            cached_latents = batch.cached_latents
             cached_targets = batch.cached_targets
-            pixels = random_horizontal_flip(
-                pixels,
-                streams.augmentations,
-                config.train.horizontal_flip_probability,
-            )
-            clean = pixels.mul(2).sub(1)
+            if config.model.input_space == "pixels":
+                if pixels is None:
+                    raise RuntimeError("pixel training requires RGB input")
+                if cached_latents is not None:
+                    raise RuntimeError("pixel training received cached latents")
+                clean = pixels.mul(2).sub(1)
+            elif latent_cache is not None:
+                if cached_latents is None:
+                    raise RuntimeError(
+                        "cached latent training requires latents from the loader"
+                    )
+                clean = cached_latents
+            else:
+                if vae_codec is None or pixels is None:
+                    raise RuntimeError(
+                        "online latent training requires a VAE and RGB input"
+                    )
+                if cached_latents is not None:
+                    raise RuntimeError(
+                        "online latent training received unexpected cached latents"
+                    )
+                clean = vae_codec.encode(pixels)
             timesteps = sample_timesteps(
                 clean.shape[0],
                 streams.timesteps,
@@ -440,6 +514,10 @@ def train(
                     dtype=torch.bfloat16,
                     enabled=device.type == "cuda",
                 ):
+                    if pixels is None:
+                        raise RuntimeError(
+                            "online feature training requires RGB input"
+                        )
                     targets = feature_encoder.targets(pixels, config.model.grid_size)
             if targets is not None and targets.reg is not None:
                 targets = scale_reg_targets(
@@ -680,6 +758,9 @@ def train(
                 resolved_config=config.as_dict(),
                 feature_cache_fingerprints=(
                     feature_cache.fingerprints if feature_cache is not None else None
+                ),
+                latent_cache_fingerprint=(
+                    latent_cache.fingerprint if latent_cache is not None else None
                 ),
                 fid=fid,
                 best_reg_timestep_shift=validation_metrics.get(

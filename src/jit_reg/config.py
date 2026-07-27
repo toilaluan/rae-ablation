@@ -7,7 +7,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 4
+CONFIG_SCHEMA_VERSION = 5
+
+FLUX2_SPATIAL_COMPRESSION = 16
+FLUX2_LATENT_CHANNELS = 128
 
 
 def _positive(name: str, *values: int | float) -> None:
@@ -76,9 +79,9 @@ class FeaturesConfig:
 
 @dataclass
 class ModelConfig:
+    input_space: str = "pixels"
     image_size: int = 256
     patch_size: int = 16
-    in_channels: int = 3
     hidden_size: int = 768
     depth: int = 12
     num_heads: int = 12
@@ -95,7 +98,27 @@ class ModelConfig:
 
     @property
     def model_variant(self) -> str:
-        return f"{self.variant}/{self.patch_size}"
+        return f"{self.variant}/{self.patch_size}-{self.input_space}"
+
+    @property
+    def input_channels(self) -> int:
+        return 3 if self.input_space == "pixels" else FLUX2_LATENT_CHANNELS
+
+    @property
+    def input_size(self) -> int:
+        if self.input_space == "pixels":
+            return self.image_size
+        return self.image_size // FLUX2_SPATIAL_COMPRESSION
+
+    @property
+    def input_patch_size(self) -> int:
+        if self.input_space == "pixels":
+            return self.patch_size
+        return self.patch_size // FLUX2_SPATIAL_COMPRESSION
+
+    @property
+    def input_shape(self) -> tuple[int, int, int]:
+        return (self.input_channels, self.input_size, self.input_size)
 
 
 @dataclass
@@ -126,6 +149,23 @@ class FeatureCacheConfig:
 
 
 @dataclass
+class VAECacheConfig:
+    enabled: bool = False
+    directory: str = "data/latents"
+    batch_size: int = 128
+    log_interval: int = 10
+
+
+@dataclass
+class VAEConfig:
+    model_name: str = "black-forest-labs/FLUX.2-klein-4B"
+    revision: str = "5e67da950fce4a097bc150c22958a05716994cea"
+    subfolder: str = "vae"
+    micro_batch_size: int = 16
+    cache: VAECacheConfig = field(default_factory=VAECacheConfig)
+
+
+@dataclass
 class OptimizerConfig:
     kind: str = "muon"
     lr: float = 2e-4
@@ -147,7 +187,6 @@ class TrainConfig:
     timestep_scale: float = 1.0
     reg_timestep_loc: float = 0.0
     reg_timestep_scale: float = 1.0
-    horizontal_flip_probability: float = 0.5
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
 
@@ -213,6 +252,7 @@ class ExperimentConfig:
     schema_version: int = CONFIG_SCHEMA_VERSION
     data: DataConfig = field(default_factory=DataConfig)
     feature_cache: FeatureCacheConfig = field(default_factory=FeatureCacheConfig)
+    vae: VAEConfig = field(default_factory=VAEConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     compile: CompileConfig = field(default_factory=CompileConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
@@ -242,8 +282,36 @@ class ExperimentConfig:
         )
         if m.image_size % m.patch_size:
             raise ValueError("model.image_size must be exactly divisible by model.patch_size")
-        if m.in_channels != 3:
-            raise ValueError("model.in_channels must be 3 for RGB pixel training")
+        if m.input_space not in {"pixels", "flux2_latents"}:
+            raise ValueError(
+                "model.input_space must be pixels or flux2_latents"
+            )
+        if m.input_space == "flux2_latents":
+            if (
+                m.image_size % FLUX2_SPATIAL_COMPRESSION
+                or m.patch_size % FLUX2_SPATIAL_COMPRESSION
+            ):
+                raise ValueError(
+                    "FLUX.2 latent mode requires model.image_size and "
+                    "model.patch_size to be divisible by 16"
+                )
+            vae = self.vae
+            if not vae.model_name or not vae.revision or not vae.subfolder:
+                raise ValueError(
+                    "latent mode requires a pinned VAE model, revision, and subfolder"
+                )
+            _positive("vae.micro_batch_size", vae.micro_batch_size)
+            if not vae.cache.directory:
+                raise ValueError("vae.cache.directory cannot be empty")
+            _positive(
+                "VAE-cache batch size and log interval",
+                vae.cache.batch_size,
+                vae.cache.log_interval,
+            )
+        elif self.vae.cache.enabled:
+            raise ValueError(
+                "vae.cache.enabled requires model.input_space=flux2_latents"
+            )
         if m.hidden_size % m.num_heads:
             raise ValueError("model.hidden_size must be divisible by model.num_heads")
         if (m.hidden_size // m.num_heads) % 4:
@@ -367,8 +435,6 @@ class ExperimentConfig:
                 raise ValueError(
                     "train.reg_timestep_scale must be finite and positive"
                 )
-        if not 0 <= self.train.horizontal_flip_probability <= 1:
-            raise ValueError("train.horizontal_flip_probability must be in [0, 1]")
         if features.enabled:
             if not self.feature_cache.directory:
                 raise ValueError("feature_cache.directory cannot be empty")
@@ -377,13 +443,6 @@ class ExperimentConfig:
                 self.feature_cache.batch_size,
                 self.feature_cache.log_interval,
             )
-            if (
-                self.feature_cache.enabled
-                and self.train.horizontal_flip_probability != 0
-            ):
-                raise ValueError(
-                    "cached feature training requires train.horizontal_flip_probability=0"
-                )
         if self.checkpoint.keep_last_n < 0:
             raise ValueError("checkpoint.keep_last_n cannot be negative")
         self._validate_sampling()

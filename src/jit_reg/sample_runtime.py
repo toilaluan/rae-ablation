@@ -75,8 +75,8 @@ class SamplingParameters:
 
 
 GenerateBatch = Callable[[Tensor, Tensor, Tensor], Tensor]
-SAMPLING_MANIFEST_SCHEMA_VERSION = 12
-FEATURE_SCHEMA_VERSION = 4
+SAMPLING_MANIFEST_SCHEMA_VERSION = 13
+FEATURE_SCHEMA_VERSION = 5
 
 
 def _float_slug(value: float) -> str:

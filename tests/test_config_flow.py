@@ -16,7 +16,8 @@ def test_required_presets_load() -> None:
     baseline = load_config(ROOT / "configs/baseline-p16.yaml")
     paper = load_config(ROOT / "configs/reg-repa-p16.yaml")
     early = load_config(ROOT / "configs/early-reg-p16.yaml")
-    assert baseline.schema_version == paper.schema_version == early.schema_version == 4
+    latent = load_config(ROOT / "configs/latent-baseline-p16.yaml")
+    assert baseline.schema_version == paper.schema_version == early.schema_version == 5
     assert (
         baseline.train.optimizer.kind
         == paper.train.optimizer.kind
@@ -38,6 +39,10 @@ def test_required_presets_load() -> None:
     assert early.sampling.img_denoising_interval == [0.3, 1.0]
     assert early.sampling.reg_denoising_interval == [0.0, 0.7]
     assert early.sampling.reg_timestep_shifts == [1.0]
+    assert latent.model.input_space == "flux2_latents"
+    assert latent.model.input_shape == (128, 16, 16)
+    assert latent.model.grid_size == 16
+    assert latent.model.input_patch_size == 1
 
 
 @pytest.mark.parametrize("kind", ["adamw", "muon", "fused_muon"])
@@ -59,6 +64,14 @@ def test_retired_micro_batch_override_is_rejected() -> None:
         load_config(
             ROOT / "configs/baseline-p16.yaml",
             ["train.micro_batch_size=8"],
+        )
+
+
+def test_removed_horizontal_flip_override_is_rejected() -> None:
+    with pytest.raises(ValueError, match="horizontal_flip_probability"):
+        load_config(
+            ROOT / "configs/baseline-p16.yaml",
+            ["train.horizontal_flip_probability=0.5"],
         )
 
 
@@ -149,8 +162,8 @@ def test_clean_break_rejects_old_and_unknown_configs(tmp_path: Path) -> None:
         load_checkpoint_config(old_checkpoint)
 
     unknown = tmp_path / "unknown.yaml"
-    unknown.write_text("schema_version: 4\nretired_experiment: true\n")
-    with pytest.raises(ValueError, match="invalid schema-v4"):
+    unknown.write_text("schema_version: 5\nretired_experiment: true\n")
+    with pytest.raises(ValueError, match="invalid schema-v5"):
         load_config(unknown)
 
 

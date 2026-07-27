@@ -23,7 +23,7 @@ from jit_reg.config import (
     WandbConfig,
     load_config,
 )
-from jit_reg.data import data_fingerprint, random_horizontal_flip
+from jit_reg.data import data_fingerprint
 from jit_reg.feature_cache import (
     FeatureCache,
     FeatureComponentCacheWriter,
@@ -167,9 +167,9 @@ def test_best_fid_metadata_tracks_reg_timestep_shift(tmp_path: Path) -> None:
 def test_v4_checkpoint_bundle_and_training_resume(tmp_path: Path) -> None:
     manager, checkpoint, model = save_checkpoint(tmp_path)
     metadata = json.loads((checkpoint / "metadata.json").read_text())
-    assert metadata["schema_version"] == 4
+    assert metadata["schema_version"] == 5
     training = torch.load(checkpoint / "training.pt", weights_only=False)
-    assert training["schema_version"] == 4
+    assert training["schema_version"] == 5
     restored = SiT(model.config)
     resumed = manager.load(
         checkpoint,
@@ -181,7 +181,7 @@ def test_v4_checkpoint_bundle_and_training_resume(tmp_path: Path) -> None:
     assert resumed.epoch == 1
     bundle = load_checkpoint_bundle(tmp_path / "checkpoints")
     assert bundle.directory == checkpoint.resolve()
-    assert bundle.config.schema_version == 4
+    assert bundle.config.schema_version == 5
 
 
 def test_old_training_resume_is_rejected_before_model_mutation(
@@ -196,7 +196,7 @@ def test_old_training_resume_is_rejected_before_model_mutation(
     before = {
         name: value.detach().clone() for name, value in restored.state_dict().items()
     }
-    with pytest.raises(ValueError, match="incompatible with schema v4"):
+    with pytest.raises(ValueError, match="incompatible with schema v5"):
         manager.load(checkpoint, restored, EMA(restored))
     assert all(
         torch.equal(value, before[name])
@@ -245,7 +245,7 @@ def test_rng_streams_checkpoint_independent_reg_timing() -> None:
     assert torch.equal(first, second)
     old = dict(saved)
     old.pop("reg_timesteps")
-    with pytest.raises(ValueError, match="incompatible with schema v4"):
+    with pytest.raises(ValueError, match="incompatible with schema v5"):
         streams.load_state_dict(old)
 
 
@@ -309,7 +309,6 @@ def test_required_preset_shapes_run_one_training_step(
     if cached:
         config.feature_cache.enabled = True
         config.feature_cache.directory = str(tmp_path / case_name / "features")
-        config.train.horizontal_flip_probability = 0
         config.validate()
         for component in ("reg", "repa"):
             spec = component_spec(config, 2, component)
@@ -367,15 +366,8 @@ def test_required_preset_shapes_run_one_training_step(
     } <= logged_names
 
 
-def test_data_fingerprint_and_flip_are_stable() -> None:
+def test_data_fingerprint_is_stable() -> None:
     config = tiny_experiment()
     first = data_fingerprint(config.data, config.model.image_size)
     assert first == data_fingerprint(config.data, config.model.image_size)
     assert first != data_fingerprint(config.data, 32)
-    values = torch.arange(12).reshape(1, 1, 3, 4)
-    assert torch.equal(
-        random_horizontal_flip(
-            values, torch.Generator().manual_seed(1), probability=1
-        ),
-        values.flip(-1),
-    )

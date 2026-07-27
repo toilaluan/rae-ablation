@@ -39,7 +39,6 @@ def cache_config(tmp_path: Path) -> ExperimentConfig:
     config.model.features.repa.enabled = True
     config.model.features.repa.block = 1
     config.model.features.repa.token_scope = "image_and_reg"
-    config.train.horizontal_flip_probability = 0
     return config
 
 

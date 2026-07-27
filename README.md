@@ -1,24 +1,392 @@
-# JiT with independent REG and REPA
+# JiT with pixel or FLUX.2 latent diffusion
 
-`jit-reg` trains a class-conditional SiT-B/16 directly on ImageNet-256 pixels. REG
-jointly denoises DINOv3 representation tokens; REPA aligns an intermediate SiT
-sequence with frozen DINOv3 targets. Either feature can be enabled independently,
-and disabling both leaves the baseline model and objective unchanged.
+`jit-reg` trains a class-conditional SiT-B/16 on ImageNet-256. The diffusion
+state can be either RGB pixels or normalized FLUX.2 VAE latents. REG jointly
+denoises DINOv3 representation tokens, while REPA aligns an intermediate SiT
+sequence with frozen DINOv3 targets. Pixel/latent input and REG/REPA are
+independent choices.
 
-This repository uses configuration schema v4. Older configs, checkpoints, REG
-feature caches, and sampling manifests are intentionally incompatible and must be
-rebuilt. Independent REPA caches remain reusable.
+This repository uses configuration schema v5. Older configs, checkpoints,
+training states, and sampling manifests are intentionally incompatible.
+Schema-v3 REG/REPA caches remain reusable.
 
-## Presets
+| Input space | Diffusion tensor | SiT patch | SiT grid |
+| --- | ---: | ---: | ---: |
+| `pixels` | `3×256×256` | `16×16` | `16×16` |
+| `flux2_latents` | `128×16×16` | `1×1` | `16×16` |
 
-- `configs/baseline-p16.yaml`: feature-free SiT-B/16 baseline.
-- `configs/reg-repa-p16.yaml`: pooled 4×4 spatial REG plus block-4,
-  full-sequence REPA; REG leads image denoising.
-- `configs/early-reg-p16.yaml`: pooled 4×4 spatial REG with aligned 2D RoPE, a
-  block-4 2048-wide depth-2 head, additive FC–GELU–FC reinjection, and leading
-  REG denoising.
+FLUX.2 first produces a raw `32×32×32` posterior mode for a 256×256 image.
+Its official 2×2 patchification and stored batch-normalization statistics turn
+that into the `128×16×16` tensor used for diffusion. Both input spaces
+therefore retain the same 256 image-token layout and the same REPA target grid.
 
-The v4 feature configuration lives under `model.features`:
+Horizontal flipping is not performed anywhere in the data, cache, or training
+pipelines.
+
+## 0. Environment setup
+
+Python 3.12 is required.
+
+```bash
+uv sync --extra dev
+uv run hf auth login
+uv run wandb login
+uv run pytest -q
+uv run ruff check .
+```
+
+The latent path downloads only the `vae` subfolder of
+`black-forest-labs/FLUX.2-klein-4B`, pinned by the configuration revision. The
+VAE is frozen and uses bf16 on CUDA and float32 on CPU.
+
+Download the ImageNet-256 ADM reference statistics before training validation
+or FID evaluation:
+
+```bash
+mkdir -p data
+curl -L \
+  https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz \
+  -o data/VIRTUAL_imagenet256_labeled.npz
+```
+
+The presets are:
+
+- `configs/baseline-p16.yaml`: pixel SiT-B/16 baseline.
+- `configs/latent-baseline-p16.yaml`: online FLUX.2 latent baseline.
+- `configs/reg-repa-p16.yaml`: pooled 4×4 REG plus block-4 REPA.
+- `configs/early-reg-p16.yaml`: block-4 early REG prediction and reinjection.
+
+Any pixel feature preset becomes a latent preset with:
+
+```bash
+--override model.input_space=flux2_latents
+```
+
+Overrides are structured OmegaConf dot-list values. Repeat `--override` once
+per setting. Unknown or retired fields fail validation.
+
+## 1. Build caches
+
+Cache construction is resumable and distributed. Each rank processes a
+disjoint subset, while rank zero owns capacity preflight, finalization, and the
+build lock. Re-running the same command continues missing entries or exits if
+the cache is already complete.
+
+### 1.1 Cache FLUX.2 latents
+
+For the latent baseline:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/cache_latents.py \
+  --config configs/latent-baseline-p16.yaml
+```
+
+For a latent REG/REPA run:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/cache_latents.py \
+  --config configs/reg-repa-p16.yaml \
+  --override model.input_space=flux2_latents
+```
+
+The cache stores deterministic posterior modes after FLUX.2 patchification and
+normalization. `vae.micro_batch_size` bounds VAE encode/decode work independently
+of loader and training batch sizes. `vae.cache.batch_size` controls the cache
+loader and host buffers.
+
+For the pinned ImageNet training split of 1,281,167 images:
+
+| Cache | Approximate size |
+| --- | ---: |
+| FLUX.2 latents, bf16 | 78.2 GiB |
+| 4×4 REG, bf16 | 29.3 GiB |
+| 16×16 REPA, bf16 | 469.2 GiB |
+| Latents + REG | 107.5 GiB |
+| Latents + REPA | 547.4 GiB |
+| Latents + REG + REPA | 576.7 GiB |
+
+The latent formula is:
+
+```text
+dataset_size × 128 × 16 × 16 × 2 bytes + completion bitmap
+```
+
+The preflight uses the actual dataset length, so `data.max_samples` scales the
+required capacity for smoke tests:
+
+```bash
+uv run python scripts/cache_latents.py \
+  --config configs/latent-baseline-p16.yaml \
+  --override data.max_samples=1024 \
+  --override vae.cache.batch_size=32
+```
+
+### 1.2 Cache REG and REPA targets
+
+Build only the active feature components:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/cache_features.py \
+  --config configs/reg-repa-p16.yaml
+```
+
+For a latent REG/REPA experiment, use the same input-space override as training:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/cache_features.py \
+  --config configs/reg-repa-p16.yaml \
+  --override model.input_space=flux2_latents
+```
+
+REG and REPA have independent fingerprints. Changing heads, losses, optimizer
+settings, target scale, timing, sampling, or the other feature does not
+invalidate a reusable component. REPA targets are large; begin with
+`data.prefetch_factor=1` during cached training if host-memory pressure is high.
+
+## 2. Train
+
+`train.global_batch_size` is divided evenly by the distributed world size.
+Every loader batch performs one optimizer step; there is no gradient
+accumulation or separate per-device batch setting.
+
+### Pixel baseline
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/baseline-p16.yaml \
+  --output runs/pixel-baseline-p16
+```
+
+### Online latent baseline
+
+This loads the frozen VAE on every rank and encodes each training batch:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/latent-baseline-p16.yaml \
+  --output runs/latent-online-p16
+```
+
+### Cached latent baseline
+
+Build the latent cache first, then enable it for training:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/latent-baseline-p16.yaml \
+  --override vae.cache.enabled=true \
+  --output runs/latent-cached-p16
+```
+
+When no online DINO targets are required, cached latent training reads only
+labels, indices, and latent tensors; RGB images are not decoded or transferred.
+
+### Cached latent REG/REPA
+
+Build both caches using the commands in step 1, then run:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/reg-repa-p16.yaml \
+  --override model.input_space=flux2_latents \
+  --override vae.cache.enabled=true \
+  --override feature_cache.enabled=true \
+  --override data.prefetch_factor=1 \
+  --output runs/latent-reg-repa-p16
+```
+
+Online and cached sources are selected independently. For example, a cached VAE
+with online DINO targets keeps RGB images in the loader, while cached VAE plus
+cached REG/REPA omits them.
+
+### Resume training
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/latent-baseline-p16.yaml \
+  --override vae.cache.enabled=true \
+  --output runs/latent-cached-p16 \
+  --resume runs/latent-cached-p16/checkpoints/last
+```
+
+Resume validates the dataset, validation plan, feature-cache fingerprints, and
+latent-cache fingerprint. Switching between online and cached sources or
+changing a semantic cache input requires a new run.
+
+Checkpoints are written beneath `<output>/checkpoints`. Periodic generated
+samples and FID results are written beneath `<output>/validation`. Set
+`wandb.enabled=true` and the relevant `wandb.*` fields through YAML or overrides
+to enable experiment logging.
+
+The fused Gram Newton–Schulz optimizer remains an explicit hardware-specific
+option:
+
+```bash
+uv sync --extra dev --extra fused-muon
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/baseline-p16.yaml \
+  --override train.optimizer.kind=fused_muon \
+  --output runs/fused-muon
+```
+
+It requires CUDA 12.9 or newer and compute capability 9.0 or newer. Unsupported
+hardware fails instead of falling back to another optimizer.
+
+## 3. Sample and evaluate
+
+Standalone sampling inherits `sampling.*` and the VAE identity from the
+checkpoint. Explicit flags replace individual sampling defaults.
+
+### Sample
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
+  --checkpoint-dir runs/latent-cached-p16/checkpoints/last
+```
+
+Latent checkpoints generate `128×16×16` diffusion states and decode them to
+256×256 RGB before preview and NPZ creation. Outputs are stored in a
+parameter-derived directory inside the checkpoint. Sampling is rank-partitioned
+and resumes only when the checkpoint, validation plan, model schema, and
+sampling parameters match the existing manifest.
+
+Override the solver and guidance:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
+  --checkpoint-dir runs/latent-reg-repa-p16/checkpoints/last \
+  --solver heun \
+  --sampling-steps 50 \
+  --guidance-scale 2.0 \
+  --reg-timestep-shift 1.0
+```
+
+### Sample and compute FID
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
+  --checkpoint-dir runs/latent-cached-p16/checkpoints/last \
+  --evaluate
+```
+
+Rank zero writes `evaluation.json` beside `samples.npz` after distributed
+sampling completes.
+
+### Evaluate an existing NPZ
+
+For a repository-produced archive, the adjacent manifest supplies the
+validation-plan hash:
+
+```bash
+uv run python scripts/eval.py \
+  --samples path/to/samples.npz \
+  --reference data/VIRTUAL_imagenet256_labeled.npz \
+  --output path/to/evaluation.json
+```
+
+For an external NPZ without an adjacent complete manifest, also provide:
+
+```bash
+--plan path/to/validation-plan.pt
+```
+
+### Compare two evaluations
+
+```bash
+uv run python scripts/compare.py \
+  runs/pixel/evaluation.json \
+  runs/latent/evaluation.json \
+  --output comparison.json
+```
+
+The evaluations must use the same validation-plan hash.
+
+## Script argument reference
+
+Run any command with `--help` for its concise parser-generated reference.
+
+### `scripts/cache_latents.py`
+
+| Argument | Type/default | Description |
+| --- | --- | --- |
+| `--config` | path; `configs/latent-baseline-p16.yaml` | Schema-v5 latent experiment configuration. The input space must be `flux2_latents`. |
+| `--override KEY=VALUE` | repeatable; none | Structured configuration override. Common cache controls are `data.max_samples`, `data.workers`, `vae.micro_batch_size`, `vae.cache.directory`, `vae.cache.batch_size`, and `vae.cache.log_interval`. |
+
+The command writes under `vae.cache.directory/<fingerprint>` and never
+overwrites an incompatible cache.
+
+### `scripts/cache_features.py`
+
+| Argument | Type/default | Description |
+| --- | --- | --- |
+| `--config` | path; `configs/baseline-p16.yaml` | Schema-v5 experiment configuration. REG or REPA must be enabled. |
+| `--override KEY=VALUE` | repeatable; none | Structured override controlling active components, dataset limits, cache directory, batch size, logging, or preprocessing identity. |
+
+The command writes independent `reg/<fingerprint>` and `repa/<fingerprint>`
+components beneath `feature_cache.directory`.
+
+### `scripts/train.py`
+
+| Argument | Type/default | Description |
+| --- | --- | --- |
+| `--config` | path; `configs/baseline-p16.yaml` | Schema-v5 experiment configuration. |
+| `--override KEY=VALUE` | repeatable; none | Structured override applied before final validation. |
+| `--output` | path; none | Run root. Rewrites checkpoint and validation-plan paths beneath this directory. Without it, configured paths are used directly. |
+| `--resume` | checkpoint path; none | Resume model, EMA, optimizer, RNG streams, epoch/step, validation state, and cache identities from a compatible checkpoint directory. |
+| `--log-interval` | integer; `10` | Training-step interval for console/W&B metric emission. |
+
+Training also requires the configured FID reference file to exist because
+validation is part of the run.
+
+### `scripts/sample.py`
+
+| Argument | Type/default | Description |
+| --- | --- | --- |
+| `--checkpoint-dir` | path; required | Self-contained checkpoint directory, or a checkpoint root containing `last`. |
+| `--num-samples` | integer; checkpoint value | Number of class-balanced samples. Must be divisible by `model.num_classes`. |
+| `--batch-size` | integer; checkpoint value | Per-rank generation batch size. VAE decode is further chunked by `vae.micro_batch_size`. |
+| `--sampling-steps` | integer; checkpoint value | Number of global Euler/Heun solver steps. |
+| `--solver` | `euler` or `heun`; checkpoint value | ODE solver. Heun uses a final Euler step. |
+| `--guidance-scale` | float; checkpoint value | Classifier-free guidance scale. |
+| `--timestep-shift` | positive float; checkpoint value | Image/latent local-clock shift. |
+| `--reg-timestep-shift` | positive float; first checkpoint candidate | REG local-clock shift used by standalone sampling. |
+| `--img-denoising-interval START END` | two floats; checkpoint value | Fractional global interval assigned to image/latent denoising. |
+| `--reg-denoising-interval START END` | two floats; checkpoint value | Fractional global interval assigned to REG denoising. |
+| `--cfg-start` | float; checkpoint value | Start of the CFG window in image-local time. |
+| `--cfg-end` | float; checkpoint value | End of the CFG window in image-local time. |
+| `--log-interval` | integer; checkpoint value | Sampling progress interval. |
+| `--evaluate` | flag; false | Compute FID on rank zero and write `evaluation.json` after sampling. |
+| `--reference-npz` | path; checkpoint evaluation path | Override the FID reference used with `--evaluate`. |
+
+All interval endpoints must satisfy `0 <= start < end <= 1`; CFG allows equal
+start/end endpoints.
+
+### `scripts/eval.py`
+
+| Argument | Type/default | Description |
+| --- | --- | --- |
+| `--samples` | path; required | ADM-compatible NPZ containing `arr_0` as `N×256×256×3` uint8 images. |
+| `--reference` | path; required | NPZ containing reference `mu` and `sigma`. |
+| `--output` | path; required | Destination `evaluation.json`. |
+| `--plan` | path; optional | Validation plan for external archives. Optional when a complete adjacent sample manifest supplies the same hash. |
+| `--batch-size` | integer; `64` | Inception feature-extraction batch size. |
+| `--device` | device string; `auto` | Evaluation device such as `auto`, `cpu`, or `cuda:0`. |
+| `--log-interval` | integer; `10` | Feature-extraction progress interval. |
+
+### `scripts/compare.py`
+
+| Argument | Type/default | Description |
+| --- | --- | --- |
+| `first` | path; required positional | First `evaluation.json`. |
+| `second` | path; required positional | Second `evaluation.json`. |
+| `--output` | path; optional | Write the comparison JSON. The comparison is always printed to stdout. |
+
+## Feature configuration
+
+REG and REPA remain configured under `model.features`. REG predicts clean
+DINOv3 tokens and has its own time distribution. REPA aligns an intermediate
+SiT sequence with frozen targets and can cover image tokens or image plus REG
+tokens.
 
 ```yaml
 model:
@@ -39,7 +407,7 @@ model:
         depth: 2
         mlp_ratio: 4.0
       early_prediction:
-        block: null          # null predicts after the final block
+        block: null
         projection_hidden_size: 2048
         reinjection_mode: replace  # replace | add
     repa:
@@ -50,173 +418,6 @@ model:
       token_scope: image_and_reg  # image | image_and_reg
 ```
 
-Every transformer block uses the same adaLN weights for both streams while applying
-image-time parameters to image tokens and REG-time parameters to REG tokens. REG
-heads predict clean x₀. The REG velocity objective is derived from that x₀ using
-REG time; the pixel objective uses image time.
-
-Image and REG training times are independent sigmoid-normal draws:
-
-```yaml
-train:
-  timestep_loc: -0.8
-  timestep_scale: 0.8
-  reg_timestep_loc: -0.8
-  reg_timestep_scale: 0.8
-```
-
-Sampling uses one global solver loop with independent local clocks. Fractional
-intervals are rounded to the nearest global step edge. For 50 steps, the example
-below gives each stream 35 updates: REG runs on steps 0–35 and image runs on
-steps 15–50.
-
-```yaml
-sampling:
-  sampling_steps: 50
-  timestep_shift: 1.0
-  reg_timestep_shifts: [0.7, 1.0, 1.3]
-  img_denoising_interval: [0.3, 1.0]
-  reg_denoising_interval: [0.0, 0.7]
-```
-
-## Environment
-
-Python 3.12 is required.
-
-```bash
-uv sync --extra dev
-uv run hf auth login
-uv run wandb login
-uv run pytest -q
-uv run ruff check .
-```
-
-The default presets use PyTorch Muon. The fused Gram Newton–Schulz backend is an
-explicit Hopper/Blackwell opt-in:
-
-```bash
-uv sync --extra dev --extra fused-muon
-uv run python scripts/train.py \
-  --override train.optimizer.kind=fused_muon
-```
-
-This installs `gram-newton-schulz==0.1.6` and requires CUDA 12.9 or newer plus
-compute capability 9.0 or newer. Unsupported hardware and missing dependencies
-produce an error; training never falls back to another optimizer.
-
-Download the ImageNet-256 ADM reference statistics to the path configured by
-`evaluation.reference_npz`:
-
-```bash
-mkdir -p data
-curl -L \
-  https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz \
-  -o data/VIRTUAL_imagenet256_labeled.npz
-```
-
-## Training
-
-All feature and online-evaluation settings come from YAML. Structured overrides are
-the only command-line mechanism for changing them.
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/baseline-p16.yaml \
-  --output runs/baseline-p16
-
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/reg-repa-p16.yaml \
-  --output runs/reg-repa-p16
-
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/early-reg-p16.yaml \
-  --output runs/early-reg-p16
-```
-
-`train.global_batch_size` is divided evenly across the distributed world size to
-derive each rank's loader batch. Every loader batch performs one optimizer step;
-gradient accumulation and a separate per-device batch setting are not used.
-
-Training logs separate timing for DataLoader wait, host batch preparation, GPU
-input preparation, GPU forward/backward, optimizer/EMA, and logging. Validation
-and checkpoint durations are logged when those operations run. Because logging
-duration is only known after a step is emitted, `throughput/logging_seconds` on a
-step describes the preceding step's logging call.
-
-For example, a REPA-only run can be selected without feature-specific CLI flags:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/baseline-p16.yaml \
-  --override model.features.repa.enabled=true \
-  --output runs/repa-p16
-```
-
-## Independent feature caches
-
-The component builder creates only missing active components. Canonical cached REG
-tokens have per-token mean zero and standard deviation one; `target_std` is applied
-only after online extraction or cache lookup during training. REG and REPA live
-under separate fingerprints, so changing a head, loss, optimizer, REPA block, REG
-target scale or timing, sampling, evaluation, or the other feature does not
-invalidate a reusable component.
-
-Cached training disables random flips:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/cache_features.py \
-  --config configs/reg-repa-p16.yaml \
-  --override train.horizontal_flip_probability=0
-
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/reg-repa-p16.yaml \
-  --override feature_cache.enabled=true \
-  --override train.horizontal_flip_probability=0 \
-  --override data.prefetch_factor=1 \
-  --output runs/reg-repa-cached-p16
-```
-
-Cached targets are gathered in DataLoader workers and pinned with the image batch.
-REPA targets are large, so start with `data.prefetch_factor=1` and increase it only
-when host memory and profiling show that deeper prefetching is useful.
-
-Cache manifests record environment versions diagnostically, but only pinned
-dataset/preprocessing, encoder identity, component feature schema, and the
-component’s target layout participate in its fingerprint.
-
-Cache construction uses two pinned host buffers, a dedicated CUDA copy stream, and
-one bounded disk-writer thread per rank. It drains queued writes before
-finalization and logs data wait, GPU extraction, buffer backpressure, copy,
-write/flush, and total throughput. A capacity preflight runs before allocation.
-Full ImageNet needs approximately 29.3 GiB for 4×4 REG, 469.2 GiB for 16×16 REPA,
-or 498.5 GiB for both.
-
-## Sampling and evaluation
-
-Standalone sampling inherits `sampling.*` from the checkpoint. Explicit sampling
-flags override individual defaults. REG checkpoints jointly integrate distinct
-image and REG schedules with Euler or Heun; CFG-window decisions use image time.
-Standalone sampling uses the first configured REG timestep shift unless
-`--reg-timestep-shift` overrides it.
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --checkpoint-dir runs/reg-repa-p16/checkpoints/last
-
-uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --checkpoint-dir runs/early-reg-p16/checkpoints/last \
-  --solver heun \
-  --evaluate
-```
-
-During training validation, every configured `sampling.reg_timestep_shifts`
-candidate is evaluated on the shared periodic subset. The lowest FID is reported
-as `validation/FID-10K` by the default presets, and its shift is reported as
-`validation/best_reg_timestep_shift`. Final validation repeats the 10K sweep and
-runs the 50K evaluation once with the winner.
-
-`--evaluate` computes FID on rank zero using the checkpoint’s `evaluation.*`
-settings and writes `evaluation.json` beside `samples.npz`. Output names and
-manifests record both denoising intervals, effective step counts, and image/REG
-timestep shifts. Sampling is rank-partitioned and resumable only from a compatible
-schema-v12 manifest.
+Image/latent and REG times are independent sigmoid-normal draws. Sampling uses
+one global solver loop with independent local clocks and quantized denoising
+intervals.

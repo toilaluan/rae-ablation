@@ -15,28 +15,25 @@ class RNGStreams:
     initialization: torch.Generator
     timesteps: torch.Generator
     noise: torch.Generator
-    augmentations: torch.Generator
     label_dropout: torch.Generator
     reg_noise: torch.Generator
     reg_timesteps: torch.Generator
 
     @classmethod
     def create(cls, seed: int, device: str | torch.device = "cpu") -> RNGStreams:
-        offsets = (0, 10_000, 20_000, 30_000, 40_000, 50_000, 60_000, 70_000)
+        offsets = (0, 10_000, 20_000, 30_000, 50_000, 60_000, 70_000)
         shuffle = torch.Generator(device="cpu").manual_seed(seed + offsets[0])
         initialization = torch.Generator(device="cpu").manual_seed(seed + offsets[1])
         timesteps = torch.Generator(device=device).manual_seed(seed + offsets[2])
         noise = torch.Generator(device=device).manual_seed(seed + offsets[3])
-        augmentations = torch.Generator(device=device).manual_seed(seed + offsets[4])
-        label_dropout = torch.Generator(device=device).manual_seed(seed + offsets[5])
-        reg_noise = torch.Generator(device=device).manual_seed(seed + offsets[6])
-        reg_timesteps = torch.Generator(device=device).manual_seed(seed + offsets[7])
+        label_dropout = torch.Generator(device=device).manual_seed(seed + offsets[4])
+        reg_noise = torch.Generator(device=device).manual_seed(seed + offsets[5])
+        reg_timesteps = torch.Generator(device=device).manual_seed(seed + offsets[6])
         return cls(
             shuffle,
             initialization,
             timesteps,
             noise,
-            augmentations,
             label_dropout,
             reg_noise,
             reg_timesteps,
@@ -48,7 +45,6 @@ class RNGStreams:
             "initialization": self.initialization.get_state(),
             "timesteps": self.timesteps.get_state(),
             "noise": self.noise.get_state(),
-            "augmentations": self.augmentations.get_state(),
             "label_dropout": self.label_dropout.get_state(),
             "reg_noise": self.reg_noise.get_state(),
             "reg_timesteps": self.reg_timesteps.get_state(),
@@ -58,7 +54,7 @@ class RNGStreams:
         expected = set(self.state_dict())
         if set(state) != expected:
             raise ValueError(
-                "checkpoint RNG streams are incompatible with schema v4; "
+                "checkpoint RNG streams are incompatible with schema v5; "
                 f"expected {sorted(expected)}"
             )
         for name, value in state.items():

@@ -28,7 +28,7 @@ from jit_reg.validation_runtime import validate_ema
 
 ROOT = Path(__file__).resolve().parents[1]
 FEATURE_SCHEMA = {
-    "schema_version": 4,
+    "schema_version": 5,
     "encoder": {},
     "reg": {"enabled": False},
     "repa": {"enabled": False},
@@ -50,7 +50,7 @@ def test_sampling_output_name_includes_asynchronous_reg_schedule() -> None:
     assert "-regint0p0-" in name
 
 
-def test_sampling_manifest_has_v4_features_and_rejects_old_schema(
+def test_sampling_manifest_has_v5_features_and_rejects_old_schema(
     tmp_path: Path,
 ) -> None:
     plan = create_validation_plan(4, 2, 2, seed=4)
@@ -87,7 +87,7 @@ def test_sampling_manifest_has_v4_features_and_rejects_old_schema(
     )
     assert archive.is_file()
     manifest = json.loads((output / "samples.json").read_text())
-    assert manifest["schema_version"] == 12
+    assert manifest["schema_version"] == 13
     assert manifest["feature_schema"] == FEATURE_SCHEMA
     assert manifest["sampling"]["reg_timestep_shift"] == 0.5
     assert manifest["sampling"]["img_denoising_steps"] == 1
@@ -95,7 +95,7 @@ def test_sampling_manifest_has_v4_features_and_rejects_old_schema(
 
     old = tmp_path / "old"
     old.mkdir()
-    (old / "samples.json").write_text(json.dumps({"schema_version": 11}))
+    (old / "samples.json").write_text(json.dumps({"schema_version": 12}))
     with pytest.raises(ValueError, match="old manifests"):
         sample_to_archive(
             output_dir=old,
@@ -338,7 +338,14 @@ def test_standalone_sampling_inherits_defaults_and_evaluate_writes_artifact(
 
 @pytest.mark.parametrize(
     "script",
-    ["train.py", "sample.py", "cache_features.py", "eval.py", "compare.py"],
+    [
+        "train.py",
+        "sample.py",
+        "cache_features.py",
+        "cache_latents.py",
+        "eval.py",
+        "compare.py",
+    ],
 )
 def test_standalone_script_help(script: str) -> None:
     result = subprocess.run(

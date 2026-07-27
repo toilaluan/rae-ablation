@@ -50,6 +50,7 @@ def test_cpu_batch_preparation_matches_previous_pixel_and_cache_values(
         pixels,
         torch.tensor([1, 2]),
         torch.tensor([3, 4]),
+        torch.randn(2, 8, 2, 2, dtype=torch.bfloat16),
         cached,
     )
     prepared = prepare_train_batch(source, "cpu")
@@ -57,6 +58,8 @@ def test_cpu_batch_preparation_matches_previous_pixel_and_cache_values(
     assert torch.equal(prepared.pixels, pixels.float().div(255))
     assert torch.equal(prepared.labels, source.labels)
     assert prepared.indices is source.indices
+    assert prepared.cached_latents is not None
+    assert prepared.cached_latents.dtype == torch.float32
     if cached is None:
         assert prepared.cached_targets is None
     else:
@@ -79,6 +82,7 @@ def test_cuda_prefetch_matches_synchronous_preparation() -> None:
         torch.randint(0, 256, (2, 3, 4, 4), dtype=torch.uint8).pin_memory(),
         torch.tensor([1, 2]).pin_memory(),
         torch.tensor([3, 4]).pin_memory(),
+        torch.randn(2, 8, 2, 2, dtype=torch.bfloat16).pin_memory(),
         FeatureTargets(
             torch.randn(2, 4, 8, dtype=torch.bfloat16).pin_memory(),
             torch.randn(2, 4, 8, dtype=torch.bfloat16).pin_memory(),
@@ -92,6 +96,11 @@ def test_cuda_prefetch_matches_synchronous_preparation() -> None:
         actual.pixels.cpu(), expected.pixels, atol=1e-7, rtol=0
     )
     assert torch.equal(actual.labels.cpu(), expected.labels)
+    assert actual.cached_latents is not None
+    assert expected.cached_latents is not None
+    assert torch.equal(
+        actual.cached_latents.cpu(), expected.cached_latents
+    )
     assert actual.cached_targets is not None
     assert expected.cached_targets is not None
     assert torch.equal(

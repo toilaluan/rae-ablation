@@ -316,13 +316,13 @@ class WideREGPredictor(nn.Module):
 
 
 class SiT(nn.Module):
-    """Pixel-space SiT with independent REG denoising and REPA alignment."""
+    """SiT over pixel or normalized FLUX.2 latent tensors."""
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        if config.image_size < 1 or config.patch_size < 1:
+        if config.input_size < 1 or config.input_patch_size < 1:
             raise ValueError("image size and patch size must be positive")
-        if config.image_size % config.patch_size:
+        if config.input_size % config.input_patch_size:
             raise ValueError("image size must be divisible by patch size")
         if config.hidden_size < 1 or config.num_heads < 1 or config.depth < 1:
             raise ValueError("SiT dimensions must be positive")
@@ -352,12 +352,12 @@ class SiT(nn.Module):
             raise ValueError("REPA image_and_reg scope requires REG")
         self.config = config
         self._reg_prediction_block = reg.early_prediction.block
-        self.grid_size = config.image_size // config.patch_size
+        self.grid_size = config.input_size // config.input_patch_size
         self.patch_projection = nn.Conv2d(
-            config.in_channels,
+            config.input_channels,
             config.hidden_size,
-            kernel_size=config.patch_size,
-            stride=config.patch_size,
+            kernel_size=config.input_patch_size,
+            stride=config.input_patch_size,
         )
         self.timestep_embedding = TimestepEmbedding(config.hidden_size)
         self.class_embedding = nn.Embedding(config.num_classes + 1, config.hidden_size)
@@ -374,7 +374,11 @@ class SiT(nn.Module):
                 for _ in range(config.depth)
             ]
         )
-        patch_values = config.patch_size * config.patch_size * config.in_channels
+        patch_values = (
+            config.input_patch_size
+            * config.input_patch_size
+            * config.input_channels
+        )
         self.final_layer = FinalLayer(config.hidden_size, patch_values)
         feature_dim = features.encoder.feature_dim
         if reg.enabled:
@@ -476,11 +480,11 @@ class SiT(nn.Module):
 
     def _unpatchify(self, tokens: Tensor) -> Tensor:
         batch = tokens.shape[0]
-        patch = self.config.patch_size
-        channels = self.config.in_channels
+        patch = self.config.input_patch_size
+        channels = self.config.input_channels
         values = tokens.reshape(batch, self.grid_size, self.grid_size, patch, patch, channels)
         return torch.einsum("bhwpqc->bchpwq", values).reshape(
-            batch, channels, self.config.image_size, self.config.image_size
+            batch, channels, self.config.input_size, self.config.input_size
         )
 
     def _add_reg_positions(self, tokens: Tensor) -> Tensor:
@@ -499,14 +503,15 @@ class SiT(nn.Module):
     ) -> SiTOutput:
         expected = (
             noisy_image.shape[0],
-            self.config.in_channels,
-            self.config.image_size,
-            self.config.image_size,
+            self.config.input_channels,
+            self.config.input_size,
+            self.config.input_size,
         )
         if noisy_image.ndim != 4 or tuple(noisy_image.shape) != expected:
             raise ValueError(
                 "noisy_image must have shape "
-                f"[B, {self.config.in_channels}, {self.config.image_size}, {self.config.image_size}]"
+                f"[B, {self.config.input_channels}, "
+                f"{self.config.input_size}, {self.config.input_size}]"
             )
         batch = noisy_image.shape[0]
         if timestep.shape != (batch,) or labels.shape != (batch,):
