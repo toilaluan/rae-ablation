@@ -48,6 +48,7 @@ def test_required_presets_load() -> None:
     assert paper.model.features.reg.internal_guidance_block == 4
     assert not paper.model.fused_mlp
     assert not paper.model.features.reg.independent_attention
+    assert paper.model.features.reg.reg_dropout_prob == 0
     assert not paper.model.features.reg.lora.enabled
     assert paper.model.features.reg.lora.rank == 16
     assert paper.model.features.reg.lora.alpha == pytest.approx(16)
@@ -194,6 +195,26 @@ def test_active_reg_lora_validates_rank_and_alpha(
     config.model.features.reg.lora.enabled = True
     setattr(config.model.features.reg.lora, field, value)
     with pytest.raises(ValueError, match=message):
+        config.validate()
+
+
+@pytest.mark.parametrize("probability", [-0.1, 1.1, float("nan")])
+def test_active_reg_dropout_probability_validates(
+    probability: float,
+) -> None:
+    config = ExperimentConfig()
+    config.model.features.reg.enabled = True
+    config.model.features.reg.independent_attention = True
+    config.model.features.reg.reg_dropout_prob = probability
+    with pytest.raises(ValueError, match="reg_dropout_prob"):
+        config.validate()
+
+
+def test_reg_dropout_requires_independent_attention() -> None:
+    config = ExperimentConfig()
+    config.model.features.reg.enabled = True
+    config.model.features.reg.reg_dropout_prob = 0.5
+    with pytest.raises(ValueError, match="independent_attention"):
         config.validate()
 
 

@@ -42,6 +42,7 @@ class REGConfig:
     loss_weight: float = 0.03
     internal_guidance_block: int = 4
     independent_attention: bool = False
+    reg_dropout_prob: float = 0.0
     lora: REGLoRAConfig = field(default_factory=REGLoRAConfig)
 
     @property
@@ -370,6 +371,18 @@ class ExperimentConfig:
                 raise ValueError("model.features.encoder.model_name cannot be empty")
         if features.reg.enabled:
             reg = features.reg
+            if (
+                not math.isfinite(reg.reg_dropout_prob)
+                or not 0 <= reg.reg_dropout_prob <= 1
+            ):
+                raise ValueError(
+                    "model.features.reg.reg_dropout_prob must be in [0, 1]"
+                )
+            if reg.reg_dropout_prob and not reg.independent_attention:
+                raise ValueError(
+                    "model.features.reg.reg_dropout_prob requires "
+                    "independent_attention=true"
+                )
             if reg.pool_size < 1 or reg.pool_size > m.grid_size:
                 raise ValueError(
                     "model.features.reg.pool_size must not exceed the model grid"

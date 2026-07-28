@@ -493,6 +493,22 @@ def train(
                 config.model.class_dropout_prob,
                 streams.label_dropout,
             )
+            reg_config = config.model.features.reg
+            drop_reg_for_image = (
+                reg_config.enabled
+                and (
+                    reg_config.reg_dropout_prob >= 1
+                    or (
+                        reg_config.reg_dropout_prob > 0
+                        and torch.rand(
+                            (),
+                            device=device,
+                            generator=streams.label_dropout,
+                        ).item()
+                        < reg_config.reg_dropout_prob
+                    )
+                )
+            )
 
             targets = None
             reg_noise = None
@@ -553,6 +569,7 @@ def train(
                     noisy_reg=noisy_reg,
                     reg_timestep=reg_timesteps,
                     return_repa=config.model.features.repa.enabled,
+                    drop_reg_for_image=drop_reg_for_image,
                 )
             repa_target = (
                 repa_target_for_scope(

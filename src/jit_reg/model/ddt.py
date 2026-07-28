@@ -359,7 +359,12 @@ class Attention(nn.Module):
         assert rope_cos is not None and rope_sin is not None
         return rope_cos, rope_sin
 
-    def forward(self, x: Tensor, reg_only: bool = False) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        reg_only: bool = False,
+        drop_reg_for_image: bool = False,
+    ) -> Tensor:
         batch, tokens, _hidden = x.shape
         expected_tokens = (
             self.reg_tokens + self.condition_tokens
@@ -369,6 +374,12 @@ class Attention(nn.Module):
         if reg_only and not self.independent_reg_attention:
             raise ValueError(
                 "REG-only attention requires independent REG attention"
+            )
+        if drop_reg_for_image and (
+            reg_only or not self.independent_reg_attention
+        ):
+            raise ValueError(
+                "REG dropout requires full independent REG attention"
             )
         if tokens != expected_tokens:
             raise ValueError(
@@ -433,10 +444,20 @@ class Attention(nn.Module):
                 reg_condition_v,
                 is_causal=False,
             )
+            image_k = (
+                k[:, :, reg_end:]
+                if drop_reg_for_image
+                else k
+            )
+            image_v = (
+                v[:, :, reg_end:]
+                if drop_reg_for_image
+                else v
+            )
             image_attended = F.scaled_dot_product_attention(
                 q[:, :, reg_end:image_end],
-                k,
-                v,
+                image_k,
+                image_v,
                 is_causal=False,
             )
             if self.condition_tokens:
@@ -664,8 +685,17 @@ class DDTEncoderBlock(nn.Module):
             reg_lora=reg_lora,
         )
 
-    def forward(self, x: Tensor, reg_only: bool = False) -> Tensor:
-        x = x + self.attention(self.norm1(x), reg_only=reg_only)
+    def forward(
+        self,
+        x: Tensor,
+        reg_only: bool = False,
+        drop_reg_for_image: bool = False,
+    ) -> Tensor:
+        x = x + self.attention(
+            self.norm1(x),
+            reg_only=reg_only,
+            drop_reg_for_image=drop_reg_for_image,
+        )
         return x + self.feed_forward(self.norm2(x))
 
 
@@ -717,6 +747,7 @@ class DDTDecoderBlock(nn.Module):
         x: Tensor,
         conditioning: Tensor,
         reg_only: bool = False,
+        drop_reg_for_image: bool = False,
     ) -> Tensor:
         if x.shape != conditioning.shape:
             raise ValueError(
@@ -729,6 +760,7 @@ class DDTDecoderBlock(nn.Module):
         attended = self.attention(
             _modulate(self.norm1(x), shift_a, scale_a),
             reg_only=reg_only,
+            drop_reg_for_image=drop_reg_for_image,
         )
         x = x + _gate(attended, gate_a)
         fed_forward = self.feed_forward(
@@ -1273,6 +1305,7 @@ class DDT(nn.Module):
         noisy_reg: Tensor | None = None,
         reg_timestep: Tensor | None = None,
         return_repa: bool = False,
+        drop_reg_for_image: bool = False,
     ) -> DDTOutput:
         expected = (
             noisy_image.shape[0],
@@ -1290,6 +1323,14 @@ class DDT(nn.Module):
         if timestep.shape != (batch,) or labels.shape != (batch,):
             raise ValueError(
                 "timestep and labels must both have shape [B]"
+            )
+        reg_config = self.config.features.reg
+        if drop_reg_for_image and (
+            not reg_config.enabled
+            or not reg_config.independent_attention
+        ):
+            raise ValueError(
+                "REG dropout requires independent REG attention"
             )
 
         image_time_result = self.img_t_embedder(
@@ -1314,7 +1355,6 @@ class DDT(nn.Module):
         decoder_reg: Tensor | None = None
         reg_time_base: Tensor | None = None
         reg_time_tokens: Tensor | None = None
-        reg_config = self.config.features.reg
         if reg_config.enabled:
             expected_reg = (
                 batch,
@@ -1372,11 +1412,16 @@ class DDT(nn.Module):
                 sequence = checkpoint(
                     block,
                     sequence,
+                    False,
+                    drop_reg_for_image,
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
             else:
-                sequence = block(sequence)
+                sequence = block(
+                    sequence,
+                    drop_reg_for_image=drop_reg_for_image,
+                )
             if (
                 self.internal_reg_head is not None
                 and index == reg_config.internal_guidance_block
@@ -1441,11 +1486,17 @@ class DDT(nn.Module):
                     block,
                     decoded,
                     decoder_context,
+                    False,
+                    drop_reg_for_image,
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
             else:
-                decoded = block(decoded, decoder_context)
+                decoded = block(
+                    decoded,
+                    decoder_context,
+                    drop_reg_for_image=drop_reg_for_image,
+                )
         image_tokens, reg = self.final_layer(
             decoded,
             decoder_context,

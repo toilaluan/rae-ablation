@@ -275,6 +275,15 @@ def test_independent_attention_is_asymmetric_and_reg_only_matches() -> None:
     changed_reg[:, :4] = torch.randn_like(changed_reg[:, :4])
     changed_reg_output = attention(changed_reg)
     assert not torch.allclose(output[:, 4:8], changed_reg_output[:, 4:8])
+    dropped_output = attention(x, drop_reg_for_image=True)
+    changed_reg_dropped_output = attention(
+        changed_reg,
+        drop_reg_for_image=True,
+    )
+    assert torch.allclose(
+        dropped_output[:, 4:8],
+        changed_reg_dropped_output[:, 4:8],
+    )
 
     reg_condition = torch.cat((x[:, :4], x[:, 8:]), dim=1)
     reg_only_output = attention(reg_condition, reg_only=True)
@@ -385,10 +394,15 @@ def test_encoder_is_unconditioned_and_decoder_is_joint() -> None:
     model = DDT(config)
     assert list(
         inspect.signature(model.encoder_blocks[0].forward).parameters
-    ) == ["x", "reg_only"]
+    ) == ["x", "reg_only", "drop_reg_for_image"]
     assert list(
         inspect.signature(model.decoder_blocks[0].forward).parameters
-    ) == ["x", "conditioning", "reg_only"]
+    ) == [
+        "x",
+        "conditioning",
+        "reg_only",
+        "drop_reg_for_image",
+    ]
 
     encoder_inputs: list[torch.Tensor] = []
     decoder_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []

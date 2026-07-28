@@ -208,6 +208,7 @@ def test_current_checkpoint_config_uses_structured_defaults(
     reg = values["model"]["features"]["reg"]
     reg.pop("spatial_rope")
     reg.pop("independent_attention")
+    reg.pop("reg_dropout_prob")
     reg.pop("lora")
     values["model"].pop("fused_mlp")
     values["model"]["decoder"].pop("mlp_ratio")
@@ -216,6 +217,7 @@ def test_current_checkpoint_config_uses_structured_defaults(
     bundle = load_checkpoint_bundle(checkpoint)
     assert bundle.config.model.features.reg.spatial_rope
     assert not bundle.config.model.features.reg.independent_attention
+    assert bundle.config.model.features.reg.reg_dropout_prob == 0
     assert not bundle.config.model.features.reg.lora.enabled
     assert not bundle.config.model.fused_mlp
     assert bundle.config.model.decoder.mlp_ratio == pytest.approx(4.0)
