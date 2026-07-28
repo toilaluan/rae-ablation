@@ -14,17 +14,23 @@ from jit_reg.config import (
     FeaturesConfig,
     ModelConfig,
     REGConfig,
+    REGLoRAConfig,
     REPAConfig,
 )
 from jit_reg.model import ddt
 from jit_reg.model.ddt import (
     DDT,
+    Attention,
     ConditionEmbedder,
     DDTDecoderBlock,
     DDTEncoderBlock,
     DDTInternalREGHead,
     DDTOutput,
+    DDTREGOutput,
+    FusedSwiGLU,
     GaussianFourierEmbedding,
+    LowRankAdapter,
+    SwiGLU,
 )
 
 
@@ -136,6 +142,188 @@ def test_feature_disabled_model_is_baseline_ddt() -> None:
     assert output.reg is None and output.repa is None and output.reg_early is None
 
 
+def test_default_reg_model_keeps_legacy_modules_and_state_keys() -> None:
+    model = DDT(tiny_config(reg=True))
+    assert all(
+        isinstance(block.feed_forward, SwiGLU)
+        for block in (*model.encoder_blocks, *model.decoder_blocks)
+    )
+    assert all(
+        not block.attention.independent_reg_attention
+        for block in (*model.encoder_blocks, *model.decoder_blocks)
+    )
+    assert not any("lora" in key for key in model.state_dict())
+
+
+def test_fused_swiglu_matches_concatenated_unfused_weights() -> None:
+    unfused = SwiGLU(16, 2)
+    fused = FusedSwiGLU(16, 2)
+    with torch.no_grad():
+        fused.gate_value.weight.copy_(
+            torch.cat((unfused.gate.weight, unfused.value.weight))
+        )
+        fused.gate_value.bias.copy_(
+            torch.cat((unfused.gate.bias, unfused.value.bias))
+        )
+        fused.projection.load_state_dict(
+            unfused.projection.state_dict()
+        )
+    unfused_input = torch.randn(2, 7, 16, requires_grad=True)
+    fused_input = unfused_input.detach().clone().requires_grad_(True)
+    unfused_output = unfused(unfused_input)
+    fused_output = fused(fused_input)
+    assert torch.allclose(
+        unfused_output,
+        fused_output,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    unfused_output.sum().backward()
+    fused_output.sum().backward()
+    assert torch.allclose(
+        unfused_input.grad,
+        fused_input.grad,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_reg_lora_is_zero_initialized_and_follows_mlp_layout() -> None:
+    for fused in (False, True):
+        config = tiny_config(reg=True)
+        config.fused_mlp = fused
+        config.features.reg.lora = REGLoRAConfig(
+            enabled=True,
+            rank=4,
+            alpha=4,
+            mlp=True,
+        )
+        model = DDT(config)
+        adapters = [
+            module
+            for module in model.modules()
+            if isinstance(module, LowRankAdapter)
+        ]
+        assert adapters
+        assert all(
+            torch.count_nonzero(adapter.up.weight) == 0
+            for adapter in adapters
+        )
+        assert all(
+            block.attention.reg_qkv_lora is not None
+            for block in (*model.encoder_blocks, *model.decoder_blocks)
+        )
+        block = model.encoder_blocks[0]
+        states = torch.randn(
+            2,
+            block.attention.expected_tokens,
+            config.hidden_size,
+            requires_grad=True,
+        )
+        block(states).square().mean().backward()
+        assert block.attention.reg_qkv_lora is not None
+        assert block.attention.reg_qkv_lora.up.weight.grad is not None
+        if fused:
+            assert all(
+                isinstance(block.feed_forward, FusedSwiGLU)
+                and block.feed_forward.reg_gate_value_lora is not None
+                for block in (*model.encoder_blocks, *model.decoder_blocks)
+            )
+            assert isinstance(block.feed_forward, FusedSwiGLU)
+            assert (
+                block.feed_forward.reg_gate_value_lora is not None
+                and block.feed_forward.reg_gate_value_lora.up.weight.grad
+                is not None
+            )
+        else:
+            assert all(
+                isinstance(block.feed_forward, SwiGLU)
+                and block.feed_forward.reg_gate_lora is not None
+                and block.feed_forward.reg_value_lora is not None
+                for block in (*model.encoder_blocks, *model.decoder_blocks)
+            )
+            assert isinstance(block.feed_forward, SwiGLU)
+            assert (
+                block.feed_forward.reg_gate_lora is not None
+                and block.feed_forward.reg_gate_lora.up.weight.grad
+                is not None
+            )
+
+
+def test_independent_attention_is_asymmetric_and_reg_only_matches() -> None:
+    attention = Attention(
+        16,
+        4,
+        grid_size=2,
+        reg_pool_size=2,
+        condition_tokens=2,
+        independent_reg_attention=True,
+    )
+    x = torch.randn(2, 10, 16)
+    changed_image = x.clone()
+    changed_image[:, 4:8] = torch.randn_like(changed_image[:, 4:8])
+    output = attention(x)
+    changed_image_output = attention(changed_image)
+    assert torch.allclose(output[:, :4], changed_image_output[:, :4])
+    assert torch.allclose(output[:, 8:], changed_image_output[:, 8:])
+    assert not torch.allclose(
+        output[:, 4:8],
+        changed_image_output[:, 4:8],
+    )
+
+    changed_reg = x.clone()
+    changed_reg[:, :4] = torch.randn_like(changed_reg[:, :4])
+    changed_reg_output = attention(changed_reg)
+    assert not torch.allclose(output[:, 4:8], changed_reg_output[:, 4:8])
+
+    reg_condition = torch.cat((x[:, :4], x[:, 8:]), dim=1)
+    reg_only_output = attention(reg_condition, reg_only=True)
+    assert torch.allclose(reg_only_output[:, :4], output[:, :4])
+    assert torch.allclose(reg_only_output[:, 4:], output[:, 8:])
+
+
+def test_ddt_reg_only_forward_skips_image_projections() -> None:
+    config = tiny_config(
+        reg=True,
+        num_reg_t_tokens=1,
+    )
+    config.features.reg.independent_attention = True
+    model = DDT(config)
+    image, timestep, labels, noisy_reg = inputs(config)
+    assert noisy_reg is not None
+    full = model(
+        image,
+        timestep,
+        labels,
+        noisy_reg=noisy_reg,
+        reg_timestep=timestep,
+    )
+    calls: list[str] = []
+    handles = [
+        module.register_forward_hook(
+            lambda _module, _args, _output, name=name: calls.append(name)
+        )
+        for name, module in (
+            ("encoder", model.encoder_patch_projection),
+            ("decoder", model.decoder_patch_projection),
+            ("image_output", model.final_layer.image_projection),
+        )
+    ]
+    reg_only = model.forward_reg(
+        noisy_reg,
+        timestep,
+        labels,
+        reg_timestep=timestep,
+    )
+    for handle in handles:
+        handle.remove()
+    assert isinstance(reg_only, DDTREGOutput)
+    assert calls == []
+    assert full.reg is not None and full.reg_early is not None
+    assert torch.allclose(full.reg, reg_only.reg)
+    assert torch.allclose(full.reg_early, reg_only.reg_early)
+
+
 @pytest.mark.parametrize(
     ("reg", "scope", "expected_repa_tokens"),
     [
@@ -195,8 +383,12 @@ def test_encoder_is_unconditioned_and_decoder_is_joint() -> None:
         num_c_tokens=2,
     )
     model = DDT(config)
-    assert len(inspect.signature(model.encoder_blocks[0].forward).parameters) == 1
-    assert len(inspect.signature(model.decoder_blocks[0].forward).parameters) == 2
+    assert list(
+        inspect.signature(model.encoder_blocks[0].forward).parameters
+    ) == ["x", "reg_only"]
+    assert list(
+        inspect.signature(model.decoder_blocks[0].forward).parameters
+    ) == ["x", "conditioning", "reg_only"]
 
     encoder_inputs: list[torch.Tensor] = []
     decoder_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []

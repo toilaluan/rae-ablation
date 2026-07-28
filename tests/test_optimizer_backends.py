@@ -82,6 +82,15 @@ def test_fused_muon_is_not_imported_for_other_backends(
     build_optimizer(nn.Linear(4, 4), OptimizerConfig(kind="muon"))
 
 
+def test_lora_parameters_are_routed_away_from_muon() -> None:
+    parameter = nn.Parameter(torch.randn(4, 4))
+    assert _muon_eligible("blocks.0.attention.qkv.weight", parameter)
+    assert not _muon_eligible(
+        "blocks.0.attention.reg_qkv_lora.down.weight",
+        parameter,
+    )
+
+
 def test_fused_muon_hardware_and_installation_errors_are_actionable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

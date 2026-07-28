@@ -26,6 +26,14 @@ class EncoderConfig:
 
 
 @dataclass
+class REGLoRAConfig:
+    enabled: bool = False
+    rank: int = 16
+    alpha: float = 16.0
+    mlp: bool = False
+
+
+@dataclass
 class REGConfig:
     enabled: bool = False
     pool_size: int = 4
@@ -33,6 +41,8 @@ class REGConfig:
     spatial_rope: bool = True
     loss_weight: float = 0.03
     internal_guidance_block: int = 4
+    independent_attention: bool = False
+    lora: REGLoRAConfig = field(default_factory=REGLoRAConfig)
 
     @property
     def num_tokens(self) -> int:
@@ -80,6 +90,7 @@ class ModelConfig:
     depth: int = 12
     num_heads: int = 12
     mlp_ratio: float = 4.0
+    fused_mlp: bool = False
     num_classes: int = 1000
     class_dropout_prob: float = 0.1
     gradient_checkpointing: bool = False
@@ -378,6 +389,22 @@ class ExperimentConfig:
                     "model.features.reg.internal_guidance_block must be within "
                     "model.depth"
                 )
+            if reg.lora.enabled:
+                if (
+                    not isinstance(reg.lora.rank, int)
+                    or isinstance(reg.lora.rank, bool)
+                    or reg.lora.rank < 1
+                ):
+                    raise ValueError(
+                        "model.features.reg.lora.rank must be a positive integer"
+                    )
+                if (
+                    not math.isfinite(reg.lora.alpha)
+                    or reg.lora.alpha <= 0
+                ):
+                    raise ValueError(
+                        "model.features.reg.lora.alpha must be finite and positive"
+                    )
         if features.repa.enabled:
             repa = features.repa
             if not 1 <= repa.block <= m.depth:

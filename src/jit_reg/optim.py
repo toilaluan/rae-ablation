@@ -17,7 +17,11 @@ FUSED_MUON_COEFFICIENTS = [(3.4445, -4.7750, 2.0315)] * 5
 
 def _muon_eligible(name: str, parameter: nn.Parameter) -> bool:
     excluded = ("embedding", "norm", "bias", "projection", "input_projection")
-    return parameter.ndim == 2 and not any(part in name for part in excluded)
+    return (
+        parameter.ndim == 2
+        and "lora" not in name
+        and not any(part in name for part in excluded)
+    )
 
 
 class CompositeOptimizer:

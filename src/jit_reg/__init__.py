@@ -6,19 +6,22 @@ from .config import (
     FeaturesConfig,
     ModelConfig,
     REGConfig,
+    REGLoRAConfig,
     VAEConfig,
     load_config,
 )
-from .model import DDT, DDTOutput
+from .model import DDT, DDTOutput, DDTREGOutput
 
 __all__ = [
     "DDT",
     "DDTDecoderConfig",
     "DDTOutput",
+    "DDTREGOutput",
     "ExperimentConfig",
     "FeaturesConfig",
     "ModelConfig",
     "REGConfig",
+    "REGLoRAConfig",
     "VAEConfig",
     "load_config",
 ]

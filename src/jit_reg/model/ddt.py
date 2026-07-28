@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 import torch
@@ -7,7 +8,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-from ..config import ModelConfig
+from ..config import ModelConfig, REGLoRAConfig
 from .rope import apply_rope_cos_sin, precompute_ddt_rope_tables
 
 
@@ -16,6 +17,11 @@ class DDTOutput(NamedTuple):
     reg: Tensor | None = None
     repa: Tensor | None = None
     reg_early: Tensor | None = None
+
+
+class DDTREGOutput(NamedTuple):
+    reg: Tensor
+    reg_early: Tensor
 
 
 def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
@@ -27,6 +33,28 @@ def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
 
 def _gate(x: Tensor, gate: Tensor) -> Tensor:
     return x * (gate.unsqueeze(1) if gate.ndim == 2 else gate)
+
+
+class LowRankAdapter(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        rank: int,
+        alpha: float,
+    ) -> None:
+        super().__init__()
+        self.down = nn.Linear(input_size, rank, bias=False)
+        self.up = nn.Linear(rank, output_size, bias=False)
+        self.scale = alpha / rank
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.up(self.down(x)) * self.scale
 
 
 def classifier_free_labels(
@@ -170,6 +198,8 @@ class Attention(nn.Module):
         reg_pool_size: int | None = None,
         condition_tokens: int = 0,
         spatial_reg_rope: bool = False,
+        independent_reg_attention: bool = False,
+        reg_lora: REGLoRAConfig | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -179,6 +209,9 @@ class Attention(nn.Module):
         self.reg_pool_size = reg_pool_size
         self.condition_tokens = condition_tokens
         reg_tokens = reg_pool_size**2 if reg_pool_size is not None else 0
+        self.reg_tokens = reg_tokens
+        self.image_tokens = grid_size**2
+        self.independent_reg_attention = independent_reg_attention
         self.expected_tokens = (
             reg_tokens + grid_size**2 + condition_tokens
         )
@@ -220,20 +253,135 @@ class Attention(nn.Module):
             rope_sin_bf16,
             persistent=False,
         )
+        if independent_reg_attention:
+            def reg_rope(table: Tensor) -> Tensor:
+                if condition_tokens:
+                    return torch.cat(
+                        (
+                            table[:reg_tokens],
+                            table[-condition_tokens:],
+                        )
+                    )
+                return table[:reg_tokens]
+
+            self.register_buffer(
+                "reg_rope_cos_fp32",
+                reg_rope(rope_cos_fp32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "reg_rope_sin_fp32",
+                reg_rope(rope_sin_fp32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "reg_rope_cos_bf16",
+                reg_rope(rope_cos_bf16),
+                persistent=False,
+            )
+            self.register_buffer(
+                "reg_rope_sin_bf16",
+                reg_rope(rope_sin_bf16),
+                persistent=False,
+            )
+        else:
+            self.register_buffer(
+                "reg_rope_cos_fp32",
+                None,
+                persistent=False,
+            )
+            self.register_buffer(
+                "reg_rope_sin_fp32",
+                None,
+                persistent=False,
+            )
+            self.register_buffer(
+                "reg_rope_cos_bf16",
+                None,
+                persistent=False,
+            )
+            self.register_buffer(
+                "reg_rope_sin_bf16",
+                None,
+                persistent=False,
+            )
         self.qkv = nn.Linear(hidden_size, 3 * hidden_size)
+        self.reg_qkv_lora = (
+            LowRankAdapter(
+                hidden_size,
+                3 * hidden_size,
+                reg_lora.rank,
+                reg_lora.alpha,
+            )
+            if reg_tokens and reg_lora is not None and reg_lora.enabled
+            else None
+        )
         self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
         self.projection = nn.Linear(hidden_size, hidden_size)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def _rope_tables(
+        self,
+        q: Tensor,
+        *,
+        reg_only: bool,
+    ) -> tuple[Tensor, Tensor]:
+        if q.dtype == torch.bfloat16:
+            rope_cos, rope_sin = (
+                (
+                    self.reg_rope_cos_bf16
+                    if reg_only
+                    else self.rope_cos_bf16
+                ),
+                (
+                    self.reg_rope_sin_bf16
+                    if reg_only
+                    else self.rope_sin_bf16
+                ),
+            )
+        else:
+            rope_cos, rope_sin = (
+                (
+                    self.reg_rope_cos_fp32
+                    if reg_only
+                    else self.rope_cos_fp32
+                ),
+                (
+                    self.reg_rope_sin_fp32
+                    if reg_only
+                    else self.rope_sin_fp32
+                ),
+            )
+            assert rope_cos is not None and rope_sin is not None
+            if q.dtype != torch.float32:
+                rope_cos = rope_cos.to(q.dtype)
+                rope_sin = rope_sin.to(q.dtype)
+        assert rope_cos is not None and rope_sin is not None
+        return rope_cos, rope_sin
+
+    def forward(self, x: Tensor, reg_only: bool = False) -> Tensor:
         batch, tokens, _hidden = x.shape
-        if tokens != self.expected_tokens:
+        expected_tokens = (
+            self.reg_tokens + self.condition_tokens
+            if reg_only
+            else self.expected_tokens
+        )
+        if reg_only and not self.independent_reg_attention:
+            raise ValueError(
+                "REG-only attention requires independent REG attention"
+            )
+        if tokens != expected_tokens:
             raise ValueError(
                 "attention token layout does not match its precomputed "
                 "DDT RoPE table"
             )
+        qkv_values = self.qkv(x)
+        if self.reg_qkv_lora is not None:
+            qkv_values[:, : self.reg_tokens].add_(
+                self.reg_qkv_lora(x[:, : self.reg_tokens])
+            )
         qkv = (
-            self.qkv(x)
+            qkv_values
             .reshape(
                 batch,
                 tokens,
@@ -245,31 +393,66 @@ class Attention(nn.Module):
         )
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
-        if q.dtype == torch.bfloat16:
-            rope_cos, rope_sin = (
-                self.rope_cos_bf16,
-                self.rope_sin_bf16,
-            )
-        else:
-            rope_cos, rope_sin = (
-                self.rope_cos_fp32,
-                self.rope_sin_fp32,
-            )
-            if q.dtype != torch.float32:
-                rope_cos = rope_cos.to(q.dtype)
-                rope_sin = rope_sin.to(q.dtype)
+        rope_cos, rope_sin = self._rope_tables(q, reg_only=reg_only)
         q, k = apply_rope_cos_sin(
             q,
             k,
             rope_cos,
             rope_sin,
         )
-        attended = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            is_causal=False,
-        )
+        if reg_only or not self.independent_reg_attention:
+            attended = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=False,
+            )
+        else:
+            reg_end = self.reg_tokens
+            image_end = reg_end + self.image_tokens
+            if self.condition_tokens:
+                reg_condition_q = torch.cat(
+                    (q[:, :, :reg_end], q[:, :, image_end:]),
+                    dim=2,
+                )
+                reg_condition_k = torch.cat(
+                    (k[:, :, :reg_end], k[:, :, image_end:]),
+                    dim=2,
+                )
+                reg_condition_v = torch.cat(
+                    (v[:, :, :reg_end], v[:, :, image_end:]),
+                    dim=2,
+                )
+            else:
+                reg_condition_q = q[:, :, :reg_end]
+                reg_condition_k = k[:, :, :reg_end]
+                reg_condition_v = v[:, :, :reg_end]
+            reg_condition_attended = F.scaled_dot_product_attention(
+                reg_condition_q,
+                reg_condition_k,
+                reg_condition_v,
+                is_causal=False,
+            )
+            image_attended = F.scaled_dot_product_attention(
+                q[:, :, reg_end:image_end],
+                k,
+                v,
+                is_causal=False,
+            )
+            if self.condition_tokens:
+                attended = torch.cat(
+                    (
+                        reg_condition_attended[:, :, :reg_end],
+                        image_attended,
+                        reg_condition_attended[:, :, reg_end:],
+                    ),
+                    dim=2,
+                )
+            else:
+                attended = torch.cat(
+                    (reg_condition_attended, image_attended),
+                    dim=2,
+                )
         attended = attended.transpose(1, 2).reshape(
             batch,
             tokens,
@@ -279,20 +462,165 @@ class Attention(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, hidden_size: int, mlp_ratio: float) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        mlp_ratio: float,
+        *,
+        reg_tokens: int = 0,
+        reg_lora: REGLoRAConfig | None = None,
+    ) -> None:
         super().__init__()
         intermediate = max(
             1,
             int(2 * hidden_size * mlp_ratio / 3),
         )
+        self.reg_tokens = reg_tokens
         self.gate = nn.Linear(hidden_size, intermediate)
         self.value = nn.Linear(hidden_size, intermediate)
         self.projection = nn.Linear(intermediate, hidden_size)
+        lora_enabled = (
+            reg_tokens
+            and reg_lora is not None
+            and reg_lora.enabled
+            and reg_lora.mlp
+        )
+        self.reg_gate_lora = (
+            LowRankAdapter(
+                hidden_size,
+                intermediate,
+                reg_lora.rank,
+                reg_lora.alpha,
+            )
+            if lora_enabled and reg_lora is not None
+            else None
+        )
+        self.reg_value_lora = (
+            LowRankAdapter(
+                hidden_size,
+                intermediate,
+                reg_lora.rank,
+                reg_lora.alpha,
+            )
+            if lora_enabled and reg_lora is not None
+            else None
+        )
+        self.reg_projection_lora = (
+            LowRankAdapter(
+                intermediate,
+                hidden_size,
+                reg_lora.rank,
+                reg_lora.alpha,
+            )
+            if lora_enabled and reg_lora is not None
+            else None
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.projection(
-            F.silu(self.gate(x)) * self.value(x)
+        gate = self.gate(x)
+        value = self.value(x)
+        if self.reg_gate_lora is not None:
+            reg_x = x[:, : self.reg_tokens]
+            gate[:, : self.reg_tokens].add_(
+                self.reg_gate_lora(reg_x)
+            )
+            assert self.reg_value_lora is not None
+            value[:, : self.reg_tokens].add_(
+                self.reg_value_lora(reg_x)
+            )
+        hidden = F.silu(gate) * value
+        projected = self.projection(hidden)
+        if self.reg_projection_lora is not None:
+            projected[:, : self.reg_tokens].add_(
+                self.reg_projection_lora(
+                    hidden[:, : self.reg_tokens]
+                )
+            )
+        return projected
+
+
+class FusedSwiGLU(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        mlp_ratio: float,
+        *,
+        reg_tokens: int = 0,
+        reg_lora: REGLoRAConfig | None = None,
+    ) -> None:
+        super().__init__()
+        intermediate = max(
+            1,
+            int(2 * hidden_size * mlp_ratio / 3),
         )
+        self.reg_tokens = reg_tokens
+        self.gate_value = nn.Linear(
+            hidden_size,
+            2 * intermediate,
+        )
+        self.projection = nn.Linear(intermediate, hidden_size)
+        lora_enabled = (
+            reg_tokens
+            and reg_lora is not None
+            and reg_lora.enabled
+            and reg_lora.mlp
+        )
+        self.reg_gate_value_lora = (
+            LowRankAdapter(
+                hidden_size,
+                2 * intermediate,
+                reg_lora.rank,
+                reg_lora.alpha,
+            )
+            if lora_enabled and reg_lora is not None
+            else None
+        )
+        self.reg_projection_lora = (
+            LowRankAdapter(
+                intermediate,
+                hidden_size,
+                reg_lora.rank,
+                reg_lora.alpha,
+            )
+            if lora_enabled and reg_lora is not None
+            else None
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        gate_value = self.gate_value(x)
+        if self.reg_gate_value_lora is not None:
+            gate_value[:, : self.reg_tokens].add_(
+                self.reg_gate_value_lora(
+                    x[:, : self.reg_tokens]
+                )
+            )
+        gate, value = gate_value.chunk(2, dim=-1)
+        hidden = F.silu(gate) * value
+        projected = self.projection(hidden)
+        if self.reg_projection_lora is not None:
+            projected[:, : self.reg_tokens].add_(
+                self.reg_projection_lora(
+                    hidden[:, : self.reg_tokens]
+                )
+            )
+        return projected
+
+
+def _build_swiglu(
+    hidden_size: int,
+    mlp_ratio: float,
+    *,
+    fused: bool,
+    reg_tokens: int,
+    reg_lora: REGLoRAConfig | None,
+) -> SwiGLU | FusedSwiGLU:
+    implementation = FusedSwiGLU if fused else SwiGLU
+    return implementation(
+        hidden_size,
+        mlp_ratio,
+        reg_tokens=reg_tokens,
+        reg_lora=reg_lora,
+    )
 
 
 class DDTEncoderBlock(nn.Module):
@@ -308,8 +636,14 @@ class DDTEncoderBlock(nn.Module):
         reg_pool_size: int | None,
         condition_tokens: int,
         spatial_reg_rope: bool,
+        independent_reg_attention: bool,
+        reg_lora: REGLoRAConfig | None,
+        fused_mlp: bool,
     ) -> None:
         super().__init__()
+        reg_tokens = (
+            reg_pool_size**2 if reg_pool_size is not None else 0
+        )
         self.norm1 = nn.RMSNorm(hidden_size, eps=1e-6)
         self.attention = Attention(
             hidden_size,
@@ -318,12 +652,20 @@ class DDTEncoderBlock(nn.Module):
             reg_pool_size=reg_pool_size,
             condition_tokens=condition_tokens,
             spatial_reg_rope=spatial_reg_rope,
+            independent_reg_attention=independent_reg_attention,
+            reg_lora=reg_lora,
         )
         self.norm2 = nn.RMSNorm(hidden_size, eps=1e-6)
-        self.feed_forward = SwiGLU(hidden_size, mlp_ratio)
+        self.feed_forward = _build_swiglu(
+            hidden_size,
+            mlp_ratio,
+            fused=fused_mlp,
+            reg_tokens=reg_tokens,
+            reg_lora=reg_lora,
+        )
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = x + self.attention(self.norm1(x))
+    def forward(self, x: Tensor, reg_only: bool = False) -> Tensor:
+        x = x + self.attention(self.norm1(x), reg_only=reg_only)
         return x + self.feed_forward(self.norm2(x))
 
 
@@ -339,8 +681,14 @@ class DDTDecoderBlock(nn.Module):
         grid_size: int,
         reg_pool_size: int | None,
         spatial_reg_rope: bool,
+        independent_reg_attention: bool,
+        reg_lora: REGLoRAConfig | None,
+        fused_mlp: bool,
     ) -> None:
         super().__init__()
+        reg_tokens = (
+            reg_pool_size**2 if reg_pool_size is not None else 0
+        )
         self.norm1 = nn.RMSNorm(hidden_size, eps=1e-6)
         self.attention = Attention(
             hidden_size,
@@ -348,15 +696,28 @@ class DDTDecoderBlock(nn.Module):
             grid_size=grid_size,
             reg_pool_size=reg_pool_size,
             spatial_reg_rope=spatial_reg_rope,
+            independent_reg_attention=independent_reg_attention,
+            reg_lora=reg_lora,
         )
         self.norm2 = nn.RMSNorm(hidden_size, eps=1e-6)
-        self.feed_forward = SwiGLU(hidden_size, mlp_ratio)
+        self.feed_forward = _build_swiglu(
+            hidden_size,
+            mlp_ratio,
+            fused=fused_mlp,
+            reg_tokens=reg_tokens,
+            reg_lora=reg_lora,
+        )
         self.modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size),
         )
 
-    def forward(self, x: Tensor, conditioning: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        conditioning: Tensor,
+        reg_only: bool = False,
+    ) -> Tensor:
         if x.shape != conditioning.shape:
             raise ValueError(
                 "DDT decoder states and token-aligned conditioning must "
@@ -366,7 +727,8 @@ class DDTDecoderBlock(nn.Module):
             self.modulation(conditioning).chunk(6, dim=-1)
         )
         attended = self.attention(
-            _modulate(self.norm1(x), shift_a, scale_a)
+            _modulate(self.norm1(x), shift_a, scale_a),
+            reg_only=reg_only,
         )
         x = x + _gate(attended, gate_a)
         fed_forward = self.feed_forward(
@@ -425,6 +787,23 @@ class DDTFinalLayer(nn.Module):
         else:
             reg = None
         return image, reg
+
+    def forward_reg(
+        self,
+        x: Tensor,
+        conditioning: Tensor,
+    ) -> Tensor:
+        if self.reg_projection is None:
+            raise ValueError(
+                "DDT final REG projection is not configured"
+            )
+        if x.shape != conditioning.shape:
+            raise ValueError(
+                "DDT final REG states and conditioning must have equal shapes"
+            )
+        shift, scale = self.modulation(conditioning).chunk(2, dim=-1)
+        decoded = _modulate(self.norm(x), shift, scale)
+        return self.reg_projection(decoded)
 
 
 class DDTInternalREGHead(nn.Module):
@@ -542,6 +921,19 @@ class DDT(nn.Module):
             raise ValueError(
                 "REG internal-guidance block must be within encoder depth"
             )
+        if reg.enabled and reg.lora.enabled:
+            if (
+                not isinstance(reg.lora.rank, int)
+                or isinstance(reg.lora.rank, bool)
+                or reg.lora.rank < 1
+            ):
+                raise ValueError(
+                    "REG LoRA rank must be a positive integer"
+                )
+            if not math.isfinite(reg.lora.alpha) or reg.lora.alpha <= 0:
+                raise ValueError(
+                    "REG LoRA alpha must be finite and positive"
+                )
         if repa.enabled and not 1 <= repa.block <= config.depth:
             raise ValueError(
                 "REPA block must be within encoder depth"
@@ -589,6 +981,7 @@ class DDT(nn.Module):
         )
         reg_pool_size = reg.pool_size if reg.enabled else None
         spatial_reg_rope = reg.enabled and reg.spatial_rope
+        reg_lora = reg.lora if reg.enabled else None
         self.encoder_blocks = nn.ModuleList(
             [
                 DDTEncoderBlock(
@@ -599,6 +992,11 @@ class DDT(nn.Module):
                     reg_pool_size=reg_pool_size,
                     condition_tokens=self.num_condition_tokens,
                     spatial_reg_rope=spatial_reg_rope,
+                    independent_reg_attention=(
+                        reg.enabled and reg.independent_attention
+                    ),
+                    reg_lora=reg_lora,
+                    fused_mlp=config.fused_mlp,
                 )
                 for _ in range(config.depth)
             ]
@@ -620,6 +1018,11 @@ class DDT(nn.Module):
                     grid_size=self.grid_size,
                     reg_pool_size=reg_pool_size,
                     spatial_reg_rope=spatial_reg_rope,
+                    independent_reg_attention=(
+                        reg.enabled and reg.independent_attention
+                    ),
+                    reg_lora=reg_lora,
+                    fused_mlp=config.fused_mlp,
                 )
                 for _ in range(decoder.depth)
             ]
@@ -701,6 +1104,9 @@ class DDT(nn.Module):
                     nn.init.zeros_(module.bias)
 
         self.apply(initialize)
+        for module in self.modules():
+            if isinstance(module, LowRankAdapter):
+                module.reset_parameters()
         for projection in (
             self.encoder_patch_projection,
             self.decoder_patch_projection,
@@ -768,6 +1174,96 @@ class DDT(nn.Module):
             self.config.input_size,
             self.config.input_size,
         )
+
+    def forward_reg(
+        self,
+        noisy_reg: Tensor,
+        image_timestep: Tensor,
+        labels: Tensor,
+        *,
+        reg_timestep: Tensor,
+    ) -> DDTREGOutput:
+        reg_config = self.config.features.reg
+        if not reg_config.enabled or not reg_config.independent_attention:
+            raise ValueError(
+                "REG-only forward requires independent REG attention"
+            )
+        batch = noisy_reg.shape[0]
+        expected_reg = (
+            batch,
+            self.num_reg_tokens,
+            self.config.features.encoder.feature_dim,
+        )
+        if noisy_reg.ndim != 3 or tuple(noisy_reg.shape) != expected_reg:
+            raise ValueError(
+                "REG-only forward requires noisy_reg with shape "
+                f"[B, {self.num_reg_tokens}, "
+                f"{self.config.features.encoder.feature_dim}]"
+            )
+        for name, value in (
+            ("image_timestep", image_timestep),
+            ("reg_timestep", reg_timestep),
+            ("labels", labels),
+        ):
+            if value.shape != (batch,):
+                raise ValueError(f"{name} must have shape [B]")
+        assert (
+            self.reg_t_embedder is not None
+            and self.encoder_reg_projection is not None
+            and self.decoder_reg_projection is not None
+            and self.internal_reg_head is not None
+        )
+        reg_time_result = self.reg_t_embedder(
+            reg_timestep,
+            return_base_embed=True,
+        )
+        assert isinstance(reg_time_result, tuple)
+        reg_time_base, reg_time_tokens = reg_time_result
+        image_time_tokens = self.img_t_embedder(image_timestep)
+        assert isinstance(image_time_tokens, Tensor)
+        class_tokens = self.condition_embedder(labels)
+        sequence = torch.cat(
+            (
+                self.encoder_reg_projection(noisy_reg),
+                reg_time_tokens,
+                image_time_tokens,
+                class_tokens,
+            ),
+            dim=1,
+        )
+
+        early_reg_state: Tensor | None = None
+        for index, block in enumerate(self.encoder_blocks, start=1):
+            sequence = block(sequence, reg_only=True)
+            if index == reg_config.internal_guidance_block:
+                early_reg_state = sequence[:, : self.num_reg_tokens]
+        if early_reg_state is None:
+            raise RuntimeError(
+                "REG-only forward did not capture its guidance state"
+            )
+        encoded_reg = sequence[:, : self.num_reg_tokens]
+        early_reg_context = F.silu(
+            early_reg_state + reg_time_base
+        )
+        reg_early = self.internal_reg_head(
+            early_reg_context,
+            early_reg_context,
+        )
+        decoder_context = self.context_projection(
+            F.silu(encoded_reg + reg_time_base)
+        )
+        decoded = self.decoder_reg_projection(noisy_reg)
+        for block in self.decoder_blocks:
+            decoded = block(
+                decoded,
+                decoder_context,
+                reg_only=True,
+            )
+        reg = self.final_layer.forward_reg(
+            decoded,
+            decoder_context,
+        )
+        return DDTREGOutput(reg=reg, reg_early=reg_early)
 
     def forward(
         self,

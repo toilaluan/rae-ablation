@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from jit_reg.model.ddt import DDTOutput
+from jit_reg.model.ddt import DDTOutput, DDTREGOutput
 from jit_reg.objective import (
     denoising_step_bounds,
     jit_losses,
@@ -190,6 +190,39 @@ class RecordingCleanModel(nn.Module):
         )
 
 
+class RecordingIndependentModel(RecordingCleanModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(
+            num_classes=3,
+            features=SimpleNamespace(
+                reg=SimpleNamespace(independent_attention=True)
+            ),
+        )
+        self.reg_only_calls: list[
+            tuple[torch.Tensor, torch.Tensor, int]
+        ] = []
+
+    def forward_reg(
+        self,
+        noisy_reg: torch.Tensor,
+        image_timestep: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        reg_timestep: torch.Tensor,
+    ) -> DDTREGOutput:
+        del labels
+        self.reg_only_calls.append(
+            (
+                image_timestep.detach().cpu(),
+                reg_timestep.detach().cpu(),
+                noisy_reg.shape[0],
+            )
+        )
+        prediction = torch.full_like(noisy_reg, -0.5)
+        return DDTREGOutput(prediction, prediction)
+
+
 @pytest.mark.parametrize("solver", ["euler", "heun"])
 def test_sampler_jointly_integrates_dual_schedules_and_x0(solver: str) -> None:
     model = RecordingCleanModel()
@@ -251,6 +284,73 @@ def test_sampler_runs_asynchronous_reg_lead_and_image_follow() -> None:
     assert all(call[1] is not None and call[1][0] == 1 for call in model.calls[7:])
     assert torch.allclose(output.image, torch.full_like(output.image, 0.25))
     assert torch.allclose(output.reg, torch.full_like(output.reg, -0.5))
+
+
+@pytest.mark.parametrize(
+    ("solver", "expected_reg_only_calls"),
+    [("euler", 3), ("heun", 6)],
+)
+def test_independent_sampler_uses_reg_only_forward_while_image_is_frozen(
+    solver: str,
+    expected_reg_only_calls: int,
+) -> None:
+    model = RecordingIndependentModel()
+    image_noise = torch.randn(1, 1, 2, 2)
+    reg_noise = torch.randn(1, 1, 3)
+    labels = torch.tensor([1])
+    output = ode_sample(
+        model,
+        image_noise,
+        labels,
+        reg_noise=reg_noise,
+        steps=10,
+        solver=solver,
+        guidance_scale=1,
+        img_denoising_interval=(0.3, 1.0),
+        reg_denoising_interval=(0.0, 0.7),
+        cfg_interval=(0, 1),
+    )
+    fallback = RecordingIndependentModel()
+    fallback.config.features.reg.independent_attention = False
+    fallback_output = ode_sample(
+        fallback,
+        image_noise,
+        labels,
+        reg_noise=reg_noise,
+        steps=10,
+        solver=solver,
+        guidance_scale=1,
+        img_denoising_interval=(0.3, 1.0),
+        reg_denoising_interval=(0.0, 0.7),
+        cfg_interval=(0, 1),
+    )
+    assert isinstance(output, ODESample)
+    assert isinstance(fallback_output, ODESample)
+    assert len(model.reg_only_calls) == expected_reg_only_calls
+    assert all(call[2] == 1 for call in model.reg_only_calls)
+    assert all(call[0][0] == 0 for call in model.reg_only_calls)
+    assert model.calls
+    assert torch.allclose(output.image, fallback_output.image)
+    assert torch.allclose(output.reg, fallback_output.reg)
+
+
+def test_independent_sampler_skips_steps_when_both_states_are_frozen() -> None:
+    model = RecordingIndependentModel()
+    output = ode_sample(
+        model,
+        torch.randn(1, 1, 2, 2),
+        torch.tensor([1]),
+        reg_noise=torch.randn(1, 1, 3),
+        steps=10,
+        solver="euler",
+        guidance_scale=1,
+        img_denoising_interval=(0.6, 1.0),
+        reg_denoising_interval=(0.0, 0.2),
+        cfg_interval=(1, 1),
+    )
+    assert isinstance(output, ODESample)
+    assert len(model.reg_only_calls) == 2
+    assert len(model.calls) == 4
 
 
 def test_noisy_interpolation_uses_its_own_timestep() -> None:

@@ -46,6 +46,12 @@ def test_required_presets_load() -> None:
     assert paper.model.features.reg.num_tokens == 16
     assert paper.model.features.reg.target_std == pytest.approx(0.53)
     assert paper.model.features.reg.internal_guidance_block == 4
+    assert not paper.model.fused_mlp
+    assert not paper.model.features.reg.independent_attention
+    assert not paper.model.features.reg.lora.enabled
+    assert paper.model.features.reg.lora.rank == 16
+    assert paper.model.features.reg.lora.alpha == pytest.approx(16)
+    assert not paper.model.features.reg.lora.mlp
     assert paper.sampling.reg_guidance_scale == pytest.approx(1.78)
     assert paper.model.features.repa.token_scope == "image_and_reg"
     assert latent.model.input_space == "flux2_latents"
@@ -167,6 +173,28 @@ def test_reg_configuration_exposes_internal_guidance_block() -> None:
     config.validate()
     assert not hasattr(config.model.features.reg, "head")
     assert config.model.features.reg.internal_guidance_block == 4
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("rank", 0, "rank"),
+        ("rank", True, "rank"),
+        ("alpha", 0.0, "alpha"),
+        ("alpha", float("inf"), "alpha"),
+    ],
+)
+def test_active_reg_lora_validates_rank_and_alpha(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    config = ExperimentConfig()
+    config.model.features.reg.enabled = True
+    config.model.features.reg.lora.enabled = True
+    setattr(config.model.features.reg.lora, field, value)
+    with pytest.raises(ValueError, match=message):
+        config.validate()
 
 
 @pytest.mark.parametrize(

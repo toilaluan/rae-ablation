@@ -207,11 +207,17 @@ def test_current_checkpoint_config_uses_structured_defaults(
     values = json.loads(config_path.read_text())
     reg = values["model"]["features"]["reg"]
     reg.pop("spatial_rope")
+    reg.pop("independent_attention")
+    reg.pop("lora")
+    values["model"].pop("fused_mlp")
     values["model"]["decoder"].pop("mlp_ratio")
     values["train"]["micro_batch_size"] = 1
     config_path.write_text(json.dumps(values))
     bundle = load_checkpoint_bundle(checkpoint)
     assert bundle.config.model.features.reg.spatial_rope
+    assert not bundle.config.model.features.reg.independent_attention
+    assert not bundle.config.model.features.reg.lora.enabled
+    assert not bundle.config.model.fused_mlp
     assert bundle.config.model.decoder.mlp_ratio == pytest.approx(4.0)
     assert not hasattr(bundle.config.train, "micro_batch_size")
 

@@ -33,6 +33,7 @@ model:
   depth: 12
   num_heads: 12
   mlp_ratio: 4.0
+  fused_mlp: false
   num_classes: 1000
   class_dropout_prob: 0.1
   gradient_checkpointing: false
@@ -53,6 +54,12 @@ model:
       target_std: 0.53
       loss_weight: 0.03
       internal_guidance_block: 4
+      independent_attention: false
+      lora:
+        enabled: false
+        rank: 16
+        alpha: 16.0
+        mlp: false
     repa:
       enabled: false
       block: 4

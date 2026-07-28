@@ -7,7 +7,11 @@ from typing import Literal, NamedTuple, overload
 import torch
 from torch import Tensor, nn
 
-from .objective import local_denoising_schedule, shift_timestep
+from .objective import (
+    denoising_step_bounds,
+    local_denoising_schedule,
+    shift_timestep,
+)
 
 Solver = Literal["euler", "heun"]
 
@@ -132,6 +136,29 @@ def ode_sample(
         ),
         reg_timestep_shift,
     )
+    image_start_step, image_end_step = denoising_step_bounds(
+        img_denoising_interval,
+        steps,
+    )
+    reg_start_step, reg_end_step = denoising_step_bounds(
+        reg_denoising_interval,
+        steps,
+    )
+    model_config = getattr(model, "config", None)
+    model_features = getattr(model_config, "features", None)
+    model_reg_config = getattr(model_features, "reg", None)
+    reg_only_forward = getattr(model, "forward_reg", None)
+    use_reg_only_forward = (
+        reg_noise is not None
+        and callable(reg_only_forward)
+        and bool(
+            getattr(
+                model_reg_config,
+                "independent_attention",
+                False,
+            )
+        )
+    )
 
     def predict_clean(
         image_state: Tensor,
@@ -200,11 +227,76 @@ def ode_sample(
             )
         return image_prediction, reg_prediction
 
+    def predict_reg_only(
+        current_reg_state: Tensor,
+        image_timestep_value: Tensor,
+        reg_timestep_value: Tensor,
+    ) -> Tensor:
+        if not use_reg_only_forward or not callable(reg_only_forward):
+            raise RuntimeError(
+                "REG-only prediction requires an independent-attention model"
+            )
+        assert reg_noise is not None
+        output = reg_only_forward(
+            current_reg_state.to(reg_noise.dtype),
+            image_timestep_value.expand(noise.shape[0]),
+            labels,
+            reg_timestep=reg_timestep_value.expand(
+                noise.shape[0]
+            ),
+        )
+        return _guided(
+            output.reg.float(),
+            output.reg_early.float(),
+            reg_guidance_scale,
+        )
+
     image_pairs = pairwise(image_schedule)
     reg_pairs = pairwise(reg_schedule)
     for step_index, ((current, following), (reg_current, reg_following)) in enumerate(
         zip(image_pairs, reg_pairs, strict=True)
     ):
+        image_active = (
+            image_start_step <= step_index < image_end_step
+        )
+        reg_active = (
+            reg_state is not None
+            and reg_start_step <= step_index < reg_end_step
+        )
+        if use_reg_only_forward and not image_active:
+            if reg_active:
+                assert reg_state is not None
+                reg_prediction = predict_reg_only(
+                    reg_state,
+                    current,
+                    reg_current,
+                )
+                reg_denominator = (1 - reg_current).clamp_min(0.05)
+                reg_step_size = reg_following - reg_current
+                reg_velocity = (
+                    reg_prediction - reg_state
+                ) / reg_denominator
+                predicted_reg = (
+                    reg_state + reg_step_size * reg_velocity
+                )
+                if solver == "heun" and step_index < steps - 1:
+                    corrected_reg = predict_reg_only(
+                        predicted_reg,
+                        following,
+                        reg_following,
+                    )
+                    corrected_denominator = (
+                        1 - reg_following
+                    ).clamp_min(0.05)
+                    corrected_velocity = (
+                        corrected_reg - predicted_reg
+                    ) / corrected_denominator
+                    reg_state = reg_state + 0.5 * reg_step_size * (
+                        reg_velocity + corrected_velocity
+                    )
+                else:
+                    reg_state = predicted_reg
+            continue
         image_prediction, reg_prediction = predict_clean(
             x, reg_state, current, reg_current
         )
