@@ -26,7 +26,12 @@ from jit_reg.sampling import ODESample, ode_sample
 
 
 def test_optional_component_target_extraction() -> None:
-    spatial = torch.randn(2, 16, 8)
+    spatial = torch.randn(
+        2,
+        16,
+        8,
+        generator=torch.Generator().manual_seed(0),
+    )
     baseline = prepare_feature_targets(
         spatial, 2, include_reg=False, include_repa=False
     )
@@ -196,17 +201,16 @@ class RecordingIndependentModel(RecordingCleanModel):
         self.config = SimpleNamespace(
             num_classes=3,
             features=SimpleNamespace(
-                reg=SimpleNamespace(independent_attention=True)
+                reg=SimpleNamespace(attention_mode="asymmetric")
             ),
         )
         self.reg_only_calls: list[
-            tuple[torch.Tensor, torch.Tensor, int]
+            tuple[torch.Tensor, int]
         ] = []
 
     def forward_reg(
         self,
         noisy_reg: torch.Tensor,
-        image_timestep: torch.Tensor,
         labels: torch.Tensor,
         *,
         reg_timestep: torch.Tensor,
@@ -214,7 +218,6 @@ class RecordingIndependentModel(RecordingCleanModel):
         del labels
         self.reg_only_calls.append(
             (
-                image_timestep.detach().cpu(),
                 reg_timestep.detach().cpu(),
                 noisy_reg.shape[0],
             )
@@ -311,7 +314,7 @@ def test_independent_sampler_uses_reg_only_forward_while_image_is_frozen(
         cfg_interval=(0, 1),
     )
     fallback = RecordingIndependentModel()
-    fallback.config.features.reg.independent_attention = False
+    fallback.config.features.reg.attention_mode = "joint"
     fallback_output = ode_sample(
         fallback,
         image_noise,
@@ -327,8 +330,7 @@ def test_independent_sampler_uses_reg_only_forward_while_image_is_frozen(
     assert isinstance(output, ODESample)
     assert isinstance(fallback_output, ODESample)
     assert len(model.reg_only_calls) == expected_reg_only_calls
-    assert all(call[2] == 1 for call in model.reg_only_calls)
-    assert all(call[0][0] == 0 for call in model.reg_only_calls)
+    assert all(call[1] == 1 for call in model.reg_only_calls)
     assert model.calls
     assert torch.allclose(output.image, fallback_output.image)
     assert torch.allclose(output.reg, fallback_output.reg)

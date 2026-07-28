@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import nn
 
-from jit_reg.model.ddt import Attention
+from jit_reg.model.layers import DDTAttention
 from jit_reg.model.rope import (
     apply_2d_rope,
     apply_2d_rope_positions,
@@ -13,6 +13,7 @@ from jit_reg.model.rope import (
     precompute_ddt_rope_tables,
     precompute_rope_tables,
 )
+from jit_reg.model.tokens import DDTTokenLayout
 from jit_reg.optim import _muon_eligible
 
 
@@ -30,11 +31,12 @@ def test_spatial_rope_uses_image_aligned_cell_centers() -> None:
 def test_attention_rotates_entire_spatial_reg_prefix_and_image_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    attention = Attention(
+    attention = DDTAttention(
         8,
         1,
         grid_size=2,
         reg_pool_size=2,
+        layout=DDTTokenLayout(4, 4),
         spatial_reg_rope=True,
     )
     with torch.no_grad():
@@ -178,11 +180,12 @@ def test_ddt_rope_orders_reg_image_then_identity_conditions() -> None:
 def test_attention_rope_tables_are_nonpersistent_and_forward_is_static(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    attention = Attention(
+    attention = DDTAttention(
         8,
         1,
         grid_size=2,
         reg_pool_size=2,
+        layout=DDTTokenLayout(4, 4),
         spatial_reg_rope=False,
     )
     assert {

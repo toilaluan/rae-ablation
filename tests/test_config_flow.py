@@ -16,7 +16,7 @@ def test_required_presets_load() -> None:
     baseline = load_config(ROOT / "configs/baseline-p16.yaml")
     paper = load_config(ROOT / "configs/reg-repa-p16.yaml")
     latent = load_config(ROOT / "configs/latent-baseline-p16.yaml")
-    assert baseline.schema_version == paper.schema_version == latent.schema_version == 8
+    assert baseline.schema_version == paper.schema_version == latent.schema_version == 9
     assert (
         baseline.train.optimizer.kind
         == paper.train.optimizer.kind
@@ -24,17 +24,19 @@ def test_required_presets_load() -> None:
     )
     assert baseline.model.patch_size == paper.model.patch_size == 16
     assert (
-        baseline.model.num_img_t_tokens
-        == paper.model.num_img_t_tokens
+        baseline.model.num_image_timestep_tokens
+        == paper.model.num_image_timestep_tokens
         == 1
     )
-    assert baseline.model.num_reg_t_tokens == 0
-    assert paper.model.num_reg_t_tokens == 1
+    assert baseline.model.num_reg_timestep_tokens == 0
+    assert paper.model.num_reg_timestep_tokens == 1
     assert (
-        baseline.model.num_c_tokens
-        == paper.model.num_c_tokens
+        baseline.model.num_image_class_tokens
+        == paper.model.num_image_class_tokens
         == 1
     )
+    assert baseline.model.num_reg_class_tokens == 0
+    assert paper.model.num_reg_class_tokens == 1
     assert baseline.model.variant == paper.model.variant == "DDT-B"
     assert baseline.model.hidden_size == paper.model.hidden_size == 768
     assert baseline.model.depth == paper.model.depth == 12
@@ -47,8 +49,9 @@ def test_required_presets_load() -> None:
     assert paper.model.features.reg.target_std == pytest.approx(0.53)
     assert paper.model.features.reg.internal_guidance_block == 4
     assert not paper.model.fused_mlp
-    assert not paper.model.features.reg.independent_attention
-    assert paper.model.features.reg.reg_dropout_prob == 0
+    assert paper.model.features.reg.attention_mode == "asymmetric"
+    assert paper.model.features.reg.join_after_block == 4
+    assert paper.model.features.reg.dropout_probability == 0
     assert not paper.model.features.reg.lora.enabled
     assert paper.model.features.reg.lora.rank == 16
     assert paper.model.features.reg.lora.alpha == pytest.approx(16)
@@ -96,11 +99,11 @@ def test_model_channels_must_match_input_space(
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("num_img_t_tokens", -1),
-        ("num_reg_t_tokens", -1),
-        ("num_c_tokens", -1),
-        ("num_c_tokens", 1.5),
-        ("num_img_t_tokens", True),
+        ("num_image_timestep_tokens", -1),
+        ("num_reg_timestep_tokens", -1),
+        ("num_image_class_tokens", -1),
+        ("num_reg_class_tokens", 1.5),
+        ("num_image_timestep_tokens", True),
     ],
 )
 def test_conditioning_token_counts_must_be_non_negative_integers(
@@ -115,8 +118,8 @@ def test_conditioning_token_counts_must_be_non_negative_integers(
 
 def test_reg_timestep_tokens_require_reg() -> None:
     config = ExperimentConfig()
-    config.model.num_reg_t_tokens = 1
-    with pytest.raises(ValueError, match="requires"):
+    config.model.num_reg_timestep_tokens = 1
+    with pytest.raises(ValueError, match="must be zero"):
         config.validate()
 
 
@@ -204,17 +207,28 @@ def test_active_reg_dropout_probability_validates(
 ) -> None:
     config = ExperimentConfig()
     config.model.features.reg.enabled = True
-    config.model.features.reg.independent_attention = True
-    config.model.features.reg.reg_dropout_prob = probability
-    with pytest.raises(ValueError, match="reg_dropout_prob"):
+    config.model.features.reg.attention_mode = "asymmetric"
+    config.model.features.reg.dropout_probability = probability
+    with pytest.raises(ValueError, match="dropout_probability"):
         config.validate()
 
 
-def test_reg_dropout_requires_independent_attention() -> None:
+def test_reg_dropout_requires_asymmetric_attention() -> None:
     config = ExperimentConfig()
     config.model.features.reg.enabled = True
-    config.model.features.reg.reg_dropout_prob = 0.5
-    with pytest.raises(ValueError, match="independent_attention"):
+    config.model.features.reg.dropout_probability = 0.5
+    with pytest.raises(ValueError, match="attention_mode=asymmetric"):
+        config.validate()
+
+
+@pytest.mark.parametrize("block", [-1, True, 1.5])
+def test_join_block_must_be_in_encoder(
+    block: object,
+) -> None:
+    config = ExperimentConfig()
+    config.model.features.reg.enabled = True
+    config.model.features.reg.join_after_block = block  # type: ignore[assignment]
+    with pytest.raises(ValueError, match="join_after_block"):
         config.validate()
 
 
@@ -294,14 +308,14 @@ def test_clean_break_rejects_old_and_unknown_configs(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="cannot be migrated"):
         load_checkpoint_config(old_checkpoint)
 
-    schema_v7 = tmp_path / "schema-v7.yaml"
-    schema_v7.write_text("schema_version: 7\n")
-    with pytest.raises(ValueError, match="schema_version: 8"):
-        load_config(schema_v7)
+    schema_v8 = tmp_path / "schema-v8.yaml"
+    schema_v8.write_text("schema_version: 8\n")
+    with pytest.raises(ValueError, match="schema_version: 9"):
+        load_config(schema_v8)
 
     unknown = tmp_path / "unknown.yaml"
-    unknown.write_text("schema_version: 8\nretired_experiment: true\n")
-    with pytest.raises(ValueError, match="invalid schema-v8"):
+    unknown.write_text("schema_version: 9\nretired_experiment: true\n")
+    with pytest.raises(ValueError, match="invalid schema-v9"):
         load_config(unknown)
 
 

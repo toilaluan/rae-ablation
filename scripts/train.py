@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=Path("configs/baseline-p16.yaml"),
-        help="schema-v8 experiment YAML (default: configs/baseline-p16.yaml)",
+        help="schema-v9 experiment YAML (default: configs/baseline-p16.yaml)",
     )
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)

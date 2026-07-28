@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=Path("configs/latent-baseline-p16.yaml"),
-        help="schema-v8 latent experiment YAML",
+        help="schema-v9 latent experiment YAML",
     )
     parser.add_argument(
         "--override",

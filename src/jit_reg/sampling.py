@@ -154,9 +154,10 @@ def ode_sample(
         and bool(
             getattr(
                 model_reg_config,
-                "independent_attention",
-                False,
+                "attention_mode",
+                "joint",
             )
+            == "asymmetric"
         )
     )
 
@@ -239,7 +240,6 @@ def ode_sample(
         assert reg_noise is not None
         output = reg_only_forward(
             current_reg_state.to(reg_noise.dtype),
-            image_timestep_value.expand(noise.shape[0]),
             labels,
             reg_timestep=reg_timestep_value.expand(
                 noise.shape[0]

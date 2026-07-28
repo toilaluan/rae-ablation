@@ -6,7 +6,7 @@ denoises DINOv3 representation tokens, while REPA aligns an intermediate DDT
 sequence with frozen DINOv3 targets. Pixel/latent input and REG/REPA are
 independent choices.
 
-This repository uses configuration schema v8. Older configs, checkpoints,
+This repository uses configuration schema v9. Older configs, checkpoints,
 training states, and sampling manifests are intentionally incompatible.
 Schema-v3 REG/REPA caches remain reusable.
 
@@ -43,8 +43,9 @@ treats the early prediction as the internal unconditional estimate:
 `early + reg_guidance_scale * (final - early)`.
 
 Image and REG time use independent Gaussian Fourier embedders. Conditioning
-token counts are configured with `model.num_img_t_tokens`,
-`model.num_reg_t_tokens`, and `model.num_c_tokens`. Conditioning tokens use
+token counts are configured with `model.num_image_timestep_tokens`,
+`model.num_reg_timestep_tokens`, `model.num_image_class_tokens`, and
+`model.num_reg_class_tokens`. Conditioning tokens use
 identity RoPE and are excluded from image/REG prediction and REPA targets.
 
 Horizontal flipping is not performed anywhere in the data, cache, or training
@@ -356,7 +357,7 @@ Run any command with `--help` for its concise parser-generated reference.
 
 | Argument | Type/default | Description |
 | --- | --- | --- |
-| `--config` | path; `configs/latent-baseline-p16.yaml` | Schema-v8 latent experiment configuration. The input space must be `flux2_latents`. |
+| `--config` | path; `configs/latent-baseline-p16.yaml` | Schema-v9 latent experiment configuration. The input space must be `flux2_latents`. |
 | `--override KEY=VALUE` | repeatable; none | Structured configuration override. Common cache controls are `data.max_samples`, `data.workers`, `vae.micro_batch_size`, `vae.cache.directory`, `vae.cache.batch_size`, and `vae.cache.log_interval`. |
 
 The command writes under `vae.cache.directory/<fingerprint>` and never
@@ -366,7 +367,7 @@ overwrites an incompatible cache.
 
 | Argument | Type/default | Description |
 | --- | --- | --- |
-| `--config` | path; `configs/baseline-p16.yaml` | Schema-v8 experiment configuration. REG or REPA must be enabled. |
+| `--config` | path; `configs/baseline-p16.yaml` | Schema-v9 experiment configuration. REG or REPA must be enabled. |
 | `--override KEY=VALUE` | repeatable; none | Structured override controlling active components, dataset limits, cache directory, batch size, logging, or preprocessing identity. |
 
 The command writes independent `reg/<fingerprint>` and `repa/<fingerprint>`
@@ -376,7 +377,7 @@ components beneath `feature_cache.directory`.
 
 | Argument | Type/default | Description |
 | --- | --- | --- |
-| `--config` | path; `configs/baseline-p16.yaml` | Schema-v8 experiment configuration. |
+| `--config` | path; `configs/baseline-p16.yaml` | Schema-v9 experiment configuration. |
 | `--override KEY=VALUE` | repeatable; none | Structured override applied before final validation. |
 | `--output` | path; none | Run root. Rewrites checkpoint and validation-plan paths beneath this directory. Without it, configured paths are used directly. |
 | `--resume` | checkpoint path; none | Resume model, EMA, optimizer, RNG streams, epoch/step, validation state, and cache identities from a compatible checkpoint directory. |
@@ -436,9 +437,10 @@ presets also use one REG-timestep token:
 
 ```yaml
 model:
-  num_img_t_tokens: 1
-  num_reg_t_tokens: 1  # must be 0 when REG is disabled
-  num_c_tokens: 1
+  num_image_timestep_tokens: 1
+  num_reg_timestep_tokens: 1  # must be 0 when REG is disabled
+  num_image_class_tokens: 1
+  num_reg_class_tokens: 1  # must be 0 when REG is disabled
   decoder:
     hidden_size: 2048
     depth: 2
@@ -446,12 +448,12 @@ model:
     mlp_ratio: 4.0
 ```
 
-Each count may be zero. `GaussianFourierEmbedding` uses a fixed random Fourier
+Each count may be zero. `TimestepTokenEmbedder` uses a fixed random Fourier
 frequency vector, an MLP, and learned token offsets initialized with standard
-deviation `1/sqrt(hidden_size)`. `ConditionEmbedder` applies the same learned
-offset construction to the label embedding. Encoder outputs plus their
-matching image or REG base-time embeddings provide token-aligned decoder
-conditioning.
+deviation `1/sqrt(hidden_size)`. `ClassTokenEmbedder` owns one shared label
+table and separate image/REG offsets, keeping runtime class activations private
+to their streams. Encoder outputs plus their matching image or REG base-time
+embeddings provide token-aligned decoder conditioning.
 
 ## Feature configuration
 
@@ -474,6 +476,9 @@ model:
       spatial_rope: true
       loss_weight: 0.03
       internal_guidance_block: 4
+      attention_mode: asymmetric  # joint | asymmetric
+      join_after_block: 4
+      dropout_probability: 0.0
     repa:
       enabled: true
       block: 4
@@ -481,6 +486,10 @@ model:
       loss_weight: 0.5
       token_scope: image_and_reg  # image | image_and_reg
 ```
+
+In asymmetric mode, REG data and both conditioning streams remain private.
+Image data begins attending REG after `join_after_block`; REG dropout keeps
+image queries isolated in both the encoder and decoder.
 
 Image/latent and REG times are independent sigmoid-normal draws. Sampling uses
 one global solver loop with independent local clocks and quantized denoising

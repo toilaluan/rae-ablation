@@ -183,9 +183,10 @@ def main() -> None:
             "input_space": config.model.input_space,
             "input_shape": list(config.model.input_shape),
             "conditioning_tokens": {
-                "image_timestep": config.model.num_img_t_tokens,
-                "reg_timestep": config.model.num_reg_t_tokens,
-                "class": config.model.num_c_tokens,
+                "image_timestep": config.model.num_image_timestep_tokens,
+                "reg_timestep": config.model.num_reg_timestep_tokens,
+                "image_class": config.model.num_image_class_tokens,
+                "reg_class": config.model.num_reg_class_tokens,
             },
             "vae": (
                 {

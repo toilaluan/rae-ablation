@@ -15,7 +15,7 @@ from .checkpoint import EMA, CheckpointManager, should_checkpoint
 from .config import ExperimentConfig
 from .feature_cache import FeatureCache
 from .latent_cache import LatentCache
-from .model.ddt import classifier_free_labels
+from .model.tokens import classifier_free_labels
 from .objective import (
     jit_losses,
     noisy_interpolate,
@@ -494,18 +494,18 @@ def train(
                 streams.label_dropout,
             )
             reg_config = config.model.features.reg
-            drop_reg_for_image = (
+            reg_dropout = (
                 reg_config.enabled
                 and (
-                    reg_config.reg_dropout_prob >= 1
+                    reg_config.dropout_probability >= 1
                     or (
-                        reg_config.reg_dropout_prob > 0
+                        reg_config.dropout_probability > 0
                         and torch.rand(
                             (),
                             device=device,
                             generator=streams.label_dropout,
                         ).item()
-                        < reg_config.reg_dropout_prob
+                        < reg_config.dropout_probability
                     )
                 )
             )
@@ -569,7 +569,7 @@ def train(
                     noisy_reg=noisy_reg,
                     reg_timestep=reg_timesteps,
                     return_repa=config.model.features.repa.enabled,
-                    drop_reg_for_image=drop_reg_for_image,
+                    reg_dropout=reg_dropout,
                 )
             repa_target = (
                 repa_target_for_scope(

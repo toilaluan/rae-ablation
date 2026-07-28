@@ -10,7 +10,12 @@ from .config import (
     VAEConfig,
     load_config,
 )
-from .model import DDT, DDTOutput, DDTREGOutput
+from .model import (
+    DDT,
+    DDTOutput,
+    DDTREGOutput,
+    classifier_free_labels,
+)
 
 __all__ = [
     "DDT",
@@ -23,6 +28,7 @@ __all__ = [
     "REGConfig",
     "REGLoRAConfig",
     "VAEConfig",
+    "classifier_free_labels",
     "load_config",
 ]
 __version__ = "0.1.0"

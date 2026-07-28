@@ -159,12 +159,12 @@ def test_best_fid_metadata_tracks_reg_timestep_shift(tmp_path: Path) -> None:
     }
 
 
-def test_v8_checkpoint_bundle_and_training_resume(tmp_path: Path) -> None:
+def test_v9_checkpoint_bundle_and_training_resume(tmp_path: Path) -> None:
     manager, checkpoint, model = save_checkpoint(tmp_path)
     metadata = json.loads((checkpoint / "metadata.json").read_text())
-    assert metadata["schema_version"] == 8
+    assert metadata["schema_version"] == 9
     training = torch.load(checkpoint / "training.pt", weights_only=False)
-    assert training["schema_version"] == 8
+    assert training["schema_version"] == 9
     restored = DDT(model.config)
     resumed = manager.load(
         checkpoint,
@@ -176,7 +176,7 @@ def test_v8_checkpoint_bundle_and_training_resume(tmp_path: Path) -> None:
     assert resumed.epoch == 1
     bundle = load_checkpoint_bundle(tmp_path / "checkpoints")
     assert bundle.directory == checkpoint.resolve()
-    assert bundle.config.schema_version == 8
+    assert bundle.config.schema_version == 9
 
 
 def test_old_training_resume_is_rejected_before_model_mutation(
@@ -191,7 +191,7 @@ def test_old_training_resume_is_rejected_before_model_mutation(
     before = {
         name: value.detach().clone() for name, value in restored.state_dict().items()
     }
-    with pytest.raises(ValueError, match="incompatible with schema v8"):
+    with pytest.raises(ValueError, match="incompatible with schema v9"):
         manager.load(checkpoint, restored, EMA(restored))
     assert all(
         torch.equal(value, before[name])
@@ -207,21 +207,21 @@ def test_current_checkpoint_config_uses_structured_defaults(
     values = json.loads(config_path.read_text())
     reg = values["model"]["features"]["reg"]
     reg.pop("spatial_rope")
-    reg.pop("independent_attention")
-    reg.pop("reg_dropout_prob")
+    reg.pop("attention_mode")
+    reg.pop("join_after_block")
+    reg.pop("dropout_probability")
     reg.pop("lora")
     values["model"].pop("fused_mlp")
     values["model"]["decoder"].pop("mlp_ratio")
-    values["train"]["micro_batch_size"] = 1
     config_path.write_text(json.dumps(values))
     bundle = load_checkpoint_bundle(checkpoint)
     assert bundle.config.model.features.reg.spatial_rope
-    assert not bundle.config.model.features.reg.independent_attention
-    assert bundle.config.model.features.reg.reg_dropout_prob == 0
+    assert bundle.config.model.features.reg.attention_mode == "joint"
+    assert bundle.config.model.features.reg.join_after_block == 4
+    assert bundle.config.model.features.reg.dropout_probability == 0
     assert not bundle.config.model.features.reg.lora.enabled
     assert not bundle.config.model.fused_mlp
     assert bundle.config.model.decoder.mlp_ratio == pytest.approx(4.0)
-    assert not hasattr(bundle.config.train, "micro_batch_size")
 
 
 def test_old_checkpoint_schema_is_explicitly_rejected(tmp_path: Path) -> None:
@@ -245,7 +245,7 @@ def test_rng_streams_checkpoint_independent_reg_timing() -> None:
     assert torch.equal(first, second)
     old = dict(saved)
     old.pop("reg_timesteps")
-    with pytest.raises(ValueError, match="incompatible with schema v8"):
+    with pytest.raises(ValueError, match="incompatible with schema v9"):
         streams.load_state_dict(old)
 
 
@@ -282,8 +282,9 @@ def test_required_preset_shapes_run_one_training_step(
             "model.num_classes=2",
             "model.features.encoder.feature_dim=8",
             "model.features.reg.pool_size=2",
-            "model.features.reg.internal_guidance_block=1",
-            "model.features.repa.block=1",
+                "model.features.reg.internal_guidance_block=1",
+                "model.features.reg.join_after_block=1",
+                "model.features.repa.block=1",
             "model.features.repa.projection_hidden_size=16",
             "compile.enabled=false",
             "train.optimizer.kind=adamw",

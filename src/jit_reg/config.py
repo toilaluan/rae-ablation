@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 8
+CONFIG_SCHEMA_VERSION = 9
 
 FLUX2_SPATIAL_COMPRESSION = 16
 FLUX2_LATENT_CHANNELS = 128
@@ -41,8 +41,9 @@ class REGConfig:
     spatial_rope: bool = True
     loss_weight: float = 0.03
     internal_guidance_block: int = 4
-    independent_attention: bool = False
-    reg_dropout_prob: float = 0.0
+    attention_mode: str = "joint"
+    join_after_block: int = 4
+    dropout_probability: float = 0.0
     lora: REGLoRAConfig = field(default_factory=REGLoRAConfig)
 
     @property
@@ -84,9 +85,10 @@ class ModelConfig:
     image_size: int = 256
     in_channels: int = 3
     patch_size: int = 16
-    num_img_t_tokens: int = 1
-    num_reg_t_tokens: int = 0
-    num_c_tokens: int = 1
+    num_image_timestep_tokens: int = 1
+    num_reg_timestep_tokens: int = 0
+    num_image_class_tokens: int = 1
+    num_reg_class_tokens: int = 0
     hidden_size: int = 768
     depth: int = 12
     num_heads: int = 12
@@ -116,6 +118,198 @@ class ModelConfig:
     @property
     def input_shape(self) -> tuple[int, int, int]:
         return (self.in_channels, self.input_size, self.input_size)
+
+    def validate(self) -> None:
+        _positive(
+            "model dimensions",
+            self.image_size,
+            self.in_channels,
+            self.patch_size,
+            self.hidden_size,
+            self.depth,
+            self.num_heads,
+            self.num_classes,
+            self.mlp_ratio,
+        )
+        if self.input_space not in {"pixels", "flux2_latents"}:
+            raise ValueError(
+                "model.input_space must be pixels or flux2_latents"
+            )
+        expected_channels = (
+            3 if self.input_space == "pixels" else FLUX2_LATENT_CHANNELS
+        )
+        if self.in_channels != expected_channels:
+            raise ValueError(
+                f"model.in_channels must be {expected_channels} for "
+                f"model.input_space={self.input_space}"
+            )
+        if (
+            self.input_space == "flux2_latents"
+            and self.image_size % FLUX2_SPATIAL_COMPRESSION
+        ):
+            raise ValueError(
+                "FLUX.2 latent mode requires model.image_size to be "
+                "divisible by 16"
+            )
+        if self.input_size % self.patch_size:
+            raise ValueError(
+                "the diffusion input size must be exactly divisible by "
+                "model.patch_size"
+            )
+        token_counts = {
+            "model.num_image_timestep_tokens": self.num_image_timestep_tokens,
+            "model.num_reg_timestep_tokens": self.num_reg_timestep_tokens,
+            "model.num_image_class_tokens": self.num_image_class_tokens,
+            "model.num_reg_class_tokens": self.num_reg_class_tokens,
+        }
+        for name, count in token_counts.items():
+            if (
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or count < 0
+            ):
+                raise ValueError(
+                    f"{name} must be a non-negative integer"
+                )
+        reg = self.features.reg
+        if not reg.enabled and (
+            self.num_reg_timestep_tokens or self.num_reg_class_tokens
+        ):
+            raise ValueError(
+                "REG timestep/class token counts must be zero when REG is disabled"
+            )
+        if self.hidden_size % self.num_heads:
+            raise ValueError(
+                "model.hidden_size must be divisible by model.num_heads"
+            )
+        if (self.hidden_size // self.num_heads) % 4:
+            raise ValueError(
+                "model attention head dimension must be divisible by 4 for 2D RoPE"
+            )
+        decoder = self.decoder
+        _positive(
+            "model.decoder dimensions",
+            decoder.hidden_size,
+            decoder.depth,
+            decoder.num_heads,
+            decoder.mlp_ratio,
+        )
+        if decoder.hidden_size % decoder.num_heads:
+            raise ValueError(
+                "model.decoder.hidden_size must be divisible by "
+                "model.decoder.num_heads"
+            )
+        if (decoder.hidden_size // decoder.num_heads) % 4:
+            raise ValueError(
+                "model decoder attention head dimension must be divisible by 4 "
+                "for 2D RoPE"
+            )
+        if not 0 <= self.class_dropout_prob < 1:
+            raise ValueError(
+                "model.class_dropout_prob must be in [0, 1)"
+            )
+        if not self.variant:
+            raise ValueError("model.variant cannot be empty")
+
+        features = self.features
+        if features.enabled:
+            _positive(
+                "model.features.encoder dimensions",
+                features.encoder.feature_dim,
+                features.encoder.register_tokens,
+            )
+            if not features.encoder.model_name:
+                raise ValueError(
+                    "model.features.encoder.model_name cannot be empty"
+                )
+        if reg.enabled:
+            if reg.attention_mode not in {"joint", "asymmetric"}:
+                raise ValueError(
+                    "model.features.reg.attention_mode must be joint or asymmetric"
+                )
+            if (
+                not isinstance(reg.join_after_block, int)
+                or isinstance(reg.join_after_block, bool)
+                or not 0 <= reg.join_after_block <= self.depth
+            ):
+                raise ValueError(
+                    "model.features.reg.join_after_block must be an integer "
+                    "within [0, model.depth]"
+                )
+            if (
+                not math.isfinite(reg.dropout_probability)
+                or not 0 <= reg.dropout_probability <= 1
+            ):
+                raise ValueError(
+                    "model.features.reg.dropout_probability must be in [0, 1]"
+                )
+            if (
+                reg.dropout_probability
+                and reg.attention_mode != "asymmetric"
+            ):
+                raise ValueError(
+                    "model.features.reg.dropout_probability requires "
+                    "attention_mode=asymmetric"
+                )
+            if reg.pool_size < 1 or reg.pool_size > self.grid_size:
+                raise ValueError(
+                    "model.features.reg.pool_size must not exceed the model grid"
+                )
+            if not math.isfinite(reg.target_std) or reg.target_std <= 0:
+                raise ValueError(
+                    "model.features.reg.target_std must be finite and positive"
+                )
+            if reg.loss_weight < 0:
+                raise ValueError(
+                    "model.features.reg.loss_weight cannot be negative"
+                )
+            if (
+                not isinstance(reg.internal_guidance_block, int)
+                or isinstance(reg.internal_guidance_block, bool)
+                or not 1 <= reg.internal_guidance_block <= self.depth
+            ):
+                raise ValueError(
+                    "model.features.reg.internal_guidance_block must be within "
+                    "model.depth"
+                )
+            if reg.lora.enabled:
+                if (
+                    not isinstance(reg.lora.rank, int)
+                    or isinstance(reg.lora.rank, bool)
+                    or reg.lora.rank < 1
+                ):
+                    raise ValueError(
+                        "model.features.reg.lora.rank must be a positive integer"
+                    )
+                if (
+                    not math.isfinite(reg.lora.alpha)
+                    or reg.lora.alpha <= 0
+                ):
+                    raise ValueError(
+                        "model.features.reg.lora.alpha must be finite and positive"
+                    )
+        if features.repa.enabled:
+            repa = features.repa
+            if not 1 <= repa.block <= self.depth:
+                raise ValueError(
+                    "model.features.repa.block must be within model.depth"
+                )
+            if repa.projection_hidden_size < 1:
+                raise ValueError(
+                    "model.features.repa.projection_hidden_size must be positive"
+                )
+            if repa.loss_weight < 0:
+                raise ValueError(
+                    "model.features.repa.loss_weight cannot be negative"
+                )
+            if repa.token_scope not in {"image", "image_and_reg"}:
+                raise ValueError(
+                    "model.features.repa.token_scope must be image or image_and_reg"
+                )
+            if repa.token_scope == "image_and_reg" and not reg.enabled:
+                raise ValueError(
+                    "REPA image_and_reg token scope requires REG"
+                )
 
 
 @dataclass
@@ -268,35 +462,8 @@ class ExperimentConfig:
                 "is not supported)"
             )
         m = self.model
-        _positive(
-            "model dimensions",
-            m.image_size,
-            m.in_channels,
-            m.patch_size,
-            m.hidden_size,
-            m.depth,
-            m.num_heads,
-            m.num_classes,
-            m.mlp_ratio,
-        )
-        if m.input_space not in {"pixels", "flux2_latents"}:
-            raise ValueError(
-                "model.input_space must be pixels or flux2_latents"
-            )
-        expected_channels = (
-            3 if m.input_space == "pixels" else FLUX2_LATENT_CHANNELS
-        )
-        if m.in_channels != expected_channels:
-            raise ValueError(
-                f"model.in_channels must be {expected_channels} for "
-                f"model.input_space={m.input_space}"
-            )
+        m.validate()
         if m.input_space == "flux2_latents":
-            if m.image_size % FLUX2_SPATIAL_COMPRESSION:
-                raise ValueError(
-                    "FLUX.2 latent mode requires model.image_size to be "
-                    "divisible by 16"
-                )
             vae = self.vae
             if not vae.model_name or not vae.revision or not vae.subfolder:
                 raise ValueError(
@@ -314,127 +481,7 @@ class ExperimentConfig:
             raise ValueError(
                 "vae.cache.enabled requires model.input_space=flux2_latents"
             )
-        if m.input_size % m.patch_size:
-            raise ValueError(
-                "the diffusion input size must be exactly divisible by "
-                "model.patch_size"
-            )
-        conditioning_token_counts = {
-            "model.num_img_t_tokens": m.num_img_t_tokens,
-            "model.num_reg_t_tokens": m.num_reg_t_tokens,
-            "model.num_c_tokens": m.num_c_tokens,
-        }
-        for name, count in conditioning_token_counts.items():
-            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
-                raise ValueError(f"{name} must be a non-negative integer")
-        if m.num_reg_t_tokens and not m.features.reg.enabled:
-            raise ValueError(
-                "model.num_reg_t_tokens requires model.features.reg.enabled=true"
-            )
-        if m.hidden_size % m.num_heads:
-            raise ValueError("model.hidden_size must be divisible by model.num_heads")
-        if (m.hidden_size // m.num_heads) % 4:
-            raise ValueError("model attention head dimension must be divisible by 4 for 2D RoPE")
-        decoder = m.decoder
-        _positive(
-            "model.decoder dimensions",
-            decoder.hidden_size,
-            decoder.depth,
-            decoder.num_heads,
-            decoder.mlp_ratio,
-        )
-        if decoder.hidden_size % decoder.num_heads:
-            raise ValueError(
-                "model.decoder.hidden_size must be divisible by "
-                "model.decoder.num_heads"
-            )
-        if (decoder.hidden_size // decoder.num_heads) % 4:
-            raise ValueError(
-                "model decoder attention head dimension must be divisible by 4 "
-                "for 2D RoPE"
-            )
-        if not 0 <= m.class_dropout_prob < 1:
-            raise ValueError("model.class_dropout_prob must be in [0, 1)")
-        if not m.variant:
-            raise ValueError("model.variant cannot be empty")
-
         features = m.features
-        # A true baseline does not depend on DINO, feature timing, or cache settings.
-        if features.enabled:
-            encoder = features.encoder
-            _positive(
-                "model.features.encoder dimensions",
-                encoder.feature_dim,
-                encoder.register_tokens,
-            )
-            if not encoder.model_name:
-                raise ValueError("model.features.encoder.model_name cannot be empty")
-        if features.reg.enabled:
-            reg = features.reg
-            if (
-                not math.isfinite(reg.reg_dropout_prob)
-                or not 0 <= reg.reg_dropout_prob <= 1
-            ):
-                raise ValueError(
-                    "model.features.reg.reg_dropout_prob must be in [0, 1]"
-                )
-            if reg.reg_dropout_prob and not reg.independent_attention:
-                raise ValueError(
-                    "model.features.reg.reg_dropout_prob requires "
-                    "independent_attention=true"
-                )
-            if reg.pool_size < 1 or reg.pool_size > m.grid_size:
-                raise ValueError(
-                    "model.features.reg.pool_size must not exceed the model grid"
-                )
-            if not math.isfinite(reg.target_std) or reg.target_std <= 0:
-                raise ValueError(
-                    "model.features.reg.target_std must be finite and positive"
-                )
-            if reg.loss_weight < 0:
-                raise ValueError("model.features.reg.loss_weight cannot be negative")
-            if (
-                not isinstance(reg.internal_guidance_block, int)
-                or isinstance(reg.internal_guidance_block, bool)
-                or not 1 <= reg.internal_guidance_block <= m.depth
-            ):
-                raise ValueError(
-                    "model.features.reg.internal_guidance_block must be within "
-                    "model.depth"
-                )
-            if reg.lora.enabled:
-                if (
-                    not isinstance(reg.lora.rank, int)
-                    or isinstance(reg.lora.rank, bool)
-                    or reg.lora.rank < 1
-                ):
-                    raise ValueError(
-                        "model.features.reg.lora.rank must be a positive integer"
-                    )
-                if (
-                    not math.isfinite(reg.lora.alpha)
-                    or reg.lora.alpha <= 0
-                ):
-                    raise ValueError(
-                        "model.features.reg.lora.alpha must be finite and positive"
-                    )
-        if features.repa.enabled:
-            repa = features.repa
-            if not 1 <= repa.block <= m.depth:
-                raise ValueError("model.features.repa.block must be within model.depth")
-            if repa.projection_hidden_size < 1:
-                raise ValueError(
-                    "model.features.repa.projection_hidden_size must be positive"
-                )
-            if repa.loss_weight < 0:
-                raise ValueError("model.features.repa.loss_weight cannot be negative")
-            if repa.token_scope not in {"image", "image_and_reg"}:
-                raise ValueError(
-                    "model.features.repa.token_scope must be image or image_and_reg"
-                )
-            if repa.token_scope == "image_and_reg" and not features.reg.enabled:
-                raise ValueError("REPA image_and_reg token scope requires REG")
-
         if self.train.optimizer.kind not in {"adamw", "muon", "fused_muon"}:
             raise ValueError(
                 "optimizer.kind must be adamw, muon, or fused_muon"
@@ -608,12 +655,11 @@ def load_config(
 
 def load_checkpoint_config(path: str | Path) -> ExperimentConfig:
     """Load a resolved current-schema checkpoint config."""
-    values = deepcopy(
-        _require_current_schema(json.loads(Path(path).read_text()), path)
+    return _structured_config(
+        deepcopy(
+            _require_current_schema(
+                json.loads(Path(path).read_text()),
+                path,
+            )
+        )
     )
-    train = values.get("train")
-    if isinstance(train, dict):
-        # Retired runtime-only field from pre-v4 checkpoints. Per-rank batch
-        # size is now derived from global_batch_size and distributed world size.
-        train.pop("micro_batch_size", None)
-    return _structured_config(values)

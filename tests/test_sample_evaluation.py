@@ -28,7 +28,7 @@ from jit_reg.validation_runtime import validate_ema
 
 ROOT = Path(__file__).resolve().parents[1]
 FEATURE_SCHEMA = {
-    "schema_version": 8,
+    "schema_version": 9,
     "encoder": {},
     "reg": {"enabled": False},
     "repa": {"enabled": False},
@@ -51,7 +51,7 @@ def test_sampling_output_name_includes_asynchronous_reg_schedule() -> None:
     assert "-regint0p0-" in name
 
 
-def test_sampling_manifest_has_v8_features_and_rejects_old_schema(
+def test_sampling_manifest_has_v9_features_and_rejects_old_schema(
     tmp_path: Path,
 ) -> None:
     plan = create_validation_plan(4, 2, 2, seed=4)
@@ -89,7 +89,7 @@ def test_sampling_manifest_has_v8_features_and_rejects_old_schema(
     )
     assert archive.is_file()
     manifest = json.loads((output / "samples.json").read_text())
-    assert manifest["schema_version"] == 15
+    assert manifest["schema_version"] == 16
     assert manifest["feature_schema"] == FEATURE_SCHEMA
     assert manifest["patch_size"] == 4
     assert manifest["jit_grid_size"] == 2
