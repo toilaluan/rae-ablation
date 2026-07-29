@@ -83,6 +83,8 @@ def test_component_fingerprints_are_minimal_and_independent(tmp_path: Path) -> N
     irrelevant.sampling.reg_guidance_scale = 3.0
     irrelevant.model.features.repa.block = 2
     irrelevant.model.features.repa.loss_weight = 99
+    irrelevant.model.features.repa.repa_stream.enabled = True
+    irrelevant.model.features.repa.repa_stream.pool_size = 1
     irrelevant.train.optimizer.lr = 1
     irrelevant.compile.enabled = False
     irrelevant.sampling.sampling_steps = 3

@@ -3,8 +3,9 @@
 `jit-reg` trains a class-conditional DDT-B/16 on ImageNet-256. The diffusion
 state can be either RGB pixels or normalized FLUX.2 VAE latents. REG jointly
 denoises DINOv3 representation tokens, while REPA aligns an intermediate DDT
-sequence with frozen DINOv3 targets. Pixel/latent input and REG/REPA are
-independent choices.
+sequence with frozen DINOv3 targets. An optional REPA stream feeds a pooled
+version of the live REPA prediction back into later encoder blocks as semantic
+memory. Pixel/latent input and REG/REPA are independent choices.
 
 This repository uses configuration schema v9. Older configs, checkpoints,
 training states, and sampling manifests are intentionally incompatible.
@@ -27,12 +28,13 @@ DDT grid.
 Following the
 [DiffusionBench DDT design](https://github.com/End2End-Diffusion/diffusion-bench/blob/main/src/stage2/models/DDT.py),
 DDT uses an unconditioned 12-layer, width-768 encoder followed by a shared
-2-layer, width-2048 decoder. The encoder sequence is REG data, image patches,
-REG-time tokens, image-time tokens, then class tokens. The primary REG/image
-states receive their matching base-time embeddings and become token-aligned
-decoder conditioning. Fresh REG and image embeddings are decoded jointly with
-adaLN-Zero. One final normalization/modulation is shared by both outputs, with
-only the dimension-specific linear projections kept separate.
+2-layer, width-2048 decoder. The base encoder sequence is REG data, image
+patches, REG-time tokens, image-time tokens, then class tokens; an enabled REPA
+stream is inserted after image patches following its source block. The primary
+REG/image states receive their matching base-time embeddings and become
+token-aligned decoder conditioning. Fresh REG and image embeddings are decoded
+jointly with adaLN-Zero. One final normalization/modulation is shared by both
+outputs, with only the dimension-specific linear projections kept separate.
 
 Following the
 [RAEv2 internal-guidance head](https://github.com/nanovisionx/RAEv2/blob/main/src/stage2/models/DDT.py#L212),
@@ -460,7 +462,8 @@ embeddings provide token-aligned decoder conditioning.
 REG and REPA remain configured under `model.features`. REG predicts clean
 DINOv3 tokens and has its own time distribution. REPA aligns an intermediate
 DDT encoder sequence with frozen targets and can cover image tokens or image plus REG
-tokens.
+tokens. The optional REPA stream uses the image-grid portion of that live
+prediction regardless of the loss scope.
 
 ```yaml
 model:
@@ -485,11 +488,24 @@ model:
       projection_hidden_size: 2048
       loss_weight: 0.5
       token_scope: image_and_reg  # image | image_and_reg
+      repa_stream:
+        enabled: true
+        pool_size: 4
 ```
 
 In asymmetric mode, REG data and both conditioning streams remain private.
 Image data begins attending REG after `join_after_block`; REG dropout keeps
 image queries isolated in both the encoder and decoder.
+
+When `repa_stream.enabled` is true, the block-`block` REPA prediction is
+L2-normalized, bicubically resized to `pool_size × pool_size`, normalized
+again, and projected back to the encoder width. These tokens are concatenated
+after the image tokens for all remaining encoder blocks and use spatially
+aligned 2D RoPE. They form part of the image-side stream: image and REPA tokens
+attend each other, while both obey the existing REG join and dropout policy.
+The stream is differentiable, has no separate loss or sampling state, and is
+not carried into the decoder. It reuses the ordinary REPA target cache without
+changing its fingerprint.
 
 Image/latent and REG times are independent sigmoid-normal draws. Sampling uses
 one global solver loop with independent local clocks and quantized denoising

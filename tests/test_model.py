@@ -15,6 +15,7 @@ from jit_reg.config import (
     REGConfig,
     REGLoRAConfig,
     REPAConfig,
+    REPAStreamConfig,
 )
 from jit_reg.model.ddt import DDT, DDTOutput, DDTREGOutput
 from jit_reg.model.layers import (
@@ -38,6 +39,7 @@ def tiny_config(
     *,
     reg: bool = False,
     repa: bool = False,
+    repa_stream: bool = False,
     scope: str = "image",
     attention_mode: str = "joint",
     image_timestep_tokens: int = 1,
@@ -80,6 +82,10 @@ def tiny_config(
                 block=1,
                 projection_hidden_size=16,
                 token_scope=scope,
+                repa_stream=REPAStreamConfig(
+                    enabled=repa_stream,
+                    pool_size=2,
+                ),
             ),
         ),
     )
@@ -144,6 +150,37 @@ def test_token_layout_is_the_sequence_authority(
         packed,
     )
     assert packed[:, layout.image_data].shape[1] == sizes[1]
+
+
+def test_token_layout_inserts_repa_stream_between_image_and_conditions() -> None:
+    layout = DDTTokenLayout(
+        reg_data_tokens=1,
+        image_data_tokens=4,
+        reg_timestep_tokens=1,
+        reg_class_tokens=1,
+        image_timestep_tokens=1,
+        image_class_tokens=1,
+        repa_stream_tokens=2,
+    )
+    values = {
+        "reg_data": torch.full((2, 1, 7), 1.0),
+        "image_data": torch.full((2, 4, 7), 2.0),
+        "repa_stream": torch.full((2, 2, 7), 3.0),
+        "reg_timestep": torch.full((2, 1, 7), 4.0),
+        "reg_class": torch.full((2, 1, 7), 5.0),
+        "image_timestep": torch.full((2, 1, 7), 6.0),
+        "image_class": torch.full((2, 1, 7), 7.0),
+    }
+    packed = layout.pack(**values)
+    assert torch.equal(packed[:, layout.repa_stream], values["repa_stream"])
+    assert layout.gather_data(packed).shape[1] == 5
+    assert layout.gather_image_data(packed).shape[1] == 6
+    reg_stream = layout.gather_reg_stream(packed)
+    image_stream = layout.gather_image_stream(packed)
+    assert torch.equal(
+        layout.reconstruct_streams(reg_stream, image_stream),
+        packed,
+    )
 
 
 def test_timestep_and_class_tokens_are_named_and_stream_private() -> None:
@@ -290,6 +327,95 @@ def test_asymmetric_attention_has_exact_query_kv_policy() -> None:
     )
 
 
+def test_repa_stream_is_image_side_memory_under_asymmetric_attention() -> None:
+    layout = DDTTokenLayout(
+        reg_data_tokens=4,
+        image_data_tokens=4,
+        reg_timestep_tokens=1,
+        reg_class_tokens=1,
+        image_timestep_tokens=1,
+        image_class_tokens=1,
+        repa_stream_tokens=4,
+    )
+    attention = DDTAttention(
+        16,
+        4,
+        grid_size=2,
+        reg_pool_size=2,
+        repa_pool_size=2,
+        layout=layout,
+        attention_mode="asymmetric",
+    )
+    x = torch.randn(2, layout.total_tokens, 16)
+    isolated = attention(x, image_attends_reg=False)
+
+    changed_repa = x.clone()
+    changed_repa[:, layout.repa_stream] += torch.randn_like(
+        changed_repa[:, layout.repa_stream]
+    )
+    changed_repa_output = attention(
+        changed_repa,
+        image_attends_reg=False,
+    )
+    assert not torch.allclose(
+        isolated[:, layout.image_data],
+        changed_repa_output[:, layout.image_data],
+    )
+    assert torch.allclose(
+        isolated[:, layout.reg_data],
+        changed_repa_output[:, layout.reg_data],
+    )
+
+    changed_image = x.clone()
+    changed_image[:, layout.image_data] += torch.randn_like(
+        changed_image[:, layout.image_data]
+    )
+    changed_image_output = attention(
+        changed_image,
+        image_attends_reg=False,
+    )
+    assert not torch.allclose(
+        isolated[:, layout.repa_stream],
+        changed_image_output[:, layout.repa_stream],
+    )
+    assert torch.allclose(
+        isolated[:, layout.reg_data],
+        changed_image_output[:, layout.reg_data],
+    )
+
+    changed_reg = x.clone()
+    for token_slice in layout.reg_stream_slices:
+        changed_reg[:, token_slice] += torch.randn_like(
+            changed_reg[:, token_slice]
+        )
+    changed_reg_isolated = attention(
+        changed_reg,
+        image_attends_reg=False,
+    )
+    assert torch.allclose(
+        isolated[:, layout.image_data],
+        changed_reg_isolated[:, layout.image_data],
+    )
+    assert torch.allclose(
+        isolated[:, layout.repa_stream],
+        changed_reg_isolated[:, layout.repa_stream],
+    )
+
+    joined = attention(x, image_attends_reg=True)
+    changed_reg_joined = attention(
+        changed_reg,
+        image_attends_reg=True,
+    )
+    assert not torch.allclose(
+        joined[:, layout.image_data],
+        changed_reg_joined[:, layout.image_data],
+    )
+    assert not torch.allclose(
+        joined[:, layout.repa_stream],
+        changed_reg_joined[:, layout.repa_stream],
+    )
+
+
 def test_isolation_remains_leak_free_across_multiple_blocks() -> None:
     config = tiny_config(
         reg=True,
@@ -388,6 +514,9 @@ def test_image_data_joins_reg_exactly_after_configured_boundary() -> None:
 def test_full_and_reg_forward_match_and_reg_path_skips_image_modules() -> None:
     config = tiny_config(
         reg=True,
+        repa=True,
+        repa_stream=True,
+        scope="image_and_reg",
         attention_mode="asymmetric",
         reg_timestep_tokens=1,
         reg_class_tokens=1,
@@ -468,21 +597,25 @@ def test_reg_dropout_overrides_encoder_join_and_decoder_join() -> None:
 
 
 @pytest.mark.parametrize(
-    ("reg", "scope", "expected_repa_tokens"),
+    ("reg", "scope", "repa_stream", "expected_repa_tokens"),
     [
-        (False, "image", 4),
-        (True, "image", 4),
-        (True, "image_and_reg", 8),
+        (False, "image", False, 4),
+        (False, "image", True, 4),
+        (True, "image", False, 4),
+        (True, "image_and_reg", False, 8),
+        (True, "image_and_reg", True, 8),
     ],
 )
 def test_output_shapes(
     reg: bool,
     scope: str,
+    repa_stream: bool,
     expected_repa_tokens: int,
 ) -> None:
     config = tiny_config(
         reg=reg,
         repa=True,
+        repa_stream=repa_stream,
         scope=scope,
         attention_mode="asymmetric" if reg else "joint",
         reg_timestep_tokens=1 if reg else 0,
@@ -511,6 +644,55 @@ def test_output_shapes(
         assert output.reg.shape == (2, 4, 8)
     else:
         assert output.reg is None
+
+
+def test_repa_stream_is_injected_only_after_repa_block_when_not_returned() -> None:
+    config = tiny_config(repa=True, repa_stream=True)
+    model = DDT(config)
+    token_counts: list[int] = []
+    handles = [
+        block.register_forward_pre_hook(
+            lambda _module, args: token_counts.append(args[0].shape[1])
+        )
+        for block in model.encoder_blocks
+    ]
+    image, timestep, labels, _noisy_reg = inputs(config)
+    output = model(
+        image,
+        timestep,
+        labels,
+        return_repa=False,
+    )
+    for handle in handles:
+        handle.remove()
+    assert token_counts == [
+        model.encoder_layout.total_tokens,
+        model.repa_encoder_layout.total_tokens,
+    ]
+    assert model.repa_encoder_layout.repa_stream_tokens == 4
+    assert output.repa is None
+
+
+def test_image_loss_backpropagates_through_live_repa_stream() -> None:
+    config = tiny_config(repa=True, repa_stream=True)
+    model = DDT(config)
+    generator = torch.Generator().manual_seed(23)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(std=0.05, generator=generator)
+    image, timestep, labels, _noisy_reg = inputs(config)
+    model(
+        image,
+        timestep,
+        labels,
+        return_repa=False,
+    ).image.square().mean().backward()
+    assert model.repa_projection is not None
+    assert model.repa_stream_projection is not None
+    repa_gradient = model.repa_projection.layers[0].weight.grad
+    stream_gradient = model.repa_stream_projection.weight.grad
+    assert repa_gradient is not None and torch.count_nonzero(repa_gradient)
+    assert stream_gradient is not None and torch.count_nonzero(stream_gradient)
 
 
 def test_fused_swiglu_matches_unfused() -> None:
@@ -581,6 +763,8 @@ def test_reg_lora_is_zero_initialized_and_active(
 def test_joint_attention_and_gradient_checkpointing_run() -> None:
     config = tiny_config(
         reg=True,
+        repa=True,
+        repa_stream=True,
         attention_mode="joint",
         reg_timestep_tokens=1,
         reg_class_tokens=1,

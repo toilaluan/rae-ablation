@@ -140,11 +140,12 @@ def precompute_ddt_rope_tables(
     head_dim: int,
     *,
     reg_pool_size: int | None = None,
+    repa_pool_size: int | None = None,
     condition_tokens: int = 0,
     spatial_reg_rope: bool = False,
     dtype: torch.dtype = torch.float32,
 ) -> tuple[Tensor, Tensor]:
-    """Build static RoPE for ``[REG, image, condition]`` DDT sequences."""
+    """Build static RoPE for ``[REG, image, REPA stream, condition]``."""
     if condition_tokens < 0:
         raise ValueError("DDT condition token count cannot be negative")
     reg_tokens = reg_pool_size**2 if reg_pool_size is not None else 0
@@ -158,8 +159,34 @@ def precompute_ddt_rope_tables(
         ),
         dtype=dtype,
     )
+    parts_cos = [primary_cos]
+    parts_sin = [primary_sin]
+    if repa_pool_size is not None:
+        if repa_pool_size < 1:
+            raise ValueError("REPA stream pool size must be positive")
+        cell = torch.arange(repa_pool_size, dtype=torch.float32) + 0.5
+        repa_y = cell * (image_height / repa_pool_size) - 0.5
+        repa_x = cell * (image_width / repa_pool_size) - 0.5
+        repa_y = (
+            repa_y[:, None]
+            .expand(repa_pool_size, repa_pool_size)
+            .reshape(-1)
+        )
+        repa_x = (
+            repa_x[None, :]
+            .expand(repa_pool_size, repa_pool_size)
+            .reshape(-1)
+        )
+        repa_cos, repa_sin = rope_cos_sin(
+            repa_y,
+            repa_x,
+            head_dim,
+            dtype,
+        )
+        parts_cos.append(repa_cos)
+        parts_sin.append(repa_sin)
     if condition_tokens == 0:
-        return primary_cos, primary_sin
+        return torch.cat(parts_cos), torch.cat(parts_sin)
     condition_cos = torch.ones(
         condition_tokens,
         head_dim,
@@ -170,10 +197,9 @@ def precompute_ddt_rope_tables(
         head_dim,
         dtype=dtype,
     )
-    return (
-        torch.cat((primary_cos, condition_cos), dim=0),
-        torch.cat((primary_sin, condition_sin), dim=0),
-    )
+    parts_cos.append(condition_cos)
+    parts_sin.append(condition_sin)
+    return torch.cat(parts_cos), torch.cat(parts_sin)
 
 
 def apply_2d_rope_positions(

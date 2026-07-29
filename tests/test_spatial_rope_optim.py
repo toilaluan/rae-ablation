@@ -142,14 +142,15 @@ def test_spatial_rope_can_be_embedded_between_conditioning_prefixes() -> None:
     )
 
 
-def test_ddt_rope_orders_reg_image_then_identity_conditions() -> None:
-    q = torch.randn(1, 2, 11, 8)
+def test_ddt_rope_orders_reg_image_repa_then_identity_conditions() -> None:
+    q = torch.randn(1, 2, 15, 8)
     k = torch.randn_like(q)
     cos, sin = precompute_ddt_rope_tables(
         2,
         2,
         8,
         reg_pool_size=2,
+        repa_pool_size=2,
         condition_tokens=3,
         spatial_reg_rope=True,
     )
@@ -167,13 +168,20 @@ def test_ddt_rope_orders_reg_image_then_identity_conditions() -> None:
         2,
         2,
     )
+    repa_q, repa_k = apply_aligned_spatial_rope(
+        q[:, :, 8:12],
+        k[:, :, 8:12],
+        2,
+        2,
+        2,
+    )
     assert torch.equal(
         actual_q,
-        torch.cat((reg_q, image_q, q[:, :, 8:]), dim=2),
+        torch.cat((reg_q, image_q, repa_q, q[:, :, 12:]), dim=2),
     )
     assert torch.equal(
         actual_k,
-        torch.cat((reg_k, image_k, k[:, :, 8:]), dim=2),
+        torch.cat((reg_k, image_k, repa_k, k[:, :, 12:]), dim=2),
     )
 
 

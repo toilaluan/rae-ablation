@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -13,9 +12,9 @@ from jit_reg.evaluation import evaluate_npz, save_evaluation
 from jit_reg.model.compile import compile_model_regions
 from jit_reg.model.ddt import DDT
 from jit_reg.sample_runtime import (
-    FEATURE_SCHEMA_VERSION,
     SamplingParameters,
     checkpoint_sha256,
+    feature_schema_for_config,
     sample_to_archive,
     sampling_output_name,
 )
@@ -178,27 +177,7 @@ def main() -> None:
         patch_size=config.model.patch_size,
         grid_size=config.model.grid_size,
         model_variant=config.model.model_variant,
-        feature_schema={
-            "schema_version": FEATURE_SCHEMA_VERSION,
-            "input_space": config.model.input_space,
-            "input_shape": list(config.model.input_shape),
-            "conditioning_tokens": {
-                "image_timestep": config.model.num_image_timestep_tokens,
-                "reg_timestep": config.model.num_reg_timestep_tokens,
-                "image_class": config.model.num_image_class_tokens,
-                "reg_class": config.model.num_reg_class_tokens,
-            },
-            "vae": (
-                {
-                    "model_name": config.vae.model_name,
-                    "revision": config.vae.revision,
-                    "subfolder": config.vae.subfolder,
-                }
-                if config.model.input_space == "flux2_latents"
-                else None
-            ),
-            **asdict(config.model.features),
-        },
+        feature_schema=feature_schema_for_config(config),
         checkpoint_hash=digest,
         parameters=parameters,
         generate_batch=generate_batch,

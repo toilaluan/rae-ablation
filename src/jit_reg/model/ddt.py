@@ -45,6 +45,7 @@ class DDT(nn.Module):
         self.grid_size = config.grid_size
         reg_config = config.features.reg
         repa_config = config.features.repa
+        repa_stream_config = repa_config.repa_stream
         decoder = config.decoder
         reg_tokens = (
             reg_config.num_tokens if reg_config.enabled else 0
@@ -64,6 +65,19 @@ class DDT(nn.Module):
             reg_class_tokens=config.num_reg_class_tokens,
             image_timestep_tokens=config.num_image_timestep_tokens,
             image_class_tokens=config.num_image_class_tokens,
+        )
+        self.repa_encoder_layout = DDTTokenLayout(
+            reg_data_tokens=reg_tokens,
+            image_data_tokens=self.grid_size**2,
+            reg_timestep_tokens=config.num_reg_timestep_tokens,
+            reg_class_tokens=config.num_reg_class_tokens,
+            image_timestep_tokens=config.num_image_timestep_tokens,
+            image_class_tokens=config.num_image_class_tokens,
+            repa_stream_tokens=(
+                repa_stream_config.num_tokens
+                if repa_stream_config.enabled
+                else 0
+            ),
         )
         self.decoder_layout = DDTTokenLayout(
             reg_data_tokens=reg_tokens,
@@ -112,14 +126,29 @@ class DDT(nn.Module):
                     config.num_heads,
                     config.mlp_ratio,
                     grid_size=self.grid_size,
-                    layout=self.encoder_layout,
+                    layout=(
+                        self.repa_encoder_layout
+                        if (
+                            repa_stream_config.enabled
+                            and index > repa_config.block
+                        )
+                        else self.encoder_layout
+                    ),
                     reg_pool_size=reg_pool_size,
+                    repa_pool_size=(
+                        repa_stream_config.pool_size
+                        if (
+                            repa_stream_config.enabled
+                            and index > repa_config.block
+                        )
+                        else None
+                    ),
                     spatial_reg_rope=spatial_reg_rope,
                     attention_mode=attention_mode,
                     reg_lora=reg_lora,
                     fused_mlp=config.fused_mlp,
                 )
-                for _ in range(config.depth)
+                for index in range(1, config.depth + 1)
             ]
         )
         self.context_projection: nn.Module = (
@@ -136,6 +165,7 @@ class DDT(nn.Module):
                     grid_size=self.grid_size,
                     layout=self.decoder_layout,
                     reg_pool_size=reg_pool_size,
+                    repa_pool_size=None,
                     spatial_reg_rope=spatial_reg_rope,
                     attention_mode=attention_mode,
                     reg_lora=reg_lora,
@@ -180,6 +210,11 @@ class DDT(nn.Module):
                 feature_dim,
             )
             if repa_config.enabled
+            else None
+        )
+        self.repa_stream_projection = (
+            nn.Linear(feature_dim, config.hidden_size)
+            if repa_stream_config.enabled
             else None
         )
         self.gradient_checkpointing = config.gradient_checkpointing
@@ -369,9 +404,12 @@ class DDT(nn.Module):
                 ]
             if (
                 not reg_stream
-                and return_repa
                 and self.repa_projection is not None
                 and index == self.config.features.repa.block
+                and (
+                    return_repa
+                    or self.config.features.repa.repa_stream.enabled
+                )
             ):
                 repa_states = (
                     self.encoder_layout.gather_data(sequence)
@@ -383,8 +421,59 @@ class DDT(nn.Module):
                         :, self.encoder_layout.image_data
                     ]
                 )
-                repa = self.repa_projection(repa_states)
+                repa_prediction = self.repa_projection(repa_states)
+                if return_repa:
+                    repa = repa_prediction
+                if self.config.features.repa.repa_stream.enabled:
+                    sequence = self._inject_repa_stream(
+                        sequence,
+                        repa_prediction,
+                    )
         return sequence, early_reg_state, repa
+
+    def _inject_repa_stream(
+        self,
+        sequence: Tensor,
+        repa_prediction: Tensor,
+    ) -> Tensor:
+        repa_config = self.config.features.repa
+        repa_stream = repa_config.repa_stream
+        if (
+            not repa_stream.enabled
+            or self.repa_stream_projection is None
+        ):
+            raise RuntimeError("REPA stream projection is not configured")
+        image_tokens = self.encoder_layout.image_data_tokens
+        image_repa = repa_prediction[:, -image_tokens:]
+        normalized = F.normalize(image_repa.float(), dim=-1)
+        normalized = normalized.transpose(1, 2).reshape(
+            normalized.shape[0],
+            normalized.shape[2],
+            self.grid_size,
+            self.grid_size,
+        )
+        pooled = F.interpolate(
+            normalized,
+            size=(repa_stream.pool_size, repa_stream.pool_size),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+        pooled = pooled.flatten(2).transpose(1, 2)
+        pooled = F.normalize(pooled, dim=-1)
+        semantic = self.repa_stream_projection(
+            pooled.to(self.repa_stream_projection.weight.dtype)
+        )
+        layout = self.encoder_layout
+        return self.repa_encoder_layout.pack(
+            reg_data=sequence[:, layout.reg_data],
+            image_data=sequence[:, layout.image_data],
+            repa_stream=semantic,
+            reg_timestep=sequence[:, layout.reg_timestep],
+            reg_class=sequence[:, layout.reg_class],
+            image_timestep=sequence[:, layout.image_timestep],
+            image_class=sequence[:, layout.image_class],
+        )
 
     def _decode_reg(
         self,

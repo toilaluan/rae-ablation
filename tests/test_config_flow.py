@@ -58,6 +58,8 @@ def test_required_presets_load() -> None:
     assert not paper.model.features.reg.lora.mlp
     assert paper.sampling.reg_guidance_scale == pytest.approx(1.78)
     assert paper.model.features.repa.token_scope == "image_and_reg"
+    assert paper.model.features.repa.repa_stream.enabled
+    assert paper.model.features.repa.repa_stream.pool_size == 4
     assert latent.model.input_space == "flux2_latents"
     assert latent.model.in_channels == 128
     assert latent.model.input_shape == (128, 16, 16)
@@ -269,6 +271,7 @@ def test_inactive_feature_sections_are_not_validated() -> None:
     config.train.reg_timestep_scale = -1
     config.model.features.repa.block = -1
     config.model.features.repa.token_scope = "retired"
+    config.model.features.repa.repa_stream.pool_size = -1
     config.feature_cache.enabled = True
     config.feature_cache.directory = ""
     config.feature_cache.batch_size = -1
@@ -294,6 +297,28 @@ def test_repa_full_sequence_requires_reg() -> None:
     config.model.features.repa.enabled = True
     config.model.features.repa.token_scope = "image_and_reg"
     with pytest.raises(ValueError, match="requires REG"):
+        config.validate()
+
+
+def test_repa_stream_requires_active_repa_and_a_downstream_block() -> None:
+    config = ExperimentConfig()
+    config.model.features.repa.repa_stream.enabled = True
+    with pytest.raises(ValueError, match="requires REPA"):
+        config.validate()
+
+    config.model.features.repa.enabled = True
+    config.model.features.repa.block = config.model.depth
+    with pytest.raises(ValueError, match="precede"):
+        config.validate()
+
+
+@pytest.mark.parametrize("pool_size", [0, 17, True, 1.5])
+def test_active_repa_stream_pool_must_fit_grid(pool_size: object) -> None:
+    config = ExperimentConfig()
+    config.model.features.repa.enabled = True
+    config.model.features.repa.repa_stream.enabled = True
+    config.model.features.repa.repa_stream.pool_size = pool_size  # type: ignore[assignment]
+    with pytest.raises(ValueError, match=r"repa_stream\.pool_size"):
         config.validate()
 
 
@@ -373,11 +398,13 @@ def test_structured_override_is_the_feature_selection_interface() -> None:
             "model.features.reg.enabled=true",
             "model.features.repa.enabled=true",
             "model.features.repa.token_scope=image_and_reg",
+            "model.features.repa.repa_stream.enabled=true",
             "model.decoder.depth=3",
         ],
     )
     assert config.model.features.reg.enabled
     assert config.model.features.repa.enabled
+    assert config.model.features.repa.repa_stream.enabled
     assert config.model.decoder.depth == 3
 
 

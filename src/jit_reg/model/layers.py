@@ -91,6 +91,7 @@ class DDTAttention(nn.Module):
         grid_size: int,
         layout: DDTTokenLayout,
         reg_pool_size: int | None = None,
+        repa_pool_size: int | None = None,
         spatial_reg_rope: bool = False,
         attention_mode: str = "joint",
         reg_lora: REGLoRAConfig | None = None,
@@ -115,6 +116,13 @@ class DDTAttention(nn.Module):
             raise ValueError(
                 "attention REG layout must match the REG pool"
             )
+        expected_repa = (
+            repa_pool_size**2 if repa_pool_size is not None else 0
+        )
+        if layout.repa_stream_tokens != expected_repa:
+            raise ValueError(
+                "attention REPA-stream layout must match the REPA pool"
+            )
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
@@ -131,6 +139,7 @@ class DDTAttention(nn.Module):
                 grid_size,
                 self.head_dim,
                 reg_pool_size=reg_pool_size,
+                repa_pool_size=repa_pool_size,
                 condition_tokens=layout.condition_tokens,
                 spatial_reg_rope=spatial_reg_rope,
                 dtype=dtype,
@@ -284,7 +293,7 @@ class DDTAttention(nn.Module):
 
         image_k = self.layout.gather_image_stream(k)
         image_v = self.layout.gather_image_stream(v)
-        image_data_q = q[..., self.layout.image_data, :]
+        image_data_q = self.layout.gather_image_data(q)
         image_data_attended = self._attend(
             image_data_q,
             k if image_attends_reg else image_k,
@@ -509,6 +518,7 @@ class DDTEncoderBlock(nn.Module):
         grid_size: int,
         layout: DDTTokenLayout,
         reg_pool_size: int | None,
+        repa_pool_size: int | None,
         spatial_reg_rope: bool,
         attention_mode: str,
         reg_lora: REGLoRAConfig | None,
@@ -522,6 +532,7 @@ class DDTEncoderBlock(nn.Module):
             grid_size=grid_size,
             layout=layout,
             reg_pool_size=reg_pool_size,
+            repa_pool_size=repa_pool_size,
             spatial_reg_rope=spatial_reg_rope,
             attention_mode=attention_mode,
             reg_lora=reg_lora,
@@ -561,6 +572,7 @@ class DDTDecoderBlock(nn.Module):
         grid_size: int,
         layout: DDTTokenLayout,
         reg_pool_size: int | None,
+        repa_pool_size: int | None,
         spatial_reg_rope: bool,
         attention_mode: str,
         reg_lora: REGLoRAConfig | None,
@@ -574,6 +586,7 @@ class DDTDecoderBlock(nn.Module):
             grid_size=grid_size,
             layout=layout,
             reg_pool_size=reg_pool_size,
+            repa_pool_size=repa_pool_size,
             spatial_reg_rope=spatial_reg_rope,
             attention_mode=attention_mode,
             reg_lora=reg_lora,

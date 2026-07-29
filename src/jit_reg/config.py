@@ -52,12 +52,23 @@ class REGConfig:
 
 
 @dataclass
+class REPAStreamConfig:
+    enabled: bool = False
+    pool_size: int = 4
+
+    @property
+    def num_tokens(self) -> int:
+        return self.pool_size**2
+
+
+@dataclass
 class REPAConfig:
     enabled: bool = False
     block: int = 4
     projection_hidden_size: int = 2048
     loss_weight: float = 0.5
     token_scope: str = "image"
+    repa_stream: REPAStreamConfig = field(default_factory=REPAStreamConfig)
 
 
 @dataclass
@@ -310,6 +321,26 @@ class ModelConfig:
                 raise ValueError(
                     "REPA image_and_reg token scope requires REG"
                 )
+            repa_stream = repa.repa_stream
+            if repa_stream.enabled:
+                if (
+                    not isinstance(repa_stream.pool_size, int)
+                    or isinstance(repa_stream.pool_size, bool)
+                    or not 1 <= repa_stream.pool_size <= self.grid_size
+                ):
+                    raise ValueError(
+                        "model.features.repa.repa_stream.pool_size must be an "
+                        "integer within the model grid"
+                    )
+                if repa.block >= self.depth:
+                    raise ValueError(
+                        "REPA stream requires model.features.repa.block to "
+                        "precede at least one encoder block"
+                    )
+        elif features.repa.repa_stream.enabled:
+            raise ValueError(
+                "model.features.repa.repa_stream requires REPA to be enabled"
+            )
 
 
 @dataclass

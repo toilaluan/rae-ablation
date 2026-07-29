@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Sequence
-from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -16,8 +15,8 @@ from .model.compile import compile_model_regions
 from .model.ddt import DDT
 from .rng import preserving_global_rng
 from .sample_runtime import (
-    FEATURE_SCHEMA_VERSION,
     SamplingParameters,
+    feature_schema_for_config,
     sample_to_archive,
     sampling_output_name,
     state_dict_sha256,
@@ -71,27 +70,7 @@ def validate_ema(
     reg = config.model.features.reg
     digest = state_dict_sha256(ema.state_dict()) if rank == 0 else None
     digest = broadcast_string(digest, rank)
-    feature_schema = {
-        "schema_version": FEATURE_SCHEMA_VERSION,
-        "input_space": config.model.input_space,
-        "input_shape": list(config.model.input_shape),
-        "conditioning_tokens": {
-            "image_timestep": config.model.num_image_timestep_tokens,
-            "reg_timestep": config.model.num_reg_timestep_tokens,
-            "image_class": config.model.num_image_class_tokens,
-            "reg_class": config.model.num_reg_class_tokens,
-        },
-        "vae": (
-            {
-                "model_name": config.vae.model_name,
-                "revision": config.vae.revision,
-                "subfolder": config.vae.subfolder,
-            }
-            if config.model.input_space == "flux2_latents"
-            else None
-        ),
-        **asdict(config.model.features),
-    }
+    feature_schema = feature_schema_for_config(config)
     codec = (
         load_flux2_codec(
             config.vae,

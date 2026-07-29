@@ -20,6 +20,7 @@ from jit_reg.evaluation import (
 )
 from jit_reg.sample_runtime import (
     SamplingParameters,
+    feature_schema_for_config,
     sample_to_archive,
     sampling_output_name,
 )
@@ -33,6 +34,20 @@ FEATURE_SCHEMA = {
     "reg": {"enabled": False},
     "repa": {"enabled": False},
 }
+
+
+def test_feature_schema_records_only_enabled_repa_stream() -> None:
+    config = ExperimentConfig()
+    disabled = feature_schema_for_config(config)
+    assert "repa_stream" not in disabled["repa"]
+
+    config.model.features.repa.enabled = True
+    config.model.features.repa.repa_stream.enabled = True
+    enabled = feature_schema_for_config(config)
+    assert enabled["repa"]["repa_stream"] == {
+        "enabled": True,
+        "pool_size": 4,
+    }
 
 
 def test_sampling_output_name_includes_asynchronous_reg_schedule() -> None:

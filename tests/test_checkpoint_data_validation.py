@@ -211,6 +211,8 @@ def test_current_checkpoint_config_uses_structured_defaults(
     reg.pop("join_after_block")
     reg.pop("dropout_probability")
     reg.pop("lora")
+    repa = values["model"]["features"]["repa"]
+    repa.pop("repa_stream")
     values["model"].pop("fused_mlp")
     values["model"]["decoder"].pop("mlp_ratio")
     config_path.write_text(json.dumps(values))
@@ -220,6 +222,8 @@ def test_current_checkpoint_config_uses_structured_defaults(
     assert bundle.config.model.features.reg.join_after_block == 4
     assert bundle.config.model.features.reg.dropout_probability == 0
     assert not bundle.config.model.features.reg.lora.enabled
+    assert not bundle.config.model.features.repa.repa_stream.enabled
+    assert bundle.config.model.features.repa.repa_stream.pool_size == 4
     assert not bundle.config.model.fused_mlp
     assert bundle.config.model.decoder.mlp_ratio == pytest.approx(4.0)
 
@@ -285,6 +289,7 @@ def test_required_preset_shapes_run_one_training_step(
                 "model.features.reg.internal_guidance_block=1",
                 "model.features.reg.join_after_block=1",
                 "model.features.repa.block=1",
+            "model.features.repa.repa_stream.pool_size=2",
             "model.features.repa.projection_hidden_size=16",
             "compile.enabled=false",
             "train.optimizer.kind=adamw",

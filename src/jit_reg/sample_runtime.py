@@ -8,7 +8,7 @@ import shutil
 import time
 import zipfile
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,7 @@ import torch
 from PIL import Image, ImageDraw
 from torch import Tensor
 
+from .config import ExperimentConfig
 from .objective import denoising_step_bounds
 from .validation import ValidationPlan
 
@@ -80,6 +81,35 @@ class SamplingParameters:
 GenerateBatch = Callable[[Tensor, Tensor, Tensor], Tensor]
 SAMPLING_MANIFEST_SCHEMA_VERSION = 16
 FEATURE_SCHEMA_VERSION = 9
+
+
+def feature_schema_for_config(config: ExperimentConfig) -> dict[str, Any]:
+    """Describe model features while preserving disabled schema-v9 manifests."""
+    features = asdict(config.model.features)
+    repa_stream = features["repa"].get("repa_stream")
+    if isinstance(repa_stream, dict) and not repa_stream.get("enabled"):
+        features["repa"].pop("repa_stream")
+    return {
+        "schema_version": FEATURE_SCHEMA_VERSION,
+        "input_space": config.model.input_space,
+        "input_shape": list(config.model.input_shape),
+        "conditioning_tokens": {
+            "image_timestep": config.model.num_image_timestep_tokens,
+            "reg_timestep": config.model.num_reg_timestep_tokens,
+            "image_class": config.model.num_image_class_tokens,
+            "reg_class": config.model.num_reg_class_tokens,
+        },
+        "vae": (
+            {
+                "model_name": config.vae.model_name,
+                "revision": config.vae.revision,
+                "subfolder": config.vae.subfolder,
+            }
+            if config.model.input_space == "flux2_latents"
+            else None
+        ),
+        **features,
+    }
 
 
 def _float_slug(value: float) -> str:

@@ -159,8 +159,10 @@ class ClassTokenEmbedder(nn.Module):
 class DDTTokenLayout:
     """Immutable authority for the canonical DDT token sequence.
 
-    The full order is ``[REG data, image data, REG timestep, REG class,
-    image timestep, image class]``.
+    The full order is ``[REG data, image data, REPA stream, REG timestep,
+    REG class, image timestep, image class]``. ``repa_stream_tokens`` is
+    declared last to preserve the positional constructor used by schema-v9
+    callers.
     """
 
     reg_data_tokens: int
@@ -169,6 +171,7 @@ class DDTTokenLayout:
     reg_class_tokens: int = 0
     image_timestep_tokens: int = 0
     image_class_tokens: int = 0
+    repa_stream_tokens: int = 0
 
     def __post_init__(self) -> None:
         for name, count in (
@@ -178,6 +181,7 @@ class DDTTokenLayout:
             ("reg_class_tokens", self.reg_class_tokens),
             ("image_timestep_tokens", self.image_timestep_tokens),
             ("image_class_tokens", self.image_class_tokens),
+            ("repa_stream_tokens", self.repa_stream_tokens),
         ):
             if (
                 not isinstance(count, int)
@@ -204,9 +208,16 @@ class DDTTokenLayout:
         )
 
     @property
-    def reg_timestep(self) -> slice:
+    def repa_stream(self) -> slice:
         return self._slice(
             self.image_data.stop,
+            self.repa_stream_tokens,
+        )
+
+    @property
+    def reg_timestep(self) -> slice:
+        return self._slice(
+            self.repa_stream.stop,
             self.reg_timestep_tokens,
         )
 
@@ -237,7 +248,11 @@ class DDTTokenLayout:
 
     @property
     def data_tokens(self) -> int:
-        return self.reg_data_tokens + self.image_data_tokens
+        return (
+            self.reg_data_tokens
+            + self.image_data_tokens
+            + self.repa_stream_tokens
+        )
 
     @property
     def condition_tokens(self) -> int:
@@ -255,6 +270,7 @@ class DDTTokenLayout:
     def image_stream_tokens(self) -> int:
         return (
             self.image_data_tokens
+            + self.repa_stream_tokens
             + self.image_timestep_tokens
             + self.image_class_tokens
         )
@@ -267,6 +283,7 @@ class DDTTokenLayout:
     def image_stream_slices(self) -> tuple[slice, ...]:
         return (
             self.image_data,
+            self.repa_stream,
             self.image_timestep,
             self.image_class,
         )
@@ -314,7 +331,14 @@ class DDTTokenLayout:
             (self.image_timestep, self.image_class),
         )
 
+    def gather_image_data(self, x: Tensor) -> Tensor:
+        return self._gather(
+            x,
+            (self.image_data, self.repa_stream),
+        )
+
     def gather_data(self, x: Tensor) -> Tensor:
+        """Gather prediction-bearing REG and image data, excluding REPA memory."""
         return self._gather(x, self.data_slices)
 
     def pack(
@@ -326,10 +350,12 @@ class DDTTokenLayout:
         reg_class: Tensor | None = None,
         image_timestep: Tensor | None = None,
         image_class: Tensor | None = None,
+        repa_stream: Tensor | None = None,
     ) -> Tensor:
         values = (
             ("reg_data", self.reg_data_tokens, reg_data),
             ("image_data", self.image_data_tokens, image_data),
+            ("repa_stream", self.repa_stream_tokens, repa_stream),
             (
                 "reg_timestep",
                 self.reg_timestep_tokens,
@@ -393,18 +419,22 @@ class DDTTokenLayout:
         reg_data_end = self.reg_data_tokens
         reg_time_end = reg_data_end + self.reg_timestep_tokens
         image_data_end = self.image_data_tokens
+        repa_stream_end = image_data_end + self.repa_stream_tokens
         image_time_end = (
-            image_data_end + self.image_timestep_tokens
+            repa_stream_end + self.image_timestep_tokens
         )
         return self.pack(
             reg_data=reg_stream[..., :reg_data_end, :],
             image_data=image_stream[..., :image_data_end, :],
+            repa_stream=image_stream[
+                ..., image_data_end:repa_stream_end, :
+            ],
             reg_timestep=reg_stream[
                 ..., reg_data_end:reg_time_end, :
             ],
             reg_class=reg_stream[..., reg_time_end:, :],
             image_timestep=image_stream[
-                ..., image_data_end:image_time_end, :
+                ..., repa_stream_end:image_time_end, :
             ],
             image_class=image_stream[..., image_time_end:, :],
         )
