@@ -13,7 +13,10 @@ from jit_reg.objective import (
     jit_losses,
     local_denoising_schedule,
     noisy_interpolate,
+    sample_normal,
     sample_timesteps,
+    shift_timestep,
+    shift_timestep_by_logit,
 )
 from jit_reg.reg import (
     FeatureTargets,
@@ -85,18 +88,35 @@ def test_negative_cosine_repa_loss() -> None:
     assert negative_cosine_repa_loss(target, target) == pytest.approx(-1.0)
 
 
-def test_independent_reg_timing_is_deterministic() -> None:
+def test_reg_timing_is_deterministically_coupled_to_image_time() -> None:
     image_time = sample_timesteps(
         8, torch.Generator().manual_seed(7), "cpu", loc=-0.8, scale=0.8
     )
-    first = sample_timesteps(
+    first_shift = sample_normal(
         8, torch.Generator().manual_seed(11), "cpu", loc=-0.8, scale=0.8
     )
-    second = sample_timesteps(
+    second_shift = sample_normal(
         8, torch.Generator().manual_seed(11), "cpu", loc=-0.8, scale=0.8
     )
+    first = shift_timestep_by_logit(image_time, first_shift)
+    second = shift_timestep_by_logit(image_time, second_shift)
+    assert torch.equal(first_shift, second_shift)
     assert torch.equal(first, second)
-    assert not torch.equal(first, image_time)
+    assert torch.allclose(
+        first,
+        torch.sigmoid(torch.logit(image_time) + first_shift),
+    )
+
+
+def test_logit_reg_shifts_have_identity_and_direction() -> None:
+    image_time = torch.tensor([0.2, 0.5, 0.8])
+    identity = shift_timestep(image_time, torch.ones_like(image_time))
+    earlier = shift_timestep(image_time, torch.full_like(image_time, torch.exp(torch.tensor(-1))))
+    later = shift_timestep(image_time, torch.full_like(image_time, torch.exp(torch.tensor(1))))
+    assert torch.equal(identity, image_time)
+    assert torch.all(earlier < image_time)
+    assert torch.all(later > image_time)
+    assert torch.all((earlier > 0) & (later < 1))
 
 
 def test_denoising_intervals_quantize_and_freeze_local_clocks() -> None:

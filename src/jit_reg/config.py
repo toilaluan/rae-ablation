@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 9
+CONFIG_SCHEMA_VERSION = 10
 
 FLUX2_SPATIAL_COMPRESSION = 16
 FLUX2_LATENT_CHANNELS = 128
@@ -376,8 +376,8 @@ class TrainConfig:
     seed: int = 0
     timestep_loc: float = 0.0
     timestep_scale: float = 1.0
-    reg_timestep_loc: float = 0.0
-    reg_timestep_scale: float = 1.0
+    reg_shift_loc: float = 0.0
+    reg_shift_scale: float = 1.0
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
 
@@ -520,14 +520,14 @@ class ExperimentConfig:
         if not math.isfinite(self.train.timestep_scale) or self.train.timestep_scale <= 0:
             raise ValueError("train.timestep_scale must be finite and positive")
         if features.reg.enabled:
-            if not math.isfinite(self.train.reg_timestep_loc):
-                raise ValueError("train.reg_timestep_loc must be finite")
+            if not math.isfinite(self.train.reg_shift_loc):
+                raise ValueError("train.reg_shift_loc must be finite")
             if (
-                not math.isfinite(self.train.reg_timestep_scale)
-                or self.train.reg_timestep_scale <= 0
+                not math.isfinite(self.train.reg_shift_scale)
+                or self.train.reg_shift_scale <= 0
             ):
                 raise ValueError(
-                    "train.reg_timestep_scale must be finite and positive"
+                    "train.reg_shift_scale must be finite and positive"
                 )
         if features.enabled:
             if not self.feature_cache.directory:

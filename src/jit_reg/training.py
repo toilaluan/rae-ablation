@@ -19,7 +19,9 @@ from .model.tokens import classifier_free_labels
 from .objective import (
     jit_losses,
     noisy_interpolate,
+    sample_normal,
     sample_timesteps,
+    shift_timestep_by_logit,
 )
 from .optim import CompositeOptimizer, learning_rate_at_epoch, set_learning_rate
 from .reg import (
@@ -513,6 +515,7 @@ def train(
             targets = None
             reg_noise = None
             noisy_reg = None
+            reg_shifts = None
             reg_timesteps = None
             if feature_cache is not None:
                 if cached_targets is None:
@@ -540,12 +543,16 @@ def train(
                     targets, config.model.features.reg.target_std
                 )
             if targets is not None and targets.reg is not None:
-                reg_timesteps = sample_timesteps(
+                reg_shifts = sample_normal(
                     clean.shape[0],
-                    streams.reg_timesteps,
+                    streams.reg_shifts,
                     device,
-                    loc=config.train.reg_timestep_loc,
-                    scale=config.train.reg_timestep_scale,
+                    loc=config.train.reg_shift_loc,
+                    scale=config.train.reg_shift_scale,
+                )
+                reg_timesteps = shift_timestep_by_logit(
+                    timesteps,
+                    reg_shifts,
                 )
                 reg_noise = torch.randn(
                     targets.reg.shape,
@@ -671,6 +678,11 @@ def train(
                 "train/reg_timestep_mean": (
                     reg_timesteps.mean().item()
                     if reg_timesteps is not None
+                    else 0.0
+                ),
+                "train/reg_shift_mean": (
+                    reg_shifts.mean().item()
+                    if reg_shifts is not None
                     else 0.0
                 ),
                 "train/lr": lr,

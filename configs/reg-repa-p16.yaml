@@ -1,4 +1,4 @@
-schema_version: 9
+schema_version: 10
 data:
   repository: benjamin-paine/imagenet-1k-256x256
   revision: 1bd0400450249a7fe90c0aece37d0d03e7ea956a
@@ -74,8 +74,8 @@ train:
   seed: 0
   timestep_loc: -0.8
   timestep_scale: 0.8
-  reg_timestep_loc: -0.8
-  reg_timestep_scale: 0.8
+  reg_shift_loc: -0.8
+  reg_shift_scale: 0.8
   optimizer:
     kind: muon
     lr: 0.0002

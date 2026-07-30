@@ -16,7 +16,7 @@ def test_required_presets_load() -> None:
     baseline = load_config(ROOT / "configs/baseline-p16.yaml")
     paper = load_config(ROOT / "configs/reg-repa-p16.yaml")
     latent = load_config(ROOT / "configs/latent-baseline-p16.yaml")
-    assert baseline.schema_version == paper.schema_version == latent.schema_version == 9
+    assert baseline.schema_version == paper.schema_version == latent.schema_version == 10
     assert (
         baseline.train.optimizer.kind
         == paper.train.optimizer.kind
@@ -266,7 +266,7 @@ def test_inactive_feature_sections_are_not_validated() -> None:
     config.model.features.encoder.feature_dim = -1
     config.model.features.reg.target_std = -1
     config.model.features.reg.internal_guidance_block = -1
-    config.train.reg_timestep_scale = -1
+    config.train.reg_shift_scale = -1
     config.model.features.repa.block = -1
     config.model.features.repa.token_scope = "retired"
     config.feature_cache.enabled = True
@@ -279,7 +279,7 @@ def test_active_sections_validate_only_their_own_fields() -> None:
     repa_only = ExperimentConfig()
     repa_only.model.features.repa.enabled = True
     repa_only.model.features.reg.target_std = -1
-    repa_only.train.reg_timestep_scale = -1
+    repa_only.train.reg_shift_scale = -1
     repa_only.validate()
 
     reg_only = ExperimentConfig()
@@ -287,6 +287,29 @@ def test_active_sections_validate_only_their_own_fields() -> None:
     reg_only.model.features.repa.block = -1
     reg_only.model.features.repa.token_scope = "irrelevant"
     reg_only.validate()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("reg_shift_loc", float("inf"), "reg_shift_loc"),
+        ("reg_shift_loc", float("nan"), "reg_shift_loc"),
+        ("reg_shift_scale", 0.0, "reg_shift_scale"),
+        ("reg_shift_scale", -1.0, "reg_shift_scale"),
+        ("reg_shift_scale", float("inf"), "reg_shift_scale"),
+        ("reg_shift_scale", float("nan"), "reg_shift_scale"),
+    ],
+)
+def test_active_reg_shift_distribution_validates(
+    field: str,
+    value: float,
+    message: str,
+) -> None:
+    config = ExperimentConfig()
+    config.model.features.reg.enabled = True
+    setattr(config.train, field, value)
+    with pytest.raises(ValueError, match=message):
+        config.validate()
 
 
 def test_repa_full_sequence_requires_reg() -> None:
@@ -308,15 +331,22 @@ def test_clean_break_rejects_old_and_unknown_configs(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="cannot be migrated"):
         load_checkpoint_config(old_checkpoint)
 
-    schema_v8 = tmp_path / "schema-v8.yaml"
-    schema_v8.write_text("schema_version: 8\n")
-    with pytest.raises(ValueError, match="schema_version: 9"):
-        load_config(schema_v8)
+    schema_v9 = tmp_path / "schema-v9.yaml"
+    schema_v9.write_text("schema_version: 9\n")
+    with pytest.raises(ValueError, match="schema_version: 10"):
+        load_config(schema_v9)
 
     unknown = tmp_path / "unknown.yaml"
-    unknown.write_text("schema_version: 9\nretired_experiment: true\n")
-    with pytest.raises(ValueError, match="invalid schema-v9"):
+    unknown.write_text("schema_version: 10\nretired_experiment: true\n")
+    with pytest.raises(ValueError, match="invalid schema-v10"):
         load_config(unknown)
+
+    retired = tmp_path / "retired-reg-timing.yaml"
+    retired.write_text(
+        "schema_version: 10\ntrain:\n  reg_timestep_loc: 0.0\n"
+    )
+    with pytest.raises(ValueError, match="reg_timestep_loc"):
+        load_config(retired)
 
 
 def test_sampling_intervals_and_reg_shift_candidates_validate() -> None:

@@ -23,7 +23,7 @@ class JiTLoss(NamedTuple):
     reg_early_x0_cosine: Tensor
 
 
-def sample_timesteps(
+def sample_normal(
     batch_size: int,
     generator: torch.Generator,
     device: torch.device | str,
@@ -32,7 +32,24 @@ def sample_timesteps(
     scale: float = 1.0,
 ) -> Tensor:
     normal = torch.randn(batch_size, generator=generator, device=device, dtype=torch.float32)
-    return (loc + scale * normal).sigmoid()
+    return loc + scale * normal
+
+
+def sample_timesteps(
+    batch_size: int,
+    generator: torch.Generator,
+    device: torch.device | str,
+    *,
+    loc: float = 0.0,
+    scale: float = 1.0,
+) -> Tensor:
+    return sample_normal(
+        batch_size,
+        generator,
+        device,
+        loc=loc,
+        scale=scale,
+    ).sigmoid()
 
 
 def denoising_step_bounds(
@@ -202,3 +219,7 @@ def jit_losses(
 
 def shift_timestep(u: Tensor, alpha: float | Tensor) -> Tensor:
     return alpha * u / (1 + (alpha - 1) * u)
+
+
+def shift_timestep_by_logit(u: Tensor, delta: Tensor) -> Tensor:
+    return shift_timestep(u, delta.exp())

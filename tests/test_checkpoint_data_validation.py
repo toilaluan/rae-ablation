@@ -159,12 +159,12 @@ def test_best_fid_metadata_tracks_reg_timestep_shift(tmp_path: Path) -> None:
     }
 
 
-def test_v9_checkpoint_bundle_and_training_resume(tmp_path: Path) -> None:
+def test_v10_checkpoint_bundle_and_training_resume(tmp_path: Path) -> None:
     manager, checkpoint, model = save_checkpoint(tmp_path)
     metadata = json.loads((checkpoint / "metadata.json").read_text())
-    assert metadata["schema_version"] == 9
+    assert metadata["schema_version"] == 10
     training = torch.load(checkpoint / "training.pt", weights_only=False)
-    assert training["schema_version"] == 9
+    assert training["schema_version"] == 10
     restored = DDT(model.config)
     resumed = manager.load(
         checkpoint,
@@ -176,7 +176,7 @@ def test_v9_checkpoint_bundle_and_training_resume(tmp_path: Path) -> None:
     assert resumed.epoch == 1
     bundle = load_checkpoint_bundle(tmp_path / "checkpoints")
     assert bundle.directory == checkpoint.resolve()
-    assert bundle.config.schema_version == 9
+    assert bundle.config.schema_version == 10
 
 
 def test_old_training_resume_is_rejected_before_model_mutation(
@@ -191,7 +191,7 @@ def test_old_training_resume_is_rejected_before_model_mutation(
     before = {
         name: value.detach().clone() for name, value in restored.state_dict().items()
     }
-    with pytest.raises(ValueError, match="incompatible with schema v9"):
+    with pytest.raises(ValueError, match="incompatible with schema v10"):
         manager.load(checkpoint, restored, EMA(restored))
     assert all(
         torch.equal(value, before[name])
@@ -236,16 +236,16 @@ def test_old_checkpoint_schema_is_explicitly_rejected(tmp_path: Path) -> None:
         load_checkpoint_bundle(checkpoint)
 
 
-def test_rng_streams_checkpoint_independent_reg_timing() -> None:
+def test_rng_streams_checkpoint_reg_shifts() -> None:
     streams = RNGStreams.create(12)
     saved = streams.state_dict()
-    first = torch.rand(5, generator=streams.reg_timesteps)
+    first = torch.randn(5, generator=streams.reg_shifts)
     streams.load_state_dict(saved)
-    second = torch.rand(5, generator=streams.reg_timesteps)
+    second = torch.randn(5, generator=streams.reg_shifts)
     assert torch.equal(first, second)
     old = dict(saved)
-    old.pop("reg_timesteps")
-    with pytest.raises(ValueError, match="incompatible with schema v9"):
+    old.pop("reg_shifts")
+    with pytest.raises(ValueError, match="incompatible with schema v10"):
         streams.load_state_dict(old)
 
 
@@ -349,6 +349,7 @@ def test_required_preset_shapes_run_one_training_step(
     assert (Path(config.checkpoint.directory) / "epoch-0001").is_dir()
     logged_names = {name for metrics in logger.metrics for name in metrics}
     assert {
+        "train/reg_shift_mean",
         "throughput/data_wait_seconds",
         "throughput/host_batch_seconds",
         "throughput/optimizer_host_seconds",

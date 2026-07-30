@@ -17,7 +17,7 @@ class RNGStreams:
     noise: torch.Generator
     label_dropout: torch.Generator
     reg_noise: torch.Generator
-    reg_timesteps: torch.Generator
+    reg_shifts: torch.Generator
 
     @classmethod
     def create(cls, seed: int, device: str | torch.device = "cpu") -> RNGStreams:
@@ -28,7 +28,7 @@ class RNGStreams:
         noise = torch.Generator(device=device).manual_seed(seed + offsets[3])
         label_dropout = torch.Generator(device=device).manual_seed(seed + offsets[4])
         reg_noise = torch.Generator(device=device).manual_seed(seed + offsets[5])
-        reg_timesteps = torch.Generator(device=device).manual_seed(seed + offsets[6])
+        reg_shifts = torch.Generator(device=device).manual_seed(seed + offsets[6])
         return cls(
             shuffle,
             initialization,
@@ -36,7 +36,7 @@ class RNGStreams:
             noise,
             label_dropout,
             reg_noise,
-            reg_timesteps,
+            reg_shifts,
         )
 
     def state_dict(self) -> dict[str, torch.Tensor]:
@@ -47,14 +47,14 @@ class RNGStreams:
             "noise": self.noise.get_state(),
             "label_dropout": self.label_dropout.get_state(),
             "reg_noise": self.reg_noise.get_state(),
-            "reg_timesteps": self.reg_timesteps.get_state(),
+            "reg_shifts": self.reg_shifts.get_state(),
         }
 
     def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
         expected = set(self.state_dict())
         if set(state) != expected:
             raise ValueError(
-                "checkpoint RNG streams are incompatible with schema v9; "
+                "checkpoint RNG streams are incompatible with schema v10; "
                 f"expected {sorted(expected)}"
             )
         for name, value in state.items():

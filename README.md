@@ -6,9 +6,9 @@ denoises DINOv3 representation tokens, while REPA aligns an intermediate DDT
 sequence with frozen DINOv3 targets. Pixel/latent input and REG/REPA are
 independent choices.
 
-This repository uses configuration schema v9. Older configs, checkpoints,
-training states, and sampling manifests are intentionally incompatible.
-Schema-v3 REG/REPA caches remain reusable.
+This repository uses configuration schema v10. Older configs, checkpoints,
+and training states are intentionally incompatible. Schema-v3 REG/REPA caches,
+schema-v1 latent caches, and schema-v16 sampling manifests remain reusable.
 
 | Input space | Diffusion tensor | `model.patch_size` | DDT grid |
 | --- | ---: | ---: | ---: |
@@ -357,7 +357,7 @@ Run any command with `--help` for its concise parser-generated reference.
 
 | Argument | Type/default | Description |
 | --- | --- | --- |
-| `--config` | path; `configs/latent-baseline-p16.yaml` | Schema-v9 latent experiment configuration. The input space must be `flux2_latents`. |
+| `--config` | path; `configs/latent-baseline-p16.yaml` | Schema-v10 latent experiment configuration. The input space must be `flux2_latents`. |
 | `--override KEY=VALUE` | repeatable; none | Structured configuration override. Common cache controls are `data.max_samples`, `data.workers`, `vae.micro_batch_size`, `vae.cache.directory`, `vae.cache.batch_size`, and `vae.cache.log_interval`. |
 
 The command writes under `vae.cache.directory/<fingerprint>` and never
@@ -367,7 +367,7 @@ overwrites an incompatible cache.
 
 | Argument | Type/default | Description |
 | --- | --- | --- |
-| `--config` | path; `configs/baseline-p16.yaml` | Schema-v9 experiment configuration. REG or REPA must be enabled. |
+| `--config` | path; `configs/baseline-p16.yaml` | Schema-v10 experiment configuration. REG or REPA must be enabled. |
 | `--override KEY=VALUE` | repeatable; none | Structured override controlling active components, dataset limits, cache directory, batch size, logging, or preprocessing identity. |
 
 The command writes independent `reg/<fingerprint>` and `repa/<fingerprint>`
@@ -377,7 +377,7 @@ components beneath `feature_cache.directory`.
 
 | Argument | Type/default | Description |
 | --- | --- | --- |
-| `--config` | path; `configs/baseline-p16.yaml` | Schema-v9 experiment configuration. |
+| `--config` | path; `configs/baseline-p16.yaml` | Schema-v10 experiment configuration. |
 | `--override KEY=VALUE` | repeatable; none | Structured override applied before final validation. |
 | `--output` | path; none | Run root. Rewrites checkpoint and validation-plan paths beneath this directory. Without it, configured paths are used directly. |
 | `--resume` | checkpoint path; none | Resume model, EMA, optimizer, RNG streams, epoch/step, validation state, and cache identities from a compatible checkpoint directory. |
@@ -458,9 +458,9 @@ embeddings provide token-aligned decoder conditioning.
 ## Feature configuration
 
 REG and REPA remain configured under `model.features`. REG predicts clean
-DINOv3 tokens and has its own time distribution. REPA aligns an intermediate
-DDT encoder sequence with frozen targets and can cover image tokens or image plus REG
-tokens.
+DINOv3 tokens with a clock coupled to the image timestep. REPA aligns an
+intermediate DDT encoder sequence with frozen targets and can cover image
+tokens or image plus REG tokens.
 
 ```yaml
 model:
@@ -491,9 +491,13 @@ In asymmetric mode, REG data and both conditioning streams remain private.
 Image data begins attending REG after `join_after_block`; REG dropout keeps
 image queries isolated in both the encoder and decoder.
 
-Image/latent and REG times are independent sigmoid-normal draws. Sampling uses
-one global solver loop with independent local clocks and quantized denoising
-intervals. Image CFG uses class-conditional and null-class image predictions
-inside its configured window. REG instead uses early and final
-class-conditional REG predictions throughout the REG denoising interval;
+During training, image/latent times are sigmoid-normal draws. Each example then
+draws `delta ~ N(train.reg_shift_loc, train.reg_shift_scale^2)` and sets
+`t_reg = sigmoid(logit(t_image) + delta)`. The standard presets use
+`reg_shift_loc: -0.8` and `reg_shift_scale: 0.8`.
+
+Sampling uses one global solver loop with independent local clocks and
+quantized denoising intervals. Image CFG uses class-conditional and null-class
+image predictions inside its configured window. REG instead uses early and
+final class-conditional REG predictions throughout the REG denoising interval;
 null-class REG predictions are ignored.
