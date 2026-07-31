@@ -7,7 +7,7 @@ sequence with frozen DINOv3 targets. Pixel/latent input and REG/REPA are
 independent choices.
 
 This repository uses configuration schema v10. Older configs, checkpoints,
-and training states are intentionally incompatible. Schema-v3 REG/REPA caches,
+and training states are intentionally incompatible. Schema-v4 REG/REPA caches,
 schema-v1 latent caches, and schema-v16 sampling manifests remain reusable.
 
 | Input space | Diffusion tensor | `model.patch_size` | DDT grid |

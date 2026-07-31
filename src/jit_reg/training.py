@@ -13,6 +13,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from .checkpoint import EMA, CheckpointManager, should_checkpoint
 from .config import ExperimentConfig
+from .data import prepare_pixels
 from .feature_cache import FeatureCache
 from .latent_cache import LatentCache
 from .model.tokens import classifier_free_labels
@@ -52,23 +53,6 @@ class TrainBatch(NamedTuple):
     indices: Tensor
     cached_latents: Tensor | None
     cached_targets: FeatureTargets | None
-
-
-def _prepare_pixels(
-    pixels: Tensor,
-    device: torch.device,
-    *,
-    non_blocking: bool,
-) -> Tensor:
-    source_is_uint8 = pixels.dtype == torch.uint8
-    pixels = pixels.to(
-        device=device,
-        dtype=torch.float32,
-        non_blocking=non_blocking,
-    )
-    if source_is_uint8:
-        pixels.div_(255)
-    return pixels
 
 
 def prepare_train_batch(
@@ -115,7 +99,7 @@ def prepare_train_batch(
     )
     return TrainBatch(
         (
-            _prepare_pixels(batch.pixels, device, non_blocking=non_blocking)
+            prepare_pixels(batch.pixels, device, non_blocking=non_blocking)
             if batch.pixels is not None
             else None
         ),

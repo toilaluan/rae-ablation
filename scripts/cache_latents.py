@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from jit_reg.config import load_config
-from jit_reg.data import load_imagenet
+from jit_reg.data import load_imagenet, prepare_pixels
 from jit_reg.distributed import initialize_distributed
 from jit_reg.latent_cache import (
     AsyncLatentCacheWriter,
@@ -108,11 +108,11 @@ def main() -> None:
                 pixels, _labels, indices = batch
                 buffer = pipeline.acquire_buffer()
                 try:
-                    pixels = pixels.to(
-                        device=device,
-                        dtype=torch.float32,
+                    pixels = prepare_pixels(
+                        pixels,
+                        device,
                         non_blocking=True,
-                    ).div_(255)
+                    )
                     latents = codec.encode(pixels)
                 except BaseException:
                     pipeline.release_buffer(buffer)

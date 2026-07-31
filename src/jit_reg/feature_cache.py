@@ -24,7 +24,7 @@ from .reg import FeatureTargets
 
 Component = Literal["reg", "repa"]
 
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
 VALUES_FILE = "values.bf16"
 COMPLETION_FILE = "completion.u8"
 MANIFEST_FILE = "manifest.json"

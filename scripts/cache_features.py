@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from jit_reg.config import load_config
-from jit_reg.data import load_imagenet
+from jit_reg.data import load_imagenet, prepare_pixels
 from jit_reg.distributed import initialize_distributed
 from jit_reg.feature_cache import (
     AsyncFeatureCacheWriter,
@@ -150,7 +150,11 @@ def main() -> None:
                         gpu_finished = torch.cuda.Event(enable_timing=True)
                         gpu_started.record()
                     try:
-                        pixels = pixels.to(device, non_blocking=True)
+                        pixels = prepare_pixels(
+                            pixels,
+                            device,
+                            non_blocking=True,
+                        )
                         with torch.autocast(
                             device.type,
                             dtype=torch.bfloat16,

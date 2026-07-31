@@ -5,7 +5,7 @@ import pytest
 import torch
 from PIL import Image
 
-from jit_reg.data import ImageNetDataset
+from jit_reg.data import ImageNetDataset, prepare_pixels
 from jit_reg.reg import FeatureTargets
 from jit_reg.training import (
     TrainBatch,
@@ -25,6 +25,21 @@ def test_imagenet_workers_emit_chw_uint8_and_python_integers() -> None:
     assert image.dtype == torch.uint8
     assert isinstance(label, int) and label == 7
     assert isinstance(index, int) and index == 0
+
+
+def test_cache_and_online_pixel_preparation_are_identical() -> None:
+    uint8_pixels = torch.tensor(
+        [[[[0, 127, 255]]]],
+        dtype=torch.uint8,
+    )
+    online_pixels = uint8_pixels.float().div(255)
+
+    cached = prepare_pixels(uint8_pixels, "cpu")
+    online = prepare_pixels(online_pixels, "cpu")
+
+    assert cached.dtype == torch.float32
+    assert torch.equal(cached, online)
+    assert torch.equal(cached, online_pixels)
 
 
 @pytest.mark.parametrize(

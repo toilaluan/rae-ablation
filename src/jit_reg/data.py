@@ -14,6 +14,24 @@ from torch.utils.data import Dataset
 from .config import DataConfig
 
 
+def prepare_pixels(
+    pixels: Tensor,
+    device: torch.device | str,
+    *,
+    non_blocking: bool = False,
+) -> Tensor:
+    """Move image tensors to float32, scaling uint8 pixels into [0, 1]."""
+    source_is_uint8 = pixels.dtype == torch.uint8
+    prepared = pixels.to(
+        device=device,
+        dtype=torch.float32,
+        non_blocking=non_blocking,
+    )
+    if source_is_uint8:
+        prepared.div_(255)
+    return prepared
+
+
 def preprocessing_metadata(config: DataConfig, image_size: int) -> dict[str, Any]:
     return {
         "repository": config.repository,
