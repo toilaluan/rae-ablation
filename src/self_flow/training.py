@@ -16,7 +16,7 @@ from .config import ExperimentConfig
 from .data import prepare_pixels
 from .latent_cache import LatentCache
 from .model import classifier_free_labels
-from .objective import self_flow_loss
+from .objective import SelfFlowLoss, self_flow_loss
 from .optim import CompositeOptimizer, learning_rate_at_epoch, set_learning_rate
 from .rng import RNGStreams
 from .vae import Flux2Codec
@@ -32,6 +32,25 @@ class TrainState:
 
 
 ValidationCallback = Callable[[int, bool], dict[str, float]]
+
+
+def _add_optional_group_metrics(
+    metrics: dict[str, float], group_names: list[str], losses: SelfFlowLoss
+) -> None:
+    if losses.sigreg_groups:
+        for name, value in zip(group_names, losses.sigreg_groups, strict=True):
+            metrics[f"train/sigreg_{name}"] = value.item()
+    if losses.feature_mean_norms:
+        for name, mean_norm, std_mean, covariance_rms in zip(
+            group_names,
+            losses.feature_mean_norms,
+            losses.feature_std_means,
+            losses.feature_covariance_offdiag_rms,
+            strict=True,
+        ):
+            metrics[f"features/{name}_mean_norm"] = mean_norm.item()
+            metrics[f"features/{name}_std_mean"] = std_mean.item()
+            metrics[f"features/{name}_covariance_offdiag_rms"] = covariance_rms.item()
 
 
 class TrainBatch(NamedTuple):
@@ -259,18 +278,7 @@ def train(
             group_names = [f"mixed_layer_{layer}" for layer in config.objective.align_layers] + [
                 f"cleaner_layer_{layer}" for layer in config.objective.align_layers
             ]
-            for name, value in zip(group_names, losses.sigreg_groups, strict=True):
-                metrics[f"train/sigreg_{name}"] = value.item()
-            for name, mean_norm, std_mean, covariance_rms in zip(
-                group_names,
-                losses.feature_mean_norms,
-                losses.feature_std_means,
-                losses.feature_covariance_offdiag_rms,
-                strict=True,
-            ):
-                metrics[f"features/{name}_mean_norm"] = mean_norm.item()
-                metrics[f"features/{name}_std_mean"] = std_mean.item()
-                metrics[f"features/{name}_covariance_offdiag_rms"] = covariance_rms.item()
+            _add_optional_group_metrics(metrics, group_names, losses)
             logger.log_training(metrics, step=state.global_step)
             if config.train.max_steps is not None and state.global_step >= config.train.max_steps:
                 break

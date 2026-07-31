@@ -8,6 +8,7 @@ from self_flow.config import ExperimentConfig, ModelConfig, ObjectiveConfig, SIG
 from self_flow.model import SiT
 from self_flow.objective import SIGReg, self_flow_loss, token_times_to_latents
 from self_flow.rng import RNGStreams
+from self_flow.training import _add_optional_group_metrics
 
 
 def experiment(kind: str, *, clean_forward: str = "truncated") -> ExperimentConfig:
@@ -111,6 +112,35 @@ def test_sigreg_truncated_executes_shared_cleaner_only_to_alignment_depth() -> N
     assert len(loss.feature_mean_norms) == 4
     assert len(loss.feature_std_means) == 4
     assert len(loss.feature_covariance_offdiag_rms) == 4
+
+
+@pytest.mark.parametrize("kind", ["ema", "sigreg"])
+def test_optional_group_metrics_allow_non_diagnostic_steps(kind: str) -> None:
+    config = experiment(kind)
+    model = SiT(
+        config.model,
+        align_layers=config.objective.align_layers,
+        projector_hidden_size=config.objective.projector_hidden_size,
+    )
+    ema = EMA(model) if kind == "ema" else None
+    losses = self_flow_loss(
+        model,
+        torch.randn(2, 128, 2, 2),
+        torch.tensor([1, 2]),
+        RNGStreams.create(11),
+        config,
+        ema_model=ema.model if ema else None,
+        collect_diagnostics=False,
+    )
+    group_names = [f"mixed_layer_{layer}" for layer in config.objective.align_layers] + [
+        f"cleaner_layer_{layer}" for layer in config.objective.align_layers
+    ]
+    metrics: dict[str, float] = {}
+    _add_optional_group_metrics(metrics, group_names, losses)
+    assert not any(name.startswith("features/") for name in metrics)
+    assert sum(name.startswith("train/sigreg_") for name in metrics) == (
+        len(group_names) if kind == "sigreg" else 0
+    )
 
 
 def test_sigreg_is_deterministic_and_requires_local_batch_two() -> None:
