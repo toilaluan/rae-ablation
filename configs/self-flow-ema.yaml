@@ -1,0 +1,9 @@
+schema_version: 11
+objective:
+  kind: ema
+  mixed_token_probability: 0.25
+  align_layers: [4, 8]
+  alignment_weight: 0.8
+  ema_decay: 0.9999
+wandb:
+  name: self-flow-ema

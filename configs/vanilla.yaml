@@ -1,0 +1,6 @@
+schema_version: 11
+objective:
+  kind: vanilla
+  align_layers: []
+wandb:
+  name: vanilla

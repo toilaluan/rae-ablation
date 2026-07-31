@@ -8,10 +8,10 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from jit_reg.config import load_config
-from jit_reg.data import load_imagenet, prepare_pixels
-from jit_reg.distributed import initialize_distributed
-from jit_reg.latent_cache import (
+from self_flow.config import load_config
+from self_flow.data import load_imagenet, prepare_pixels
+from self_flow.distributed import initialize_distributed
+from self_flow.latent_cache import (
     AsyncLatentCacheWriter,
     LatentCacheWriter,
     latent_cache_build_lock,
@@ -19,7 +19,7 @@ from jit_reg.latent_cache import (
     latent_cache_spec,
     preflight_latent_cache_capacity,
 )
-from jit_reg.vae import load_flux2_codec
+from self_flow.vae import load_flux2_codec
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,8 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/latent-baseline-p16.yaml"),
-        help="schema-v9 latent experiment YAML",
+        default=Path("configs/vanilla.yaml"),
+        help="schema-v11 Self-Flow experiment YAML",
     )
     parser.add_argument(
         "--override",
@@ -45,8 +45,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     config = load_config(args.config, args.override)
-    if config.model.input_space != "flux2_latents":
-        raise ValueError("latent-cache building requires FLUX.2 latent input space")
     rank, world_size, device = initialize_distributed()
     dataset = load_imagenet(config.data, config.model.image_size)
     spec = latent_cache_spec(config, len(dataset))
@@ -58,9 +56,7 @@ def main() -> None:
     )
     with lock:
         if rank == 0:
-            required = preflight_latent_cache_capacity(
-                config.vae.cache.directory, spec, path
-            )
+            required = preflight_latent_cache_capacity(config.vae.cache.directory, spec, path)
             print(
                 f"latent-cache capacity preflight: {required / 2**30:.1f} GiB "
                 "additional space required",
@@ -88,18 +84,14 @@ def main() -> None:
             num_workers=config.data.workers,
             pin_memory=torch.cuda.is_available(),
             persistent_workers=config.data.workers > 0,
-            prefetch_factor=(
-                config.data.prefetch_factor if config.data.workers > 0 else None
-            ),
+            prefetch_factor=(config.data.prefetch_factor if config.data.workers > 0 else None),
         )
         codec = load_flux2_codec(
             config.vae,
             image_size=config.model.image_size,
             device=device,
         )
-        pipeline = AsyncLatentCacheWriter(
-            writer, config.vae.cache.batch_size, device
-        )
+        pipeline = AsyncLatentCacheWriter(writer, config.vae.cache.batch_size, device)
         started = time.perf_counter()
         processed = 0
         pipeline_error: Exception | None = None
@@ -119,10 +111,7 @@ def main() -> None:
                     raise
                 pipeline.submit(indices, latents, buffer=buffer)
                 processed += indices.numel()
-                if (
-                    rank == 0
-                    and batch_index % config.vae.cache.log_interval == 0
-                ):
+                if rank == 0 and batch_index % config.vae.cache.log_interval == 0:
                     metrics = pipeline.metrics()
                     elapsed = max(time.perf_counter() - started, 1e-9)
                     print(
@@ -155,9 +144,7 @@ def main() -> None:
                     raise RuntimeError(
                         f"latent-cache pipeline failed on ranks: {failed}"
                     ) from pipeline_error
-                raise RuntimeError(
-                    f"latent-cache pipeline failed on ranks: {failed}"
-                )
+                raise RuntimeError(f"latent-cache pipeline failed on ranks: {failed}")
         elif pipeline_error is not None:
             raise pipeline_error
         if world_size > 1:
@@ -166,8 +153,7 @@ def main() -> None:
             writer.finalize()
             metrics = pipeline.metrics()
             print(
-                f"latent cache complete: {path} "
-                f"({metrics.images_per_second:.1f} images/s)",
+                f"latent cache complete: {path} ({metrics.images_per_second:.1f} images/s)",
                 flush=True,
             )
 

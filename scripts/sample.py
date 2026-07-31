@@ -7,52 +7,36 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
-from jit_reg.checkpoint_bundle import load_checkpoint_bundle
-from jit_reg.distributed import broadcast_string, initialize_distributed
-from jit_reg.evaluation import evaluate_npz, save_evaluation
-from jit_reg.model.compile import compile_model_regions
-from jit_reg.model.ddt import DDT
-from jit_reg.sample_runtime import (
+from self_flow.checkpoint_bundle import load_checkpoint_bundle
+from self_flow.distributed import broadcast_string, initialize_distributed
+from self_flow.evaluation import evaluate_npz, save_evaluation
+from self_flow.model import SiT
+from self_flow.model.compile import compile_model_regions
+from self_flow.sample_runtime import (
     FEATURE_SCHEMA_VERSION,
     SamplingParameters,
     checkpoint_sha256,
     sample_to_archive,
     sampling_output_name,
 )
-from jit_reg.sampling import ODESample, ode_sample
-from jit_reg.vae import load_flux2_codec
-from jit_reg.validation import noise_for_samples
-
-torch._dynamo.config.cache_size_limit = 1000
+from self_flow.sampling import ode_sample
+from self_flow.vae import load_flux2_codec
+from self_flow.validation import noise_for_samples
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Sample a self-contained JiT checkpoint into an ADM-compatible NPZ"
-    )
+    parser = argparse.ArgumentParser(description="Sample a Self-Flow checkpoint")
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--num-samples", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--sampling-steps", type=int)
     parser.add_argument("--solver", choices=("euler", "heun"))
     parser.add_argument("--guidance-scale", type=float)
-    parser.add_argument("--reg-guidance-scale", type=float)
     parser.add_argument("--timestep-shift", type=float)
-    parser.add_argument("--reg-timestep-shift", type=float)
-    parser.add_argument(
-        "--img-denoising-interval", type=float, nargs=2, metavar=("START", "END")
-    )
-    parser.add_argument(
-        "--reg-denoising-interval", type=float, nargs=2, metavar=("START", "END")
-    )
     parser.add_argument("--cfg-start", type=float)
     parser.add_argument("--cfg-end", type=float)
     parser.add_argument("--log-interval", type=int)
-    parser.add_argument(
-        "--evaluate",
-        action="store_true",
-        help="compute FID on rank zero and write evaluation.json beside samples.npz",
-    )
+    parser.add_argument("--evaluate", action="store_true")
     parser.add_argument("--reference-npz", type=Path)
     return parser
 
@@ -66,112 +50,54 @@ def main() -> None:
     bundle = load_checkpoint_bundle(args.checkpoint_dir)
     config = bundle.config
     defaults = config.sampling
-    reg = config.model.features.reg
     sample_count = int(_value(args.num_samples, defaults.num_samples))
     parameters = SamplingParameters(
         batch_size=int(_value(args.batch_size, defaults.batch_size)),
-        sampling_steps=int(
-            _value(args.sampling_steps, defaults.sampling_steps)
-        ),
+        sampling_steps=int(_value(args.sampling_steps, defaults.sampling_steps)),
         solver=str(_value(args.solver, defaults.solver)),
-        guidance_scale=float(
-            _value(args.guidance_scale, defaults.guidance_scale)
-        ),
-        reg_guidance_scale=float(
-            _value(args.reg_guidance_scale, defaults.reg_guidance_scale)
-        ),
-        timestep_shift=float(
-            _value(args.timestep_shift, defaults.timestep_shift)
-        ),
-        reg_timestep_shift=float(
-            _value(args.reg_timestep_shift, defaults.reg_timestep_shifts[0])
-        ),
-        img_denoising_interval=tuple(
-            _value(args.img_denoising_interval, defaults.img_denoising_interval)
-        ),
-        reg_denoising_interval=tuple(
-            _value(args.reg_denoising_interval, defaults.reg_denoising_interval)
-        ),
+        guidance_scale=float(_value(args.guidance_scale, defaults.guidance_scale)),
+        timestep_shift=float(_value(args.timestep_shift, defaults.timestep_shift)),
         cfg_start=float(_value(args.cfg_start, defaults.cfg_start)),
         cfg_end=float(_value(args.cfg_end, defaults.cfg_end)),
         log_interval=int(_value(args.log_interval, defaults.log_interval)),
     )
     parameters.validate()
     rank, _world_size, device = initialize_distributed()
-    if rank == 0:
-        print(f"initializing sampler on {device}")
-    plan = bundle.plan
     digest = checkpoint_sha256(bundle.weights) if rank == 0 else None
     digest = broadcast_string(digest, rank)
-
-    model = DDT(config.model).to(device)
+    model = SiT(
+        config.model,
+        align_layers=config.objective.align_layers,
+        projector_hidden_size=config.objective.projector_hidden_size,
+    ).to(device)
     model.load_state_dict(load_file(str(bundle.weights), device=str(device)))
     model.eval()
     execution_model = compile_model_regions(model, config.compile)
-    codec = (
-        load_flux2_codec(
-            config.vae,
-            image_size=config.model.image_size,
-            device=device,
-        )
-        if config.model.input_space == "flux2_latents"
-        else None
-    )
+    codec = load_flux2_codec(config.vae, image_size=config.model.image_size, device=device)
 
-    @torch.inference_mode()
     def generate_batch(
         _positions: torch.Tensor, labels: torch.Tensor, noise_seeds: torch.Tensor
     ) -> torch.Tensor:
-        batch_labels = labels.to(device)
         dtype = torch.float16 if device.type == "cuda" else torch.float32
-        noise = noise_for_samples(
-            noise_seeds,
-            config.model.input_shape,
-            device,
-            dtype=dtype,
-        )
-        reg_noise = (
-            noise_for_samples(
-                noise_seeds,
-                (
-                    reg.num_tokens,
-                    config.model.features.encoder.feature_dim,
-                ),
-                device,
-                dtype=dtype,
-                seed_offset=1_000_003,
-            )
-            if reg.enabled
-            else None
-        )
-        with torch.autocast(
-            device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
-        ):
+        noise = noise_for_samples(noise_seeds, config.model.input_shape, device, dtype=dtype)
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             generated = ode_sample(
                 execution_model,
                 noise,
-                batch_labels,
-                reg_noise=reg_noise,
+                labels.to(device),
                 steps=parameters.sampling_steps,
                 guidance_scale=parameters.guidance_scale,
-                reg_guidance_scale=parameters.reg_guidance_scale,
                 timestep_shift=parameters.timestep_shift,
-                reg_timestep_shift=parameters.reg_timestep_shift,
-                img_denoising_interval=parameters.img_denoising_interval,
-                reg_denoising_interval=parameters.reg_denoising_interval,
                 cfg_interval=(parameters.cfg_start, parameters.cfg_end),
                 solver=parameters.solver,
                 num_classes=config.model.num_classes,
             )
-        image = generated.image if isinstance(generated, ODESample) else generated
-        if codec is not None:
-            return codec.decode(image)
-        return image.float().add(1).div(2)
+        return codec.decode(generated)
 
     output_dir = bundle.directory / sampling_output_name(sample_count, parameters)
     archive = sample_to_archive(
         output_dir=output_dir,
-        plan=plan,
+        plan=bundle.plan,
         sample_count=sample_count,
         num_classes=config.model.num_classes,
         image_size=config.model.image_size,
@@ -180,52 +106,31 @@ def main() -> None:
         model_variant=config.model.model_variant,
         feature_schema={
             "schema_version": FEATURE_SCHEMA_VERSION,
-            "input_space": config.model.input_space,
+            "input_space": "flux2_latents",
             "input_shape": list(config.model.input_shape),
-            "conditioning_tokens": {
-                "image_timestep": config.model.num_image_timestep_tokens,
-                "reg_timestep": config.model.num_reg_timestep_tokens,
-                "image_class": config.model.num_image_class_tokens,
-                "reg_class": config.model.num_reg_class_tokens,
+            "conditioning": "per-token-adaln-zero",
+            "position_encoding": "factorized-2d-rope",
+            "objective": asdict(config.objective),
+            "vae": {
+                "model_name": config.vae.model_name,
+                "revision": config.vae.revision,
+                "subfolder": config.vae.subfolder,
             },
-            "vae": (
-                {
-                    "model_name": config.vae.model_name,
-                    "revision": config.vae.revision,
-                    "subfolder": config.vae.subfolder,
-                }
-                if config.model.input_space == "flux2_latents"
-                else None
-            ),
-            **asdict(config.model.features),
         },
         checkpoint_hash=digest,
         parameters=parameters,
         generate_batch=generate_batch,
     )
     if args.evaluate and rank == 0:
-        del execution_model, model, codec
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
         reference = args.reference_npz or Path(config.evaluation.reference_npz)
-        eval_device = (
-            device
-            if config.evaluation.device == "auto"
-            else torch.device(config.evaluation.device)
-        )
         metrics = evaluate_npz(
             archive,
             reference,
             batch_size=config.evaluation.batch_size,
-            device=eval_device,
+            device=device if config.evaluation.device == "auto" else config.evaluation.device,
             log_interval=config.evaluation.log_interval,
         )
-        save_evaluation(
-            output_dir / "evaluation.json",
-            metrics,
-            plan.plan_hash,
-        )
-        print(f"evaluation: {output_dir / 'evaluation.json'}")
+        save_evaluation(output_dir / "evaluation.json", metrics, bundle.plan.plan_hash)
 
 
 if __name__ == "__main__":

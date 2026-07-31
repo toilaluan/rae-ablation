@@ -1,0 +1,7 @@
+schema_version: 11
+objective:
+  kind: dual_timestep
+  mixed_token_probability: 0.25
+  align_layers: []
+wandb:
+  name: dual-timestep
