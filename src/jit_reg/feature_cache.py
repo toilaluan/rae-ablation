@@ -20,9 +20,8 @@ import torch
 from torch import Tensor
 
 from .config import ExperimentConfig
-from .reg import FeatureTargets
 
-Component = Literal["reg", "repa"]
+Component = Literal["repa"]
 
 CACHE_SCHEMA_VERSION = 4
 VALUES_FILE = "values.bf16"
@@ -61,17 +60,8 @@ def component_spec(
     """Build a minimal component identity plus non-fingerprinted diagnostics."""
     if dataset_size < 1:
         raise ValueError("feature-cache dataset size must be positive")
-    features = config.model.features
-    encoder = features.encoder
-    if component == "reg":
-        reg = features.reg
-        target = {
-            "feature_schema": "dino-unit-std-pooled-spatial-v3",
-            "pool_size": reg.pool_size,
-            "num_tokens": reg.num_tokens,
-            "dtype": "bfloat16",
-        }
-    elif component == "repa":
+    encoder = config.repa.encoder
+    if component == "repa":
         target = {
             "feature_schema": "dino-resized-normalized-patches-v2",
             "target_grid": config.model.grid_size,
@@ -79,7 +69,7 @@ def component_spec(
             "dtype": "bfloat16",
         }
     else:
-        raise ValueError("feature-cache component must be reg or repa")
+        raise ValueError("feature-cache component must be repa")
     fingerprint_inputs = {
         "schema_version": CACHE_SCHEMA_VERSION,
         "component": component,
@@ -117,7 +107,7 @@ def component_path(
 ) -> Path:
     spec = component_spec(config, dataset_size, component)
     return (
-        Path(config.feature_cache.directory)
+        Path(config.repa.cache.directory)
         / component
         / component_fingerprint(spec)
     )
@@ -464,7 +454,7 @@ class AsyncFeatureCacheWriter:
     def submit(
         self,
         indices: Tensor,
-        targets: FeatureTargets,
+        targets: Tensor,
         *,
         buffer: _HostBuffer | None = None,
     ) -> None:
@@ -477,11 +467,7 @@ class AsyncFeatureCacheWriter:
                 raise ValueError("cache pipeline indices must be a non-empty batch")
             active: dict[Component, Tensor] = {}
             for component in self.writers:
-                value = getattr(targets, component)
-                if value is None:
-                    raise ValueError(
-                        f"active {component.upper()} cache has no targets"
-                    )
+                value = targets
                 expected = (
                     count,
                     self.writers[component].shape[1],
@@ -630,31 +616,16 @@ class FeatureComponentCache:
 
 
 class FeatureCache:
-    """Read whichever independent feature components are active."""
+    """Read the reusable schema-v4 REPA component."""
 
     def __init__(self, config: ExperimentConfig, dataset_size: int) -> None:
-        features = config.model.features
-        self.reg = (
-            FeatureComponentCache(config, dataset_size, "reg")
-            if features.reg.enabled
-            else None
-        )
-        self.repa = (
-            FeatureComponentCache(config, dataset_size, "repa")
-            if features.repa.enabled
-            else None
-        )
+        if not config.repa.enabled:
+            raise ValueError("REPA cache requires repa.enabled=true")
+        self.repa = FeatureComponentCache(config, dataset_size, "repa")
 
     @property
     def fingerprints(self) -> dict[str, str]:
-        return {
-            component: cache.fingerprint
-            for component, cache in (("reg", self.reg), ("repa", self.repa))
-            if cache is not None
-        }
+        return {"repa": self.repa.fingerprint}
 
-    def lookup(self, indices: Tensor) -> FeatureTargets:
-        return FeatureTargets(
-            self.reg.lookup(indices) if self.reg is not None else None,
-            self.repa.lookup(indices) if self.repa is not None else None,
-        )
+    def lookup(self, indices: Tensor) -> Tensor:
+        return self.repa.lookup(indices)

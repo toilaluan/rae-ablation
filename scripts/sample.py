@@ -11,7 +11,7 @@ from jit_reg.checkpoint_bundle import load_checkpoint_bundle
 from jit_reg.distributed import broadcast_string, initialize_distributed
 from jit_reg.evaluation import evaluate_npz, save_evaluation
 from jit_reg.model.compile import compile_model_regions
-from jit_reg.model.ddt import DDT
+from jit_reg.model.sit import SiT
 from jit_reg.sample_runtime import (
     FEATURE_SCHEMA_VERSION,
     SamplingParameters,
@@ -19,7 +19,7 @@ from jit_reg.sample_runtime import (
     sample_to_archive,
     sampling_output_name,
 )
-from jit_reg.sampling import ODESample, ode_sample
+from jit_reg.sampling import ode_sample
 from jit_reg.vae import load_flux2_codec
 from jit_reg.validation import noise_for_samples
 
@@ -36,15 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sampling-steps", type=int)
     parser.add_argument("--solver", choices=("euler", "heun"))
     parser.add_argument("--guidance-scale", type=float)
-    parser.add_argument("--reg-guidance-scale", type=float)
     parser.add_argument("--timestep-shift", type=float)
-    parser.add_argument("--reg-timestep-shift", type=float)
-    parser.add_argument(
-        "--img-denoising-interval", type=float, nargs=2, metavar=("START", "END")
-    )
-    parser.add_argument(
-        "--reg-denoising-interval", type=float, nargs=2, metavar=("START", "END")
-    )
     parser.add_argument("--cfg-start", type=float)
     parser.add_argument("--cfg-end", type=float)
     parser.add_argument("--log-interval", type=int)
@@ -66,7 +58,6 @@ def main() -> None:
     bundle = load_checkpoint_bundle(args.checkpoint_dir)
     config = bundle.config
     defaults = config.sampling
-    reg = config.model.features.reg
     sample_count = int(_value(args.num_samples, defaults.num_samples))
     parameters = SamplingParameters(
         batch_size=int(_value(args.batch_size, defaults.batch_size)),
@@ -77,20 +68,8 @@ def main() -> None:
         guidance_scale=float(
             _value(args.guidance_scale, defaults.guidance_scale)
         ),
-        reg_guidance_scale=float(
-            _value(args.reg_guidance_scale, defaults.reg_guidance_scale)
-        ),
         timestep_shift=float(
             _value(args.timestep_shift, defaults.timestep_shift)
-        ),
-        reg_timestep_shift=float(
-            _value(args.reg_timestep_shift, defaults.reg_timestep_shifts[0])
-        ),
-        img_denoising_interval=tuple(
-            _value(args.img_denoising_interval, defaults.img_denoising_interval)
-        ),
-        reg_denoising_interval=tuple(
-            _value(args.reg_denoising_interval, defaults.reg_denoising_interval)
         ),
         cfg_start=float(_value(args.cfg_start, defaults.cfg_start)),
         cfg_end=float(_value(args.cfg_end, defaults.cfg_end)),
@@ -104,7 +83,7 @@ def main() -> None:
     digest = checkpoint_sha256(bundle.weights) if rank == 0 else None
     digest = broadcast_string(digest, rank)
 
-    model = DDT(config.model).to(device)
+    model = SiT(config.model, config.repa).to(device)
     model.load_state_dict(load_file(str(bundle.weights), device=str(device)))
     model.eval()
     execution_model = compile_model_regions(model, config.compile)
@@ -130,20 +109,6 @@ def main() -> None:
             device,
             dtype=dtype,
         )
-        reg_noise = (
-            noise_for_samples(
-                noise_seeds,
-                (
-                    reg.num_tokens,
-                    config.model.features.encoder.feature_dim,
-                ),
-                device,
-                dtype=dtype,
-                seed_offset=1_000_003,
-            )
-            if reg.enabled
-            else None
-        )
         with torch.autocast(
             device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
         ):
@@ -151,22 +116,17 @@ def main() -> None:
                 execution_model,
                 noise,
                 batch_labels,
-                reg_noise=reg_noise,
                 steps=parameters.sampling_steps,
                 guidance_scale=parameters.guidance_scale,
-                reg_guidance_scale=parameters.reg_guidance_scale,
                 timestep_shift=parameters.timestep_shift,
-                reg_timestep_shift=parameters.reg_timestep_shift,
-                img_denoising_interval=parameters.img_denoising_interval,
-                reg_denoising_interval=parameters.reg_denoising_interval,
                 cfg_interval=(parameters.cfg_start, parameters.cfg_end),
                 solver=parameters.solver,
                 num_classes=config.model.num_classes,
+                velocity_denominator_floor=config.train.velocity_denominator_floor,
             )
-        image = generated.image if isinstance(generated, ODESample) else generated
         if codec is not None:
-            return codec.decode(image)
-        return image.float().add(1).div(2)
+            return codec.decode(generated)
+        return generated.float().add(1).div(2)
 
     output_dir = bundle.directory / sampling_output_name(sample_count, parameters)
     archive = sample_to_archive(
@@ -182,12 +142,8 @@ def main() -> None:
             "schema_version": FEATURE_SCHEMA_VERSION,
             "input_space": config.model.input_space,
             "input_shape": list(config.model.input_shape),
-            "conditioning_tokens": {
-                "image_timestep": config.model.num_image_timestep_tokens,
-                "reg_timestep": config.model.num_reg_timestep_tokens,
-                "image_class": config.model.num_image_class_tokens,
-                "reg_class": config.model.num_reg_class_tokens,
-            },
+            "conditioning": "timestep_plus_class_vector",
+            "prediction": "x0",
             "vae": (
                 {
                     "model_name": config.vae.model_name,
@@ -197,7 +153,7 @@ def main() -> None:
                 if config.model.input_space == "flux2_latents"
                 else None
             ),
-            **asdict(config.model.features),
+            "repa": asdict(config.repa),
         },
         checkpoint_hash=digest,
         parameters=parameters,

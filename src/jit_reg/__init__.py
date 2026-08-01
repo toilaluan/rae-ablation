@@ -1,34 +1,24 @@
-"""Pixel- and FLUX.2-latent DDT training with optional DINOv3 REG and REPA."""
+"""High-throughput SiT training with optional REPA and K-exploration."""
 
 from .config import (
-    DDTDecoderConfig,
     ExperimentConfig,
-    FeaturesConfig,
+    ExplorationConfig,
     ModelConfig,
-    REGConfig,
-    REGLoRAConfig,
+    REPAConfig,
     VAEConfig,
     load_config,
 )
-from .model import (
-    DDT,
-    DDTOutput,
-    DDTREGOutput,
-    classifier_free_labels,
-)
+from .model import SiT, SiTOutput, classifier_free_labels
 
 __all__ = [
-    "DDT",
-    "DDTDecoderConfig",
-    "DDTOutput",
-    "DDTREGOutput",
     "ExperimentConfig",
-    "FeaturesConfig",
+    "ExplorationConfig",
     "ModelConfig",
-    "REGConfig",
-    "REGLoRAConfig",
+    "REPAConfig",
+    "SiT",
+    "SiTOutput",
     "VAEConfig",
     "classifier_free_labels",
     "load_config",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -134,48 +134,6 @@ def precompute_rope_tables(
     )
 
 
-def precompute_ddt_rope_tables(
-    image_height: int,
-    image_width: int,
-    head_dim: int,
-    *,
-    reg_pool_size: int | None = None,
-    condition_tokens: int = 0,
-    spatial_reg_rope: bool = False,
-    dtype: torch.dtype = torch.float32,
-) -> tuple[Tensor, Tensor]:
-    """Build static RoPE for ``[REG, image, condition]`` DDT sequences."""
-    if condition_tokens < 0:
-        raise ValueError("DDT condition token count cannot be negative")
-    reg_tokens = reg_pool_size**2 if reg_pool_size is not None else 0
-    primary_cos, primary_sin = precompute_rope_tables(
-        image_height,
-        image_width,
-        head_dim,
-        prefix_tokens=reg_tokens,
-        spatial_pool_size=(
-            reg_pool_size if spatial_reg_rope else None
-        ),
-        dtype=dtype,
-    )
-    if condition_tokens == 0:
-        return primary_cos, primary_sin
-    condition_cos = torch.ones(
-        condition_tokens,
-        head_dim,
-        dtype=dtype,
-    )
-    condition_sin = torch.zeros(
-        condition_tokens,
-        head_dim,
-        dtype=dtype,
-    )
-    return (
-        torch.cat((primary_cos, condition_cos), dim=0),
-        torch.cat((primary_sin, condition_sin), dim=0),
-    )
-
-
 def apply_2d_rope_positions(
     q: Tensor,
     k: Tensor,
@@ -209,22 +167,4 @@ def apply_2d_rope(q: Tensor, k: Tensor, height: int, width: int) -> tuple[Tensor
     x = torch.arange(width, device=q.device, dtype=torch.float32)
     y = y[:, None].expand(height, width).reshape(-1)
     x = x[None, :].expand(height, width).reshape(-1)
-    return apply_2d_rope_positions(q, k, y, x)
-
-
-def apply_aligned_spatial_rope(
-    q: Tensor,
-    k: Tensor,
-    pool_size: int,
-    image_height: int,
-    image_width: int,
-) -> tuple[Tensor, Tensor]:
-    """Rotate pooled cells at their centers in image-patch coordinates."""
-    if pool_size < 1 or image_height < 1 or image_width < 1:
-        raise ValueError("spatial and image grids must be positive")
-    cell = torch.arange(pool_size, device=q.device, dtype=torch.float32) + 0.5
-    y = cell * (image_height / pool_size) - 0.5
-    x = cell * (image_width / pool_size) - 0.5
-    y = y[:, None].expand(pool_size, pool_size).reshape(-1)
-    x = x[None, :].expand(pool_size, pool_size).reshape(-1)
     return apply_2d_rope_positions(q, k, y, x)

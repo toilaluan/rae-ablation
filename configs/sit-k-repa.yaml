@@ -1,0 +1,23 @@
+schema_version: 11
+model:
+  variant: SiT-B
+  input_space: pixels
+  image_size: 256
+  in_channels: 3
+  patch_size: 16
+  hidden_size: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+repa:
+  enabled: true
+  block: 4
+  projection_hidden_size: 2048
+  loss_weight: 0.5
+exploration:
+  k: 4
+  selector: repa
+  candidate_chunk_size: null
+wandb:
+  project: sit-k-exploration
+  name: sit-repa-k4-early

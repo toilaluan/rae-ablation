@@ -15,11 +15,12 @@ from jit_reg.data import (
 )
 from jit_reg.distributed import initialize_distributed
 from jit_reg.feature_cache import FeatureCache
+from jit_reg.flops import model_flops_per_step
 from jit_reg.latent_cache import LatentCache
 from jit_reg.model.compile import compile_model_regions
-from jit_reg.model.ddt import DDT
+from jit_reg.model.sit import SiT
 from jit_reg.optim import build_optimizer
-from jit_reg.reg import DINOv3FeatureExtractor
+from jit_reg.repa import DINOv3FeatureExtractor
 from jit_reg.rng import RNGStreams
 from jit_reg.sample_runtime import SamplingParameters
 from jit_reg.training import TrainState, make_train_loader, train
@@ -33,13 +34,13 @@ torch._dynamo.config.cache_size_limit = 1000
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train pixel- or FLUX.2-latent JiT on ImageNet-256"
+        description="Train pixel- or FLUX.2-latent SiT on ImageNet-256"
     )
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/baseline-p16.yaml"),
-        help="schema-v9 experiment YAML (default: configs/baseline-p16.yaml)",
+        default=Path("configs/sit-baseline.yaml"),
+        help="schema-v11 experiment YAML",
     )
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
@@ -57,33 +58,17 @@ def main() -> None:
         config.validation.plan_path = str(args.output / "validation-plan.pt")
     config.validate()
     sampling_config = config.sampling
-    reg_config = config.model.features.reg
-    reg_shifts = (
-        sampling_config.reg_timestep_shifts if reg_config.enabled else [1.0]
+    sampling_parameters = SamplingParameters(
+        batch_size=sampling_config.batch_size,
+        sampling_steps=sampling_config.sampling_steps,
+        solver=sampling_config.solver,
+        guidance_scale=sampling_config.guidance_scale,
+        timestep_shift=sampling_config.timestep_shift,
+        cfg_start=sampling_config.cfg_start,
+        cfg_end=sampling_config.cfg_end,
+        log_interval=sampling_config.log_interval,
     )
-    sampling_candidates = [
-        SamplingParameters(
-            batch_size=sampling_config.batch_size,
-            sampling_steps=sampling_config.sampling_steps,
-            solver=sampling_config.solver,
-            guidance_scale=sampling_config.guidance_scale,
-            reg_guidance_scale=sampling_config.reg_guidance_scale,
-            timestep_shift=sampling_config.timestep_shift,
-            reg_timestep_shift=reg_shift,
-            img_denoising_interval=tuple(
-                sampling_config.img_denoising_interval
-            ),
-            reg_denoising_interval=tuple(
-                sampling_config.reg_denoising_interval
-            ),
-            cfg_start=sampling_config.cfg_start,
-            cfg_end=sampling_config.cfg_end,
-            log_interval=sampling_config.log_interval,
-        )
-        for reg_shift in reg_shifts
-    ]
-    for sampling in sampling_candidates:
-        sampling.validate()
+    sampling_parameters.validate()
     if not Path(config.evaluation.reference_npz).is_file():
         raise FileNotFoundError(config.evaluation.reference_npz)
 
@@ -93,8 +78,8 @@ def main() -> None:
     streams = RNGStreams.create(config.train.seed, device)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(streams.initialization.initial_seed())
-        model = DDT(config.model).to(device)
-    cache_active = config.feature_cache.enabled and config.model.features.enabled
+        model = SiT(config.model, config.repa).to(device)
+    cache_active = config.repa.enabled and config.repa.cache.enabled
     latent_cache_active = (
         config.model.input_space == "flux2_latents"
         and config.vae.cache.enabled
@@ -105,7 +90,7 @@ def main() -> None:
             config.model.input_space == "flux2_latents"
             and not latent_cache_active
         )
-        or (config.model.features.enabled and not cache_active)
+        or (config.repa.enabled and not cache_active)
     )
     dataset = load_imagenet(
         config.data,
@@ -160,9 +145,9 @@ def main() -> None:
             device_ids=[device.index] if device.type == "cuda" else None,
         )
     feature_encoder = None
-    if config.model.features.enabled and feature_cache is None:
+    if config.repa.enabled and feature_cache is None:
         feature_encoder = (
-            DINOv3FeatureExtractor(config.model.features).to(device).bfloat16()
+            DINOv3FeatureExtractor(config.repa).to(device).bfloat16()
         )
         if config.compile.enabled:
             feature_encoder = torch.compile(
@@ -189,8 +174,8 @@ def main() -> None:
         "data_fingerprint": fingerprint,
         "validation_plan_hash": plan.plan_hash,
         "feature_target": (
-            config.model.features.encoder.model_name
-            if config.model.features.enabled
+            config.repa.encoder.model_name
+            if config.repa.enabled
             else None
         ),
         "feature_cache_fingerprints": (
@@ -227,9 +212,8 @@ def main() -> None:
     logger.event(
         f"training initialized: variant={config.model.model_variant}, "
         f"input_shape={config.model.input_shape}, "
-        f"reg={reg_config.enabled}, repa={config.model.features.repa.enabled}, "
-        f"decoder={config.model.decoder.depth}x"
-        f"{config.model.decoder.hidden_size}, "
+        f"repa={config.repa.enabled}, selector={config.exploration.selector}, "
+        f"K={config.exploration.k}, "
         "parameters="
         f"{logged_config['model_parameters']['total']:,}"
     )
@@ -245,7 +229,18 @@ def main() -> None:
             completed_epoch=epoch,
             final=final,
             output_root=output_root,
-            sampling=sampling_candidates,
+            sampling=sampling_parameters,
+        )
+        metrics.update(
+            {
+                "progress/epoch": float(epoch),
+                "progress/images_seen": float(
+                    state.global_step * config.train.global_batch_size
+                ),
+                "compute/cumulative_model_flops": float(
+                    state.global_step * model_flops_per_step(config)
+                ),
+            }
         )
         if rank == 0:
             labels = ", ".join(str(value) for value in plan.labels[:16].tolist())

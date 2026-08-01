@@ -20,15 +20,15 @@ from jit_reg.feature_cache import (
     component_spec,
     preflight_cache_capacity,
 )
-from jit_reg.reg import DINOv3FeatureExtractor
+from jit_reg.repa import DINOv3FeatureExtractor
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Precompute independent DINO REG and REPA feature components"
+        description="Precompute reusable DINOv3 REPA targets"
     )
     parser.add_argument(
-        "--config", type=Path, default=Path("configs/baseline-p16.yaml")
+        "--config", type=Path, default=Path("configs/sit-repa.yaml")
     )
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     return parser
@@ -37,18 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     config = load_config(args.config, args.override)
-    if not config.model.features.enabled:
-        raise ValueError("feature-cache building requires REG or REPA to be enabled")
+    if not config.repa.enabled:
+        raise ValueError("feature-cache building requires repa.enabled=true")
     rank, world_size, device = initialize_distributed()
     dataset = load_imagenet(config.data, config.model.image_size)
-    components = [
-        name
-        for name, enabled in (
-            ("reg", config.model.features.reg.enabled),
-            ("repa", config.model.features.repa.enabled),
-        )
-        if enabled
-    ]
+    components = ["repa"]
     specs = {
         name: component_spec(config, len(dataset), name) for name in components
     }
@@ -57,14 +50,14 @@ def main() -> None:
     }
 
     lock_context = (
-        cache_build_lock(config.feature_cache.directory)
+        cache_build_lock(config.repa.cache.directory)
         if rank == 0
         else contextlib.nullcontext()
     )
     with lock_context:
         if rank == 0:
             required = preflight_cache_capacity(
-                config.feature_cache.directory,
+                config.repa.cache.directory,
                 specs,  # type: ignore[arg-type]
                 paths,  # type: ignore[arg-type]
             )
@@ -106,7 +99,7 @@ def main() -> None:
         )
         loader = DataLoader(
             Subset(dataset, pending.tolist()),
-            batch_size=config.feature_cache.batch_size,
+            batch_size=config.repa.cache.batch_size,
             shuffle=False,
             num_workers=config.data.workers,
             pin_memory=torch.cuda.is_available(),
@@ -115,7 +108,7 @@ def main() -> None:
                 config.data.prefetch_factor if config.data.workers > 0 else None
             ),
         )
-        extractor = DINOv3FeatureExtractor(config.model.features).to(device).bfloat16()
+        extractor = DINOv3FeatureExtractor(config.repa).to(device).bfloat16()
         extractor.eval()
         if config.compile.enabled:
             extractor = torch.compile(
@@ -132,7 +125,7 @@ def main() -> None:
         gpu_extraction_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         loader_iterator = iter(loader)
         pipeline = AsyncFeatureCacheWriter(
-            writers, config.feature_cache.batch_size, device  # type: ignore[arg-type]
+            writers, config.repa.cache.batch_size, device  # type: ignore[arg-type]
         )
         pipeline_error: Exception | None = None
         try:
@@ -179,7 +172,7 @@ def main() -> None:
                     processed += indices.numel()
                     if (
                         rank == 0
-                        and batch_index % config.feature_cache.log_interval == 0
+                        and batch_index % config.repa.cache.log_interval == 0
                     ):
                         if gpu_extraction_events:
                             gpu_extraction_events[-1][1].synchronize()

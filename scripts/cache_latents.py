@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/latent-baseline-p16.yaml"),
+        default=Path("configs/sit-baseline.yaml"),
         help="schema-v9 latent experiment YAML",
     )
     parser.add_argument(
