@@ -6,187 +6,162 @@ import pytest
 import torch
 
 from jit_reg.config import (
-    EarlyPredictionConfig,
+    CONFIG_SCHEMA_VERSION,
+    RAE_BASE_REPOSITORY,
+    RAE_BASE_REVISION,
+    RAE_COMPRESSOR_REPOSITORY,
+    RAE_COMPRESSOR_REVISION,
+    DDTConfig,
     ExperimentConfig,
-    ModelConfig,
-    REPAConfig,
     load_config,
 )
-from jit_reg.model.sit import FusedSwiGLU, SiT, SiTAttention
+from jit_reg.model import DDT
 
 
-def tiny_model() -> ModelConfig:
-    return ModelConfig(
-        image_size=8,
-        patch_size=2,
-        hidden_size=32,
-        depth=3,
-        num_heads=4,
+def tiny_config() -> DDTConfig:
+    return DDTConfig(
+        input_size=2,
+        in_channels=4,
+        hidden_size=[16, 32],
+        depth=[3, 1],
+        num_heads=[4, 4],
         mlp_ratio=2,
-        num_classes=10,
-        variant="SiT-Tiny",
+        base_model_depth=2,
+        num_classes=3,
+        num_timestep_tokens=2,
+        num_class_tokens=2,
+        variant="DDT-Tiny",
     )
 
 
-def tiny_repa() -> REPAConfig:
-    config = REPAConfig(enabled=True, block=2, projection_hidden_size=16)
-    config.encoder.feature_dim = 8
-    return config
-
-
-def tiny_early() -> EarlyPredictionConfig:
-    return EarlyPredictionConfig(enabled=True, block=2, mlp_hidden_size=16)
-
-
-def test_official_presets_are_valid_and_cover_core_modes() -> None:
+def test_exact_schema_v13_defaults_and_presets() -> None:
+    config = ExperimentConfig()
+    config.validate()
+    assert config.schema_version == CONFIG_SCHEMA_VERSION == 13
+    assert config.model.input_shape == (1024, 8, 8)
+    assert config.model.patch_size == [1, 1]
+    assert config.model.hidden_size == [768, 2048]
+    assert config.model.depth == [12, 2]
+    assert config.model.num_heads == [12, 16]
+    assert config.model.base_model_depth == 4
+    assert (config.model.num_timestep_tokens, config.model.num_class_tokens) == (4, 8)
+    assert config.train.base_loss_weight == 1.0
+    assert (
+        config.rae.base_repository,
+        config.rae.base_revision,
+        config.rae.compressor_repository,
+        config.rae.compressor_revision,
+    ) == (
+        RAE_BASE_REPOSITORY,
+        RAE_BASE_REVISION,
+        RAE_COMPRESSOR_REPOSITORY,
+        RAE_COMPRESSOR_REVISION,
+    )
     expected = {
-        "sit-baseline.yaml": (False, False, 1, 1, "none"),
-        "sit-repa.yaml": (True, False, 1, 1, "none"),
-        "sit-k-final.yaml": (False, False, 1, 4, "none"),
-        "sit-k-final-repa.yaml": (True, False, 1, 4, "none"),
-        "sit-k-repa.yaml": (True, False, 4, 1, "repa"),
-        "sit-k-hybrid-early.yaml": (False, True, 4, 2, "early_prediction"),
-        "sit-k-hybrid-repa.yaml": (True, False, 4, 2, "repa"),
+        "ddt-baseline.yaml": (1, 1),
+        "ddt-k-early.yaml": (4, 1),
+        "ddt-k-final.yaml": (1, 4),
+        "ddt-k-hybrid.yaml": (4, 2),
     }
     for name, values in expected.items():
-        config = load_config(f"configs/{name}")
-        assert (
-            config.repa.enabled,
-            config.early_prediction.enabled,
-            config.exploration.k_early,
-            config.exploration.k_full,
-            config.exploration.early_selector,
-        ) == values
-        assert config.model.variant == "SiT-B"
+        preset = load_config(f"configs/{name}")
+        assert (preset.exploration.k_early, preset.exploration.k_full) == values
 
 
-@pytest.mark.parametrize(
-    ("k_early", "selector", "repa", "early", "message"),
-    [
-        (1, "repa", True, False, "k_early=1"),
-        (2, "none", False, False, "k_early>1"),
-        (2, "repa", False, False, "REPA selection"),
-        (2, "early_prediction", False, False, "early prediction selection"),
-    ],
-)
-def test_exploration_validation(
-    k_early: int,
-    selector: str,
-    repa: bool,
-    early: bool,
-    message: str,
-) -> None:
-    config = ExperimentConfig()
-    config.exploration.k_early = k_early
-    config.exploration.early_selector = selector
-    config.repa.enabled = repa
-    config.early_prediction.enabled = early
-    with pytest.raises(ValueError, match=message):
+def test_old_and_unknown_configuration_are_rejected(tmp_path) -> None:
+    old = tmp_path / "old.yaml"
+    old.write_text("schema_version: 12\n")
+    with pytest.raises(ValueError, match="schema_version: 13"):
+        load_config(old)
+    current = tmp_path / "current.yaml"
+    current.write_text("schema_version: 13\nrepa: {}\n")
+    with pytest.raises(ValueError, match="schema-v13"):
+        load_config(current)
+
+
+def test_ddt_validation_checks_pairs_grid_heads_and_base_depth() -> None:
+    config = tiny_config()
+    config.hidden_size = [16]
+    with pytest.raises(ValueError, match="two values"):
+        config.validate()
+    config = tiny_config()
+    config.patch_size = [3, 1]
+    with pytest.raises(ValueError, match="divisible"):
+        config.validate()
+    config = tiny_config()
+    config.num_heads = [3, 4]
+    with pytest.raises(ValueError, match="divisible"):
+        config.validate()
+    config = tiny_config()
+    config.base_model_depth = 4
+    with pytest.raises(ValueError, match="encoder depth"):
         config.validate()
 
 
-def test_candidate_chunk_must_divide_k() -> None:
-    config = ExperimentConfig()
-    config.repa.enabled = True
-    config.exploration.k_early = 4
-    config.exploration.k_full = 2
-    config.exploration.early_selector = "repa"
-    config.exploration.early_candidate_chunk_size = 3
-    with pytest.raises(ValueError, match="divide"):
-        config.validate()
-    config.exploration.early_candidate_chunk_size = None
-    config.exploration.full_candidate_chunk_size = 3
-    with pytest.raises(ValueError, match="divide"):
-        config.validate()
-
-
-def test_pixel_and_flux2_geometry() -> None:
-    pixel = tiny_model()
-    assert pixel.input_shape == (3, 8, 8)
-    latent = ModelConfig(
-        input_space="flux2_latents",
-        image_size=256,
-        in_channels=128,
-        patch_size=2,
-        hidden_size=32,
-        depth=2,
-        num_heads=4,
-    )
-    latent.validate()
-    assert latent.input_shape == (128, 16, 16)
-    assert latent.grid_size == 8
-
-
-def test_sit_x_prediction_and_prefixes_match_full_forward() -> None:
-    model = SiT(tiny_model(), tiny_repa(), tiny_early())
-    noisy = torch.randn(2, 3, 8, 8)
+def test_ddt_paths_shapes_zero_initialization_and_base_isolation() -> None:
+    model = DDT(tiny_config())
+    x = torch.randn(2, 4, 2, 2)
     timestep = torch.tensor([0.2, 0.7])
     labels = torch.tensor([1, 2])
-    output = model(
-        noisy,
-        timestep,
-        labels,
-        return_repa=True,
-        return_early_prediction=True,
+    output = model(x, timestep, labels)
+    assert output.full_prediction.shape == x.shape
+    assert output.base_prediction.shape == x.shape
+    assert torch.equal(output.base_prediction, model.forward_base_prediction(x, timestep, labels))
+    assert torch.equal(output.full_prediction, model.forward_full_prediction(x, timestep, labels))
+    assert torch.count_nonzero(output.full_prediction) == 0
+    assert torch.count_nonzero(output.base_prediction) == 0
+    assert all(torch.count_nonzero(block.modulation[-1].weight) == 0 for block in model.decoder_blocks)
+
+    with torch.no_grad():
+        model.base_head.projection.weight.normal_()
+    before = model.forward_base_prediction(x, timestep, labels)
+    with torch.no_grad():
+        for block in model.encoder_blocks[model.config.base_model_depth :]:
+            for parameter in block.parameters():
+                parameter.add_(torch.randn_like(parameter))
+        for parameter in model.decoder_blocks.parameters():
+            parameter.add_(torch.randn_like(parameter))
+    after = model.forward_base_prediction(x, timestep, labels)
+    assert torch.equal(before, after)
+
+
+def test_base_loss_backpropagates_through_first_four_equivalent_blocks() -> None:
+    model = DDT(tiny_config())
+    with torch.no_grad():
+        model.base_head.projection.weight.normal_()
+    prediction = model.forward_base_prediction(
+        torch.randn(2, 4, 2, 2), torch.rand(2), torch.tensor([1, 2])
     )
-    repa_prefix = model.forward_repa(noisy, timestep, labels)
-    early_prefix = model.forward_early_prediction(noisy, timestep, labels)
-    assert output.x_prediction.shape == noisy.shape
-    assert output.repa_prediction is not None
-    assert output.repa_prediction.shape == (2, 16, 8)
-    assert torch.equal(output.repa_prediction, repa_prefix)
-    assert output.early_x_prediction is not None
-    assert output.early_x_prediction.shape == noisy.shape
-    assert torch.equal(output.early_x_prediction, early_prefix)
-    assert model(noisy, timestep, labels).early_x_prediction is None
+    prediction.square().mean().backward()
+    assert model.spatial_projection.weight.grad is not None
+    assert all(next(block.parameters()).grad is not None for block in model.encoder_blocks[:2])
+    assert all(parameter.grad is None for block in model.encoder_blocks[2:] for parameter in block.parameters())
+    assert all(parameter.grad is None for parameter in model.decoder_blocks.parameters())
 
 
-def test_early_prediction_head_detaches_transformer_states() -> None:
-    model = SiT(tiny_model(), early_prediction_config=tiny_early())
-    output = model(
-        torch.randn(2, 3, 8, 8),
-        torch.rand(2),
-        torch.tensor([1, 2]),
-        return_early_prediction=True,
-    )
-    assert output.early_x_prediction is not None
-    output.early_x_prediction.sum().backward()
-    assert model.early_prediction_head is not None
-    assert model.early_prediction_head.projection.weight.grad is not None
-    assert model.patch_projection.weight.grad is None
-    assert all(parameter.grad is None for block in model.blocks for parameter in block.parameters())
-
-
-def test_modern_block_components_are_always_enabled() -> None:
-    model = SiT(tiny_model())
-    block = model.blocks[0]
-    assert isinstance(block.attention, SiTAttention)
-    assert isinstance(block.feed_forward, FusedSwiGLU)
-    assert block.attention.qkv.out_features == 3 * tiny_model().hidden_size
-    assert hasattr(block.attention, "rope_cos_bf16")
-    assert block.attention.q_norm.normalized_shape == (8,)
-
-
-def test_zero_initialized_x_head_and_adaln() -> None:
-    model = SiT(tiny_model())
-    output = model(
-        torch.randn(2, 3, 8, 8),
-        torch.rand(2),
-        torch.tensor([1, 2]),
-    )
-    assert torch.count_nonzero(output.x_prediction) == 0
-    assert all(torch.count_nonzero(block.modulation[-1].weight) == 0 for block in model.blocks)
-
-
-def test_gradient_checkpointing_preserves_gradients() -> None:
-    config = tiny_model()
-    first = SiT(config)
-    second = SiT(deepcopy(config))
+def test_gradient_checkpointing_matches_uncheckpointed_execution() -> None:
+    first = DDT(tiny_config())
+    with torch.no_grad():
+        first.full_head.projection.weight.normal_()
+        first.base_head.projection.weight.normal_()
+    second = DDT(deepcopy(tiny_config()))
     second.load_state_dict(first.state_dict())
     second.set_gradient_checkpointing(True)
-    args = (torch.randn(2, 3, 8, 8), torch.rand(2), torch.tensor([1, 2]))
-    first(*args).x_prediction.sum().backward()
-    second(*args).x_prediction.sum().backward()
+    args = (torch.randn(2, 4, 2, 2), torch.rand(2), torch.tensor([1, 2]))
+    first_loss = sum(value.sum() for value in first(*args))
+    second_loss = sum(value.sum() for value in second(*args))
+    first_loss.backward()
+    second_loss.backward()
+    assert torch.allclose(first_loss, second_loss)
     for left, right in zip(first.parameters(), second.parameters(), strict=True):
-        assert left.grad is not None and right.grad is not None
-        assert torch.allclose(left.grad, right.grad)
+        assert (left.grad is None) == (right.grad is None)
+        if left.grad is not None:
+            assert torch.allclose(left.grad, right.grad)
+
+
+def test_ddt_supports_fullgraph_compilation() -> None:
+    model = DDT(tiny_config()).eval()
+    compiled = torch.compile(model, backend="eager", fullgraph=True)
+    output = compiled(torch.randn(1, 4, 2, 2), torch.rand(1), torch.tensor([1]))
+    assert output.full_prediction.shape == (1, 4, 2, 2)
+    assert output.base_prediction.shape == (1, 4, 2, 2)

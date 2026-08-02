@@ -9,7 +9,7 @@ from jit_reg.compare import compare_runs
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compare matched SiT experiment results")
+    parser = argparse.ArgumentParser(description="Compare matched RAE-DDT experiment results")
     parser.add_argument("first", type=Path)
     parser.add_argument("second", type=Path)
     parser.add_argument("--output", type=Path)

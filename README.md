@@ -1,210 +1,97 @@
-# SiT REPA and hybrid K-exploration
+# RAE-DDT with internal guidance and K-exploration
 
-This repository trains a class-conditional SiT on ImageNet-256 in either RGB
-pixel space or normalized FLUX.2 VAE space. It is intentionally limited to
-three questions:
+This repository implements one schema-v13 pipeline:
 
-1. How does a modern SiT baseline train?
-2. What does intermediate DINOv3 REPA alignment add?
-3. What happens when every source image explores K independent noise samples
-   and trains only on the best candidate?
+`ImageNet-256 RGB → frozen RAEv2 compressor → normalized 1024×8×8 tokens → DDT`
 
-Configuration schema v12 is a clean break. Older checkpoints are not
-loadable. Existing schema-v4 REPA caches and FLUX.2 latent caches remain
-reusable.
+Training never loads images or RAE weights. The cache builder is the only RGB/encode
+path; sampling is the only RAE/decode path. Schema-v12 configurations, checkpoints,
+and cache manifests are intentionally rejected without migration.
 
-## Model and objective
+## Architecture
 
-The default SiT-B has 12 blocks, width 768, and 12 attention heads. It uses
-one fused QKV projection, PyTorch SDPA/Flash Attention, factorized 2D RoPE,
-per-head Q/K RMSNorm, affine-free RMSNorm, fused gate/value SwiGLU, and
-adaLN-Zero conditioning from the sum of timestep and class embeddings.
+The model follows upstream `DiTwDDTHeadIG`, adjusted to an 8×8 input grid. A 1×1
+projection produces width-768 spatial tokens. Twelve encoder blocks jointly process
+64 spatial, four timestep, and eight class tokens. The base x-prediction head exits
+after encoder block four. The full path projects to width 2048, applies two
+adaLN-conditioned decoder blocks, and predicts x with a separate head.
 
-The model predicts clean `x0`, not velocity. Training constructs
+Both heads train with flow matching:
 
-```text
-xt       = t * x0 + (1 - t) * noise
-v_target = x0 - noise
-v_pred   = (x_prediction - xt) / max(1 - t, 0.05)
-loss     = mse(v_pred, v_target)
-```
+`x_t = (1 - t) clean + t noise`
 
-Sampling likewise applies classifier-free guidance to x-predictions and only
-then converts them to velocity for Euler or Heun integration.
+X predictions are converted to velocity using `max(t, 0.05)`. The loss is
+`full_loss + train.base_loss_weight * base_loss`; the default base weight is 1.0.
+Timesteps are logit-normal and use the compact-token shift 4.
 
-An optional early x0 head can be attached after a configured SiT block. It is
-a compact token-wise MLP whose input states are detached, so its auxiliary
-velocity loss trains the head without asking the transformer trunk to predict
-x0 early. Sampling never evaluates this head.
+## Pinned codec
 
-## Experiment modes
+- Base: `toilaluan/raev2-dinov3l-k7@46ce5a7e76df99eb5528020d3c65cef528a355fa`
+- Compressor: `toilaluan/raev2-compressor@846e2213dcf6218d3b726448ae52d8104c925c0f`
 
-| Preset | REPA | Early head | K early | K full | Early selector |
-| --- | ---: | ---: | ---: | ---: | --- |
-| `configs/sit-baseline.yaml` | no | no | 1 | 1 | none |
-| `configs/sit-repa.yaml` | yes | no | 1 | 1 | none |
-| `configs/sit-k-final.yaml` | no | no | 1 | 4 | none |
-| `configs/sit-k-final-repa.yaml` | yes | no | 1 | 4 | none |
-| `configs/sit-k-repa.yaml` | yes | no | 4 | 1 | REPA |
-| `configs/sit-k-hybrid-early.yaml` | no | yes | 4 | 2 | early x0 |
-| `configs/sit-k-hybrid-repa.yaml` | yes | no | 4 | 2 | REPA |
+The base is loaded first and injected into the compressor with remote code enabled.
+CUDA uses BF16; CPU uses FP32.
 
-Exploration generates `K_total = K_early * K_full` independent noises for each
-source sample at one timestep. When `K_early > 1`, the early selector scores
-all candidates and retains the globally best `K_full`. When `K_full > 1`, the
-full model scores those finalists with velocity MSE and selects one. Candidate
-scoring runs under no-grad; only the final winner is run with gradients.
+## Cache
 
-The early selector can use x0-derived velocity MSE at
-`early_prediction.block`, or token-averaged REPA cosine distance at
-`repa.block`. Full-only exploration uses `k_early=1`, early-only exploration
-uses `k_full=1`, and hybrid exploration makes both values greater than one.
-
-Candidates are flattened into large batches for throughput. Each stage can be
-chunked independently using a divisor of its candidate count:
+Build the resumable cache before training:
 
 ```bash
---override exploration.early_candidate_chunk_size=2
---override exploration.full_candidate_chunk_size=1
+uv run torchrun --standalone --nproc-per-node=8 scripts/cache_tokens.py \
+  --config configs/ddt-baseline.yaml
 ```
 
-Sweep full-only K without changing the original data batch:
+Raw outputs are stored as BF16 with a byte-per-example completion bitmap. Once all
+values exist, ranks partition the memory map, accumulate per-channel sums and squared
+sums in FP64, all-reduce them, and save FP32 population mean/std. An interruption
+after encoding resumes at the statistics pass without loading the codec.
+
+For the pinned 1,281,167-example train split, `values.bf16` is 167,925,121,024 bytes
+(156.3925 GiB), the bitmap is about 1.22 MiB, and statistics are 8 KiB. Provision at
+least 170 GiB free. An uncompressed 1024×16×16 BF16 cache would be about 625.57 GiB.
+
+## Presets and training
+
+The four presets are:
+
+| Preset | K early | K full |
+|---|---:|---:|
+| `configs/ddt-baseline.yaml` | 1 | 1 |
+| `configs/ddt-k-early.yaml` | 4 | 1 |
+| `configs/ddt-k-final.yaml` | 1 | 4 |
+| `configs/ddt-k-hybrid.yaml` | 4 | 2 |
 
 ```bash
---override exploration.k_full=2
---override exploration.k_full=8
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/ddt-k-hybrid.yaml \
+  --output runs/ddt-k-hybrid
 ```
 
-`train.global_batch_size` always counts original ImageNet samples, not
-candidates.
+For K exploration, every early-stage candidate is scored with the base prefix under
+no-grad. The globally best `k_full` candidates are scored by the full path, and only
+the winning candidate receives the dual-head training forward/backward. Candidate
+chunking is configurable per stage and stable ties prefer the lower original index.
 
-## Setup and caches
+## Sampling
 
-Python 3.12 is required.
+Internal guidance is enabled by default:
+
+`guided = base + 1.78 * (full - base)` for `t ∈ [0.1, 1.0]`.
+
+CFG defaults to scale 1.0 (inactive). If explicitly enabled, IG is applied to each
+conditional branch first and CFG combines them afterward. Euler and Heun are
+available.
 
 ```bash
-uv sync --extra dev
-uv run hf auth login
-uv run wandb login
+uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
+  --checkpoint-dir runs/ddt-k-hybrid/checkpoints/last
+```
+
+## Verification
+
+```bash
 uv run pytest -q
 uv run ruff check .
 ```
 
-REPA uses frozen DINOv3 spatial features resized and L2-normalized to the SiT
-token grid. Cache them before throughput-sensitive runs:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/cache_features.py \
-  --config configs/sit-k-repa.yaml
-```
-
-FLUX.2 produces normalized `128x16x16` diffusion tensors. Build its cache with
-the same latent overrides used for training:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/cache_latents.py \
-  --config configs/sit-baseline.yaml \
-  --override model.input_space=flux2_latents \
-  --override model.in_channels=128 \
-  --override model.patch_size=2
-```
-
-Patch size 1 gives a 16x16 latent token grid; patch size 2 gives an 8x8 grid.
-REPA cache identity includes this grid size.
-
-## Training
-
-Pixel baseline:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/sit-baseline.yaml \
-  --output runs/sit-pixel
-```
-
-Cached latent K-final experiment:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/sit-k-final.yaml \
-  --override model.input_space=flux2_latents \
-  --override model.in_channels=128 \
-  --override model.patch_size=2 \
-  --override vae.cache.enabled=true \
-  --output runs/sit-latent-k4-final
-```
-
-Cached latent early-REPA experiment:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/sit-k-repa.yaml \
-  --override model.input_space=flux2_latents \
-  --override model.in_channels=128 \
-  --override model.patch_size=2 \
-  --override vae.cache.enabled=true \
-  --override repa.cache.enabled=true \
-  --output runs/sit-latent-k4-repa
-```
-
-Hybrid early-x0 experiment (8 total candidates, then 2 full evaluations):
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/sit-k-hybrid-early.yaml \
-  --output runs/sit-k8-hybrid-early
-```
-
-Resume with the identical resolved schema-v12 configuration:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/sit-k-repa.yaml \
-  --output runs/sit-k4-repa \
-  --resume runs/sit-k4-repa/checkpoints/last
-```
-
-Cached latents remove online VAE work. Cached REPA targets remove online DINOv3
-work and allow latent training to omit RGB decoding entirely. BF16, static
-compiled regions, SDPA, asynchronous host-to-device prefetch, and fused MLP
-projections are enabled by default. Gradient checkpointing is off because the
-no-grad selector already bounds K-way activation memory.
-
-## Validation and reporting
-
-Download the ADM ImageNet-256 reference statistics:
-
-```bash
-mkdir -p data
-curl -L \
-  https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz \
-  -o data/VIRTUAL_imagenet256_labeled.npz
-```
-
-Every validation row contains the FID together with:
-
-- `progress/epoch`
-- `progress/images_seen`
-- `compute/cumulative_model_flops`
-
-The same FID curve can therefore use epochs/images seen or model FLOPs as its
-x-axis. FLOPs count SiT, the REPA projector, the K-way selector, and the winner
-forward/backward. Frozen online VAE/DINO preprocessing, optimizer work, and
-evaluation are excluded; wall-clock and throughput metrics are logged
-separately.
-
-Selection diagnostics report early and full stage scores separately, along
-with both K values, total K, mean original winning index, images/s, and selector
-evaluations/s.
-
-Sample or evaluate a checkpoint with:
-
-```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --checkpoint-dir runs/sit-k4-repa/checkpoints/last \
-  --evaluate
-
-uv run python scripts/eval.py \
-  --samples runs/sit-k4-repa/checkpoints/last/samples-*/samples.npz \
-  --reference data/VIRTUAL_imagenet256_labeled.npz
-```
+Remote CUDA codec validation is opt-in through the integration test marker.

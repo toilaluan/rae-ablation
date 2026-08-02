@@ -1,24 +1,17 @@
-"""High-throughput SiT training with optional REPA and K-exploration."""
+"""RAEv2-compressed ImageNet training with DDT internal guidance and K exploration."""
 
-from .config import (
-    ExperimentConfig,
-    ExplorationConfig,
-    ModelConfig,
-    REPAConfig,
-    VAEConfig,
-    load_config,
-)
-from .model import SiT, SiTOutput, classifier_free_labels
+from .config import DDTConfig, ExperimentConfig, ExplorationConfig, RAEConfig, load_config
+from .model import DDT, DDTOutput, DiTwDDTHeadIG, classifier_free_labels
 
 __all__ = [
+    "DDT",
+    "DDTConfig",
+    "DDTOutput",
+    "DiTwDDTHeadIG",
     "ExperimentConfig",
     "ExplorationConfig",
-    "ModelConfig",
-    "REPAConfig",
-    "SiT",
-    "SiTOutput",
-    "VAEConfig",
+    "RAEConfig",
     "classifier_free_labels",
     "load_config",
 ]
-__version__ = "0.2.0"
+__version__ = "0.3.0"

@@ -7,9 +7,15 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 12
-FLUX2_SPATIAL_COMPRESSION = 16
-FLUX2_LATENT_CHANNELS = 128
+CONFIG_SCHEMA_VERSION = 13
+IMAGE_SIZE = 256
+RAE_CHANNELS = 1024
+RAE_INPUT_SIZE = 8
+RAE_TOKEN_COUNT = RAE_INPUT_SIZE**2
+RAE_BASE_REPOSITORY = "toilaluan/raev2-dinov3l-k7"
+RAE_BASE_REVISION = "46ce5a7e76df99eb5528020d3c65cef528a355fa"
+RAE_COMPRESSOR_REPOSITORY = "toilaluan/raev2-compressor"
+RAE_COMPRESSOR_REVISION = "846e2213dcf6218d3b726448ae52d8104c925c0f"
 
 
 def _positive(name: str, *values: int | float) -> None:
@@ -18,43 +24,9 @@ def _positive(name: str, *values: int | float) -> None:
 
 
 @dataclass
-class EncoderConfig:
-    model_name: str = "vit_base_patch16_dinov3.lvd1689m"
-    feature_dim: int = 768
-    register_tokens: int = 4
-
-
-@dataclass
-class REPACacheConfig:
-    enabled: bool = False
-    directory: str = "data/features"
-    batch_size: int = 128
-    log_interval: int = 10
-
-
-@dataclass
-class REPAConfig:
-    enabled: bool = False
-    block: int = 4
-    projection_hidden_size: int = 2048
-    loss_weight: float = 0.5
-    encoder: EncoderConfig = field(default_factory=EncoderConfig)
-    cache: REPACacheConfig = field(default_factory=REPACacheConfig)
-
-
-@dataclass
-class EarlyPredictionConfig:
-    enabled: bool = False
-    block: int = 4
-    mlp_hidden_size: int | None = None
-    loss_weight: float = 1.0
-
-
-@dataclass
 class ExplorationConfig:
     k_early: int = 1
     k_full: int = 1
-    early_selector: str = "none"
     early_candidate_chunk_size: int | None = None
     full_candidate_chunk_size: int | None = None
 
@@ -64,31 +36,25 @@ class ExplorationConfig:
 
 
 @dataclass
-class ModelConfig:
-    input_space: str = "pixels"
-    image_size: int = 256
-    in_channels: int = 3
-    patch_size: int = 16
-    hidden_size: int = 768
-    depth: int = 12
-    num_heads: int = 12
+class DDTConfig:
+    input_size: int = RAE_INPUT_SIZE
+    patch_size: list[int] = field(default_factory=lambda: [1, 1])
+    in_channels: int = RAE_CHANNELS
+    hidden_size: list[int] = field(default_factory=lambda: [768, 2048])
+    depth: list[int] = field(default_factory=lambda: [12, 2])
+    num_heads: list[int] = field(default_factory=lambda: [12, 16])
     mlp_ratio: float = 4.0
+    base_model_depth: int = 4
     num_classes: int = 1000
-    class_dropout_prob: float = 0.1
+    cfg_dropout_prob: float = 0.1
+    num_timestep_tokens: int = 4
+    num_class_tokens: int = 8
     gradient_checkpointing: bool = False
-    variant: str = "SiT-B"
-
-    @property
-    def input_size(self) -> int:
-        return (
-            self.image_size
-            if self.input_space == "pixels"
-            else self.image_size // FLUX2_SPATIAL_COMPRESSION
-        )
+    variant: str = "DDT-B/1-RAEv2-8x8"
 
     @property
     def grid_size(self) -> int:
-        return self.input_size // self.patch_size
+        return self.input_size // self.patch_size[0]
 
     @property
     def input_shape(self) -> tuple[int, int, int]:
@@ -96,42 +62,46 @@ class ModelConfig:
 
     @property
     def model_variant(self) -> str:
-        return f"{self.variant}/{self.patch_size}-{self.input_space}"
+        return self.variant
 
     def validate(self) -> None:
+        if len(self.patch_size) != 2 or len(self.hidden_size) != 2:
+            raise ValueError("model.patch_size and model.hidden_size must contain two values")
+        if len(self.depth) != 2 or len(self.num_heads) != 2:
+            raise ValueError("model.depth and model.num_heads must contain two values")
         _positive(
-            "model dimensions",
-            self.image_size,
+            "DDT dimensions",
+            self.input_size,
+            *self.patch_size,
             self.in_channels,
-            self.patch_size,
-            self.hidden_size,
-            self.depth,
-            self.num_heads,
+            *self.hidden_size,
+            *self.depth,
+            *self.num_heads,
             self.mlp_ratio,
+            self.base_model_depth,
             self.num_classes,
+            self.num_timestep_tokens,
+            self.num_class_tokens,
         )
-        if self.input_space not in {"pixels", "flux2_latents"}:
-            raise ValueError("model.input_space must be pixels or flux2_latents")
-        expected_channels = 3 if self.input_space == "pixels" else FLUX2_LATENT_CHANNELS
-        if self.in_channels != expected_channels:
-            raise ValueError(
-                f"model.in_channels must be {expected_channels} for "
-                f"model.input_space={self.input_space}"
-            )
-        if self.input_space == "flux2_latents" and (
-            self.image_size % FLUX2_SPATIAL_COMPRESSION
+        if self.input_size % self.patch_size[0] or self.input_size % self.patch_size[1]:
+            raise ValueError("DDT input size must be divisible by both patch sizes")
+        for stage, (width, heads) in enumerate(
+            zip(self.hidden_size, self.num_heads, strict=True)
         ):
-            raise ValueError("FLUX.2 latent mode requires image_size divisible by 16")
-        if self.input_size % self.patch_size:
-            raise ValueError("diffusion input size must be divisible by model.patch_size")
-        if self.hidden_size % self.num_heads:
-            raise ValueError("model.hidden_size must be divisible by model.num_heads")
-        if (self.hidden_size // self.num_heads) % 4:
-            raise ValueError("attention head dimension must be divisible by four for 2D RoPE")
-        if not 0 <= self.class_dropout_prob < 1:
-            raise ValueError("model.class_dropout_prob must be in [0, 1)")
+            if width % heads:
+                raise ValueError(f"model.hidden_size[{stage}] must be divisible by num_heads")
+            if (width // heads) % 4:
+                raise ValueError("attention head dimensions must be divisible by four for 2D RoPE")
+        if self.base_model_depth > self.depth[0]:
+            raise ValueError("model.base_model_depth must be within encoder depth")
+        if not 0 <= self.cfg_dropout_prob < 1:
+            raise ValueError("model.cfg_dropout_prob must be in [0, 1)")
         if not self.variant:
             raise ValueError("model.variant cannot be empty")
+
+
+# ModelConfig is retained as a descriptive alias, not the old generic model schema.
+ModelConfig = DDTConfig
 
 
 @dataclass
@@ -154,20 +124,44 @@ class DataConfig:
 
 
 @dataclass
-class VAECacheConfig:
-    enabled: bool = False
-    directory: str = "data/latents"
+class TokenCacheConfig:
+    directory: str = "data/rae-tokens"
     batch_size: int = 128
     log_interval: int = 10
 
 
 @dataclass
-class VAEConfig:
-    model_name: str = "black-forest-labs/FLUX.2-klein-4B"
-    revision: str = "5e67da950fce4a097bc150c22958a05716994cea"
-    subfolder: str = "vae"
+class RAEConfig:
+    base_repository: str = RAE_BASE_REPOSITORY
+    base_revision: str = RAE_BASE_REVISION
+    compressor_repository: str = RAE_COMPRESSOR_REPOSITORY
+    compressor_revision: str = RAE_COMPRESSOR_REVISION
+    trust_remote_code: bool = True
+    remote_code_schema: int = 1
     micro_batch_size: int = 16
-    cache: VAECacheConfig = field(default_factory=VAECacheConfig)
+    cache: TokenCacheConfig = field(default_factory=TokenCacheConfig)
+
+    def validate(self) -> None:
+        expected = (
+            ("base_repository", self.base_repository, RAE_BASE_REPOSITORY),
+            ("base_revision", self.base_revision, RAE_BASE_REVISION),
+            ("compressor_repository", self.compressor_repository, RAE_COMPRESSOR_REPOSITORY),
+            ("compressor_revision", self.compressor_revision, RAE_COMPRESSOR_REVISION),
+        )
+        for name, actual, pinned in expected:
+            if actual != pinned:
+                raise ValueError(f"rae.{name} must use pinned source {pinned}")
+        if self.trust_remote_code is not True:
+            raise ValueError("rae.trust_remote_code must be true")
+        _positive(
+            "RAE settings",
+            self.remote_code_schema,
+            self.micro_batch_size,
+            self.cache.batch_size,
+            self.cache.log_interval,
+        )
+        if not self.cache.directory:
+            raise ValueError("rae.cache.directory cannot be empty")
 
 
 @dataclass
@@ -190,7 +184,9 @@ class TrainConfig:
     seed: int = 0
     timestep_loc: float = 0.0
     timestep_scale: float = 1.0
+    timestep_shift: float = 4.0
     velocity_denominator_floor: float = 0.05
+    base_loss_weight: float = 1.0
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
 
@@ -200,10 +196,13 @@ class SamplingConfig:
     batch_size: int = 32
     sampling_steps: int = 50
     solver: str = "euler"
-    guidance_scale: float = 1.78
-    timestep_shift: float = 1.0
+    timestep_shift: float = 4.0
+    ig_scale: float = 1.78
+    ig_start: float = 0.1
+    ig_end: float = 1.0
+    cfg_scale: float = 1.0
     cfg_start: float = 0.0
-    cfg_end: float = 0.9
+    cfg_end: float = 1.0
     log_interval: int = 10
 
 
@@ -236,7 +235,7 @@ class CheckpointConfig:
 class WandbConfig:
     enabled: bool = False
     entity: str | None = None
-    project: str = "sit-k-exploration"
+    project: str = "rae-ddt-k-exploration"
     name: str | None = None
     group: str | None = None
     tags: list[str] = field(default_factory=list)
@@ -248,10 +247,8 @@ class WandbConfig:
 class ExperimentConfig:
     schema_version: int = CONFIG_SCHEMA_VERSION
     data: DataConfig = field(default_factory=DataConfig)
-    vae: VAEConfig = field(default_factory=VAEConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
-    repa: REPAConfig = field(default_factory=REPAConfig)
-    early_prediction: EarlyPredictionConfig = field(default_factory=EarlyPredictionConfig)
+    rae: RAEConfig = field(default_factory=RAEConfig)
+    model: DDTConfig = field(default_factory=DDTConfig)
     exploration: ExplorationConfig = field(default_factory=ExplorationConfig)
     compile: CompileConfig = field(default_factory=CompileConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
@@ -268,79 +265,18 @@ class ExperimentConfig:
                 f"schema_version: {CONFIG_SCHEMA_VERSION} is required (clean break)"
             )
         self.model.validate()
-        if self.model.input_space == "flux2_latents":
-            if not self.vae.model_name or not self.vae.revision or not self.vae.subfolder:
-                raise ValueError("latent mode requires a pinned VAE model, revision, and subfolder")
-            _positive(
-                "VAE settings",
-                self.vae.micro_batch_size,
-                self.vae.cache.batch_size,
-                self.vae.cache.log_interval,
-            )
-        elif self.vae.cache.enabled:
-            raise ValueError("vae.cache.enabled requires flux2_latents input")
-
-        repa = self.repa
-        if repa.enabled:
-            _positive(
-                "REPA settings",
-                repa.block,
-                repa.projection_hidden_size,
-                repa.encoder.feature_dim,
-                repa.encoder.register_tokens,
-                repa.cache.batch_size,
-                repa.cache.log_interval,
-            )
-            if repa.block > self.model.depth:
-                raise ValueError("repa.block must be within model.depth")
-            if repa.loss_weight < 0:
-                raise ValueError("repa.loss_weight cannot be negative")
-            if not repa.encoder.model_name or not repa.cache.directory:
-                raise ValueError("REPA encoder and cache directory cannot be empty")
-        elif repa.cache.enabled:
-            raise ValueError("repa.cache.enabled requires repa.enabled=true")
-
-        early = self.early_prediction
-        if early.enabled:
-            _positive("early prediction block", early.block)
-            if early.block > self.model.depth:
-                raise ValueError("early_prediction.block must be within model.depth")
-            if early.mlp_hidden_size is not None:
-                _positive("early prediction MLP hidden size", early.mlp_hidden_size)
-            if early.loss_weight < 0:
-                raise ValueError("early_prediction.loss_weight cannot be negative")
-
+        self.rae.validate()
+        if self.model.input_shape != (RAE_CHANNELS, RAE_INPUT_SIZE, RAE_INPUT_SIZE):
+            raise ValueError("schema-v13 experiments must consume 1024x8x8 RAE tokens")
+        if self.model.patch_size != [1, 1]:
+            raise ValueError("schema-v13 experiments require model.patch_size [1, 1]")
         explore = self.exploration
         for name, value in (("k_early", explore.k_early), ("k_full", explore.k_full)):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"exploration.{name} must be a positive integer")
-        if explore.early_selector not in {"none", "early_prediction", "repa"}:
-            raise ValueError(
-                "exploration.early_selector must be none, early_prediction, or repa"
-            )
-        if explore.k_early == 1 and explore.early_selector != "none":
-            raise ValueError("k_early=1 requires exploration.early_selector=none")
-        if explore.k_early > 1 and explore.early_selector == "none":
-            raise ValueError("k_early>1 requires an early exploration selector")
-        if explore.early_selector == "repa" and not repa.enabled:
-            raise ValueError("REPA selection requires repa.enabled=true")
-        if explore.early_selector == "early_prediction" and not early.enabled:
-            raise ValueError(
-                "early prediction selection requires early_prediction.enabled=true"
-            )
         for name, chunk, candidates, active in (
-            (
-                "early_candidate_chunk_size",
-                explore.early_candidate_chunk_size,
-                explore.k_total,
-                explore.k_early > 1,
-            ),
-            (
-                "full_candidate_chunk_size",
-                explore.full_candidate_chunk_size,
-                explore.k_full,
-                explore.k_full > 1,
-            ),
+            ("early_candidate_chunk_size", explore.early_candidate_chunk_size, explore.k_total, explore.k_early > 1),
+            ("full_candidate_chunk_size", explore.full_candidate_chunk_size, explore.k_full, explore.k_full > 1),
         ):
             if chunk is None:
                 continue
@@ -349,10 +285,7 @@ class ExperimentConfig:
             if not isinstance(chunk, int) or isinstance(chunk, bool) or chunk < 1:
                 raise ValueError(f"exploration.{name} must be a positive integer")
             if chunk > candidates or candidates % chunk:
-                raise ValueError(
-                    f"exploration.{name} must divide its stage candidate count"
-                )
-
+                raise ValueError(f"exploration.{name} must divide its stage candidate count")
         if self.train.optimizer.kind not in {"adamw", "muon", "fused_muon"}:
             raise ValueError("optimizer.kind must be adamw, muon, or fused_muon")
         if self.wandb.mode not in {"online", "offline", "disabled"}:
@@ -363,30 +296,27 @@ class ExperimentConfig:
             raise ValueError("data.max_samples must be positive")
         if not self.data.repository or not self.data.revision or not self.data.split:
             raise ValueError("data repository, revision, and split cannot be empty")
-        if self.train.epochs < 1 or self.train.global_batch_size < 1:
-            raise ValueError("training epochs and global batch size must be positive")
+        _positive("training counts", self.train.epochs, self.train.global_batch_size)
         if self.train.max_steps is not None and self.train.max_steps < 1:
             raise ValueError("train.max_steps must be positive")
         if not 0 < self.train.ema_decay < 1:
             raise ValueError("train.ema_decay must be in (0, 1)")
         if not math.isfinite(self.train.timestep_loc):
             raise ValueError("train.timestep_loc must be finite")
-        if not math.isfinite(self.train.timestep_scale) or self.train.timestep_scale <= 0:
-            raise ValueError("train.timestep_scale must be finite and positive")
-        if self.train.velocity_denominator_floor <= 0:
-            raise ValueError("train.velocity_denominator_floor must be positive")
-        for name, value in (
-            ("validation.interval", self.validation.interval),
-            ("checkpoint.interval", self.checkpoint.interval),
-        ):
+        _positive(
+            "training flow settings",
+            self.train.timestep_scale,
+            self.train.timestep_shift,
+            self.train.velocity_denominator_floor,
+        )
+        if self.train.base_loss_weight < 0:
+            raise ValueError("train.base_loss_weight cannot be negative")
+        for name, value in (("validation.interval", self.validation.interval), ("checkpoint.interval", self.checkpoint.interval)):
             if value < 0:
                 raise ValueError(f"{name} cannot be negative")
         if self.validation.periodic_samples > self.validation.final_samples:
             raise ValueError("periodic validation must be a subset of final validation")
-        if (
-            self.validation.periodic_samples % self.model.num_classes
-            or self.validation.final_samples % self.model.num_classes
-        ):
+        if self.validation.periodic_samples % self.model.num_classes or self.validation.final_samples % self.model.num_classes:
             raise ValueError("validation sample counts must be class balanced")
         if self.checkpoint.keep_last_n < 0:
             raise ValueError("checkpoint.keep_last_n cannot be negative")
@@ -399,12 +329,15 @@ class ExperimentConfig:
             raise ValueError("sampling.solver must be euler or heun")
         if s.num_samples % self.model.num_classes:
             raise ValueError("sampling.num_samples must be class balanced")
-        if not math.isfinite(s.guidance_scale):
-            raise ValueError("sampling.guidance_scale must be finite")
-        if not math.isfinite(s.timestep_shift) or s.timestep_shift <= 0:
-            raise ValueError("sampling.timestep_shift must be finite and positive")
-        if not 0 <= s.cfg_start <= s.cfg_end <= 1:
-            raise ValueError("sampling CFG interval must satisfy 0 <= start <= end <= 1")
+        for name, value in (("timestep_shift", s.timestep_shift), ("ig_scale", s.ig_scale), ("cfg_scale", s.cfg_scale)):
+            if not math.isfinite(value):
+                raise ValueError(f"sampling.{name} must be finite")
+        if s.timestep_shift <= 0:
+            raise ValueError("sampling.timestep_shift must be positive")
+        if not 0 <= s.ig_start < s.ig_end <= 1:
+            raise ValueError("sampling IG interval must satisfy 0 <= start < end <= 1")
+        if not 0 <= s.cfg_start < s.cfg_end <= 1:
+            raise ValueError("sampling CFG interval must satisfy 0 <= start < end <= 1")
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -453,6 +386,4 @@ def load_config(path: str | Path | None = None, overrides: list[str] | None = No
 
 
 def load_checkpoint_config(path: str | Path) -> ExperimentConfig:
-    return _structured_config(
-        deepcopy(_require_current_schema(json.loads(Path(path).read_text()), path))
-    )
+    return _structured_config(deepcopy(_require_current_schema(json.loads(Path(path).read_text()), path)))

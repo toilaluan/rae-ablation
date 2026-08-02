@@ -13,8 +13,8 @@ from torch import Tensor, nn
 
 from .model.compile import clean_state_dict
 
-CHECKPOINT_SCHEMA_VERSION = 12
-TRAINING_STATE_SCHEMA_VERSION = 12
+CHECKPOINT_SCHEMA_VERSION = 13
+TRAINING_STATE_SCHEMA_VERSION = 13
 
 
 def _contiguous(state: dict[str, object]) -> dict[str, Tensor]:
@@ -36,8 +36,7 @@ class ResumeState:
     validation_plan_hash: str
     optimizer: dict[str, Any]
     rng_streams: dict[str, Tensor]
-    feature_cache_fingerprints: dict[str, str] | None = None
-    latent_cache_fingerprint: str | None = None
+    token_cache_fingerprint: str
 
 
 def should_checkpoint(completed_epoch: int, total_epochs: int, interval: int) -> bool:
@@ -92,10 +91,11 @@ class CheckpointManager:
         last_completed_validation_epoch: int | None,
         wandb_run_id: str | None,
         resolved_config: dict[str, Any],
-        feature_cache_fingerprints: dict[str, str] | None = None,
-        latent_cache_fingerprint: str | None = None,
+        token_cache_fingerprint: str,
         fid: float | None = None,
     ) -> Path:
+        if not token_cache_fingerprint:
+            raise ValueError("schema-v13 checkpoints require token-cache provenance")
         name = f"epoch-{completed_epoch:04d}"
         target = self.directory / name
         if target.exists():
@@ -115,8 +115,7 @@ class CheckpointManager:
             "validation_plan_hash": validation_plan_hash,
             "optimizer": optimizer_state,
             "rng_streams": rng_streams,
-            "feature_cache_fingerprints": feature_cache_fingerprints,
-            "latent_cache_fingerprint": latent_cache_fingerprint,
+            "token_cache_fingerprint": token_cache_fingerprint,
         }
         torch.save(training, temporary / "training.pt")
         (temporary / "config.json").write_text(
@@ -137,8 +136,7 @@ class CheckpointManager:
                     "global_step": global_step,
                     "data_fingerprint": data_fingerprint,
                     "validation_plan_hash": validation_plan_hash,
-                    "feature_cache_fingerprints": feature_cache_fingerprints,
-                    "latent_cache_fingerprint": latent_cache_fingerprint,
+                    "token_cache_fingerprint": token_cache_fingerprint,
                 },
                 indent=2,
                 sort_keys=True,
@@ -203,8 +201,7 @@ class CheckpointManager:
         ema: EMA,
         expected_data_fingerprint: str | None = None,
         expected_validation_plan_hash: str | None = None,
-        expected_feature_cache_fingerprints: dict[str, str] | None = None,
-        expected_latent_cache_fingerprint: str | None = None,
+        expected_token_cache_fingerprint: str | None = None,
     ) -> ResumeState:
         path = Path(checkpoint)
         if not path.is_absolute():
@@ -212,7 +209,7 @@ class CheckpointManager:
         metadata_path = path / "metadata.json"
         if not metadata_path.is_file():
             raise ValueError(
-                "checkpoint predates schema v12; old checkpoints are not supported"
+                "checkpoint predates schema v13; old checkpoints are not supported"
             )
         metadata = json.loads(metadata_path.read_text())
         if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
@@ -238,21 +235,16 @@ class CheckpointManager:
             and state["validation_plan_hash"] != expected_validation_plan_hash
         ):
             raise ValueError("checkpoint validation-plan hash mismatch")
-        saved_cache_fingerprints = state.get("feature_cache_fingerprints")
-        if expected_feature_cache_fingerprints != saved_cache_fingerprints and (
-            expected_feature_cache_fingerprints is not None
-            or saved_cache_fingerprints is not None
+        saved_token_fingerprint = state.get("token_cache_fingerprint")
+        if not isinstance(saved_token_fingerprint, str) or not saved_token_fingerprint:
+            raise ValueError("checkpoint has no token-cache provenance")
+        if metadata.get("token_cache_fingerprint") != saved_token_fingerprint:
+            raise ValueError("checkpoint token-cache provenance is inconsistent")
+        if expected_token_cache_fingerprint != saved_token_fingerprint and (
+            expected_token_cache_fingerprint is not None
+            or saved_token_fingerprint is not None
         ):
-            raise ValueError("checkpoint feature-cache fingerprints mismatch")
-        saved_latent_fingerprint = state.get("latent_cache_fingerprint")
-        if (
-            expected_latent_cache_fingerprint != saved_latent_fingerprint
-            and (
-                expected_latent_cache_fingerprint is not None
-                or saved_latent_fingerprint is not None
-            )
-        ):
-            raise ValueError("checkpoint latent-cache fingerprint mismatch")
+            raise ValueError("checkpoint token-cache fingerprint mismatch")
         return ResumeState(**state)
 
     def export_ema(self, ema: EMA, path: str | Path) -> None:

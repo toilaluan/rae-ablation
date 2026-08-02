@@ -25,10 +25,13 @@ class SamplingParameters:
     batch_size: int = 32
     sampling_steps: int = 50
     solver: str = "euler"
-    guidance_scale: float = 1.78
-    timestep_shift: float = 1.0
+    timestep_shift: float = 4.0
+    ig_scale: float = 1.78
+    ig_start: float = 0.1
+    ig_end: float = 1.0
+    cfg_scale: float = 1.0
     cfg_start: float = 0.0
-    cfg_end: float = 0.9
+    cfg_end: float = 1.0
     log_interval: int = 10
 
     @property
@@ -46,15 +49,17 @@ class SamplingParameters:
             raise ValueError("sampling solver must be euler or heun")
         if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
             raise ValueError("timestep shift must be finite and positive")
-        if not math.isfinite(self.guidance_scale):
-            raise ValueError("guidance scale must be finite")
-        if not 0 <= self.cfg_start <= self.cfg_end <= 1:
-            raise ValueError("CFG interval must satisfy 0 <= start <= end <= 1")
+        if not math.isfinite(self.ig_scale) or not math.isfinite(self.cfg_scale):
+            raise ValueError("guidance scales must be finite")
+        if not 0 <= self.ig_start < self.ig_end <= 1:
+            raise ValueError("IG interval must satisfy 0 <= start < end <= 1")
+        if not 0 <= self.cfg_start < self.cfg_end <= 1:
+            raise ValueError("CFG interval must satisfy 0 <= start < end <= 1")
 
 
 GenerateBatch = Callable[[Tensor, Tensor, Tensor], Tensor]
 SAMPLING_MANIFEST_SCHEMA_VERSION = 17
-FEATURE_SCHEMA_VERSION = 10
+FEATURE_SCHEMA_VERSION = 13
 
 
 def _float_slug(value: float) -> str:
@@ -67,9 +72,11 @@ def sampling_output_name(sample_count: int, parameters: SamplingParameters) -> s
         raise ValueError("sample count must be positive")
     return (
         f"samples-{parameters.solver}-n{sample_count}-steps{parameters.sampling_steps}"
-        f"-cfg{_float_slug(parameters.guidance_scale)}"
+        f"-ig{_float_slug(parameters.ig_scale)}"
+        f"-cfg{_float_slug(parameters.cfg_scale)}"
         f"-shift{_float_slug(parameters.timestep_shift)}"
-        f"-window{_float_slug(parameters.cfg_start)}-{_float_slug(parameters.cfg_end)}"
+        f"-igwindow{_float_slug(parameters.ig_start)}-{_float_slug(parameters.ig_end)}"
+        f"-cfgwindow{_float_slug(parameters.cfg_start)}-{_float_slug(parameters.cfg_end)}"
     )
 
 
@@ -169,7 +176,7 @@ def _manifest_base(
         "sample_ids_sha256": ids_digest,
         "image_size": image_size,
         "patch_size": patch_size,
-        "jit_grid_size": grid_size,
+        "ddt_grid_size": grid_size,
         "model_variant": model_variant,
         "feature_schema": feature_schema,
         "sample_count": sample_count,
@@ -181,7 +188,9 @@ def _manifest_base(
             "solver": parameters.solver,
             "sampling_steps": parameters.sampling_steps,
             "sampling_nfe": parameters.sampling_nfe,
-            "guidance_scale": parameters.guidance_scale,
+            "ig_scale": parameters.ig_scale,
+            "ig_interval": [parameters.ig_start, parameters.ig_end],
+            "cfg_scale": parameters.cfg_scale,
             "timestep_shift": parameters.timestep_shift,
             "cfg_interval": [parameters.cfg_start, parameters.cfg_end],
         },
@@ -392,8 +401,9 @@ def sample_to_archive(
             f"sampling configuration: samples={sample_count} classes={num_classes} "
             f"batch_size={parameters.batch_size} solver={parameters.solver} "
             f"steps={parameters.sampling_steps} nfe={parameters.sampling_nfe} "
-            f"guidance={parameters.guidance_scale:g} "
+            f"ig={parameters.ig_scale:g} cfg={parameters.cfg_scale:g} "
             f"timestep_shift={parameters.timestep_shift:g} "
+            f"ig_interval=[{parameters.ig_start:g}, {parameters.ig_end:g}] "
             f"cfg_interval=[{parameters.cfg_start:g}, {parameters.cfg_end:g}]"
         )
         print(f"sampling state: {status}, completed={state[1]}/{sample_count}")
