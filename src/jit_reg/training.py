@@ -19,7 +19,7 @@ from .model.tokens import classifier_free_labels
 from .objective import ddt_losses, noisy_interpolate, sample_timesteps
 from .optim import CompositeOptimizer, learning_rate_at_epoch, set_learning_rate
 from .rng import RNGStreams
-from .token_cache import TokenCache
+from .token_cache import TokenCache, normalize_tokens
 from .validation import should_validate
 from .wandb_utils import RunLogger
 
@@ -34,32 +34,101 @@ def prepare_train_batch(
     batch: TrainBatch,
     device: torch.device | str,
     *,
+    mean: Tensor | None = None,
+    std: Tensor | None = None,
     non_blocking: bool = False,
 ) -> TrainBatch:
+    if (mean is None) != (std is None):
+        raise ValueError("mean and std must be supplied together")
+    tokens = batch.tokens.to(device, non_blocking=non_blocking)
+    if mean is not None and std is not None:
+        tokens = normalize_tokens(tokens, mean, std)
     return TrainBatch(
-        batch.tokens.to(device, non_blocking=non_blocking),
+        tokens,
         batch.labels.to(device, dtype=torch.long, non_blocking=non_blocking),
         batch.indices.to(device, dtype=torch.long, non_blocking=non_blocking),
     )
 
 
 class _PreparedBatchIterator(Iterator[TrainBatch]):
-    def __init__(self, source: Iterator[TrainBatch], device: torch.device) -> None:
+    """Double-buffer batches and normalize raw latents on the target device."""
+
+    def __init__(
+        self,
+        source: Iterator[TrainBatch],
+        device: torch.device,
+        mean: Tensor,
+        std: Tensor,
+    ) -> None:
         self.source = source
         self.device = device
+        self.mean = mean.to(device)
+        self.std = std.to(device)
         self.data_wait_seconds = 0.0
+        self._next_batch: TrainBatch | None = None
+        self._exhausted = False
+        self._stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        self._preload()
 
     def __iter__(self) -> _PreparedBatchIterator:
         return self
 
     def __next__(self) -> TrainBatch:
+        batch = self.consume()
+        self.preload()
+        return batch
+
+    def consume(self) -> TrainBatch:
+        if self._next_batch is None:
+            raise StopIteration
+
+        batch = self._next_batch
+        self._next_batch = None
+
+        if self._stream is not None:
+            current = torch.cuda.current_stream(self.device)
+            current.wait_stream(self._stream)
+            for tensor in batch:
+                tensor.record_stream(current)
+        return batch
+
+    def preload(self) -> None:
+        if self._next_batch is None:
+            self._preload()
+
+    def _preload(self) -> None:
+        if self._exhausted:
+            return
         started = time.perf_counter()
-        batch = next(self.source)
+        try:
+            batch = next(self.source)
+        except StopIteration:
+            self._exhausted = True
+            return
         self.data_wait_seconds += time.perf_counter() - started
-        return prepare_train_batch(batch, self.device)
+
+        if self._stream is None:
+            self._next_batch = prepare_train_batch(
+                batch,
+                self.device,
+                mean=self.mean,
+                std=self.std,
+            )
+            return
+
+        with torch.cuda.stream(self._stream):
+            self._next_batch = prepare_train_batch(
+                batch,
+                self.device,
+                mean=self.mean,
+                std=self.std,
+                non_blocking=True,
+            )
 
     def close(self) -> None:
-        return None
+        if self._stream is not None:
+            self._stream.synchronize()
+        self._next_batch = None
 
 
 class _TrainBatchCollator:
@@ -70,7 +139,7 @@ class _TrainBatchCollator:
         _pixels, label_values, index_values = zip(*samples, strict=True)
         labels = default_collate(label_values)
         indices = default_collate(index_values)
-        return TrainBatch(self.cache.lookup(indices), labels, indices)
+        return TrainBatch(self.cache.raw_lookup(indices), labels, indices)
 
 
 def distributed_info() -> tuple[int, int]:
@@ -161,6 +230,8 @@ def train(
         raise ValueError("RAE-DDT training requires a complete token cache")
 
     step_flops = model_flops_per_step(config)
+    token_mean = token_cache.mean.to(device)
+    token_std = token_cache.std.to(device)
     optimizer.zero_grad()
     for epoch_index in range(state.epoch, config.train.epochs):
         logger.event(f"epoch {epoch_index + 1}/{config.train.epochs} started")
@@ -168,13 +239,13 @@ def train(
             sampler.set_epoch(epoch_index)
         execution_model.train()
         epoch_started = time.perf_counter()
-        iterator = _PreparedBatchIterator(iter(loader), device)
-        previous_wait = iterator.data_wait_seconds
+        iterator = _PreparedBatchIterator(iter(loader), device, token_mean, token_std)
+        previous_wait = 0.0
         for batch_index in range(len(loader)):
-            step_started = time.perf_counter()
-            clean, labels, _indices = next(iterator)
-            data_wait = iterator.data_wait_seconds - previous_wait
-            previous_wait = iterator.data_wait_seconds
+            # Include first-batch pipeline warmup in the first step. Later steps
+            # start after the preceding iteration has finished logging.
+            step_started = epoch_started if batch_index == 0 else time.perf_counter()
+            clean, labels, _indices = iterator.consume()
             clean = clean.float()
             timesteps = sample_timesteps(
                 clean.shape[0],
@@ -244,6 +315,16 @@ def train(
             optimizer.zero_grad()
             ema.update(canonical_model)
             state.global_step += 1
+            reached_step_limit = (
+                config.train.max_steps is not None
+                and state.global_step >= config.train.max_steps
+            )
+            if batch_index + 1 < len(loader) and not reached_step_limit:
+                # DataLoader dequeue, H2D, and GPU normalization now run while
+                # the current step's queued CUDA work is still executing.
+                iterator.preload()
+            data_wait = iterator.data_wait_seconds - previous_wait
+            previous_wait = iterator.data_wait_seconds
             elapsed = max(time.perf_counter() - step_started, 1e-9)
             metrics = {
                 "train/loss": losses.total.item(),

@@ -536,7 +536,9 @@ class TokenCache:
         positions = indices.detach().cpu().numpy().astype(np.int64, copy=False)
         if positions.ndim != 1 or np.any(positions < 0) or np.any(positions >= self.shape[0]):
             raise IndexError("token-cache index is out of range")
-        bits = np.asarray(self.values[positions]).copy()
+        # NumPy advanced indexing already returns an owning copy. Copying it again
+        # doubles host-memory traffic for every training batch.
+        bits = self.values[positions]
         return torch.from_numpy(bits).view(torch.bfloat16)
 
     def lookup(self, indices: Tensor) -> Tensor:
