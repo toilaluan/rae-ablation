@@ -83,7 +83,7 @@ def main() -> None:
     digest = checkpoint_sha256(bundle.weights) if rank == 0 else None
     digest = broadcast_string(digest, rank)
 
-    model = SiT(config.model, config.repa).to(device)
+    model = SiT(config.model, config.repa, config.early_prediction).to(device)
     model.load_state_dict(load_file(str(bundle.weights), device=str(device)))
     model.eval()
     execution_model = compile_model_regions(model, config.compile)
@@ -154,6 +154,7 @@ def main() -> None:
                 else None
             ),
             "repa": asdict(config.repa),
+            "early_prediction": asdict(config.early_prediction),
         },
         checkpoint_hash=digest,
         parameters=parameters,

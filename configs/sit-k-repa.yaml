@@ -1,4 +1,4 @@
-schema_version: 11
+schema_version: 12
 model:
   variant: SiT-B
   input_space: pixels
@@ -15,9 +15,10 @@ repa:
   projection_hidden_size: 2048
   loss_weight: 0.5
 exploration:
-  k: 4
-  selector: repa
-  candidate_chunk_size: null
+  k_early: 4
+  k_full: 1
+  early_selector: repa
+  early_candidate_chunk_size: null
 wandb:
   project: sit-k-exploration
   name: sit-repa-k4-early

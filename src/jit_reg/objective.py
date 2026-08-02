@@ -12,6 +12,7 @@ class SiTLoss(NamedTuple):
     total: Tensor
     velocity: Tensor
     repa: Tensor
+    early_velocity: Tensor
 
 
 def sample_normal(
@@ -113,6 +114,8 @@ def sit_losses(
     repa_prediction: Tensor | None = None,
     repa_target: Tensor | None = None,
     repa_weight: float = 0.5,
+    early_x_prediction: Tensor | None = None,
+    early_weight: float = 1.0,
     velocity_denominator_floor: float = 0.05,
 ) -> SiTLoss:
     velocity = per_sample_velocity_mse(
@@ -130,7 +133,24 @@ def sit_losses(
         raise ValueError("REPA prediction and target must be provided together")
     else:
         repa = per_sample_repa_cosine_loss(repa_prediction, repa_target).mean()
-    return SiTLoss(velocity + repa_weight * repa, velocity, repa)
+    early_velocity = (
+        zero
+        if early_x_prediction is None
+        else per_sample_velocity_mse(
+            clean,
+            noise,
+            noisy,
+            timestep,
+            early_x_prediction,
+            floor=velocity_denominator_floor,
+        ).mean()
+    )
+    return SiTLoss(
+        velocity + repa_weight * repa + early_weight * early_velocity,
+        velocity,
+        repa,
+        early_velocity,
+    )
 
 
 def shift_timestep(u: Tensor, alpha: float | Tensor) -> Tensor:

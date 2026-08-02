@@ -1,4 +1,4 @@
-# SiT REPA and K-exploration
+# SiT REPA and hybrid K-exploration
 
 This repository trains a class-conditional SiT on ImageNet-256 in either RGB
 pixel space or normalized FLUX.2 VAE space. It is intentionally limited to
@@ -9,7 +9,7 @@ three questions:
 3. What happens when every source image explores K independent noise samples
    and trains only on the best candidate?
 
-Configuration schema v11 is a clean break. Old DDT/REG checkpoints are not
+Configuration schema v12 is a clean break. Older checkpoints are not
 loadable. Existing schema-v4 REPA caches and FLUX.2 latent caches remain
 reusable.
 
@@ -32,38 +32,47 @@ loss     = mse(v_pred, v_target)
 Sampling likewise applies classifier-free guidance to x-predictions and only
 then converts them to velocity for Euler or Heun integration.
 
+An optional early x0 head can be attached after a configured SiT block. It is
+a compact token-wise MLP whose input states are detached, so its auxiliary
+velocity loss trains the head without asking the transformer trunk to predict
+x0 early. Sampling never evaluates this head.
+
 ## Experiment modes
 
-| Preset | REPA | K | Selector |
-| --- | ---: | ---: | --- |
-| `configs/sit-baseline.yaml` | no | 1 | none |
-| `configs/sit-repa.yaml` | yes | 1 | none |
-| `configs/sit-k-final.yaml` | no | 4 | final velocity MSE |
-| `configs/sit-k-final-repa.yaml` | yes | 4 | final velocity MSE |
-| `configs/sit-k-repa.yaml` | yes | 4 | block-4 REPA cosine distance |
+| Preset | REPA | Early head | K early | K full | Early selector |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `configs/sit-baseline.yaml` | no | no | 1 | 1 | none |
+| `configs/sit-repa.yaml` | yes | no | 1 | 1 | none |
+| `configs/sit-k-final.yaml` | no | no | 1 | 4 | none |
+| `configs/sit-k-final-repa.yaml` | yes | no | 1 | 4 | none |
+| `configs/sit-k-repa.yaml` | yes | no | 4 | 1 | REPA |
+| `configs/sit-k-hybrid-early.yaml` | no | yes | 4 | 2 | early x0 |
+| `configs/sit-k-hybrid-repa.yaml` | yes | no | 4 | 2 | REPA |
 
-For K-exploration, every original sample gets one timestep and K independent
-noises. Candidate scoring runs under no-grad. The winner is gathered and run
-again through the full model with gradients, so rejected candidates retain no
-activation graph and receive no backward pass.
+Exploration generates `K_total = K_early * K_full` independent noises for each
+source sample at one timestep. When `K_early > 1`, the early selector scores
+all candidates and retains the globally best `K_full`. When `K_full > 1`, the
+full model scores those finalists with velocity MSE and selects one. Candidate
+scoring runs under no-grad; only the final winner is run with gradients.
 
-The final selector evaluates all SiT blocks and chooses the smallest velocity
-MSE. The early selector evaluates only through `repa.block`, chooses the
-smallest token-averaged cosine distance to the clean DINOv3 target, and avoids
-running rejected candidates through the remaining blocks.
+The early selector can use x0-derived velocity MSE at
+`early_prediction.block`, or token-averaged REPA cosine distance at
+`repa.block`. Full-only exploration uses `k_early=1`, early-only exploration
+uses `k_full=1`, and hybrid exploration makes both values greater than one.
 
-Candidates are flattened into one large batch for maximum throughput. If that
-does not fit, set a divisor of K:
+Candidates are flattened into large batches for throughput. Each stage can be
+chunked independently using a divisor of its candidate count:
 
 ```bash
---override exploration.candidate_chunk_size=2
+--override exploration.early_candidate_chunk_size=2
+--override exploration.full_candidate_chunk_size=1
 ```
 
-Sweep K without changing the original data batch:
+Sweep full-only K without changing the original data batch:
 
 ```bash
---override exploration.k=2
---override exploration.k=8
+--override exploration.k_full=2
+--override exploration.k_full=8
 ```
 
 `train.global_batch_size` always counts original ImageNet samples, not
@@ -138,7 +147,15 @@ uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --output runs/sit-latent-k4-repa
 ```
 
-Resume with the identical resolved schema-v11 configuration:
+Hybrid early-x0 experiment (8 total candidates, then 2 full evaluations):
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/sit-k-hybrid-early.yaml \
+  --output runs/sit-k8-hybrid-early
+```
+
+Resume with the identical resolved schema-v12 configuration:
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
@@ -176,8 +193,9 @@ forward/backward. Frozen online VAE/DINO preprocessing, optimizer work, and
 evaluation are excluded; wall-clock and throughput metrics are logged
 separately.
 
-Selection diagnostics include candidate-zero score, winning score, score
-improvement, mean winning index, original images/s, and selector candidates/s.
+Selection diagnostics report early and full stage scores separately, along
+with both K values, total K, mean original winning index, images/s, and selector
+evaluations/s.
 
 Sample or evaluate a checkpoint with:
 

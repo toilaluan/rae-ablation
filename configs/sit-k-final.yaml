@@ -1,4 +1,4 @@
-schema_version: 11
+schema_version: 12
 model:
   variant: SiT-B
   input_space: pixels
@@ -12,9 +12,10 @@ model:
 repa:
   enabled: false
 exploration:
-  k: 4
-  selector: final_velocity
-  candidate_chunk_size: null
+  k_early: 1
+  k_full: 4
+  early_selector: none
+  full_candidate_chunk_size: null
 wandb:
   project: sit-k-exploration
   name: sit-k4-final

@@ -71,6 +71,7 @@ def validate_ema(
         "conditioning": "timestep_plus_class_vector",
         "prediction": "x0",
         "repa": asdict(config.repa),
+        "early_prediction": asdict(config.early_prediction),
         "vae": (
             {
                 "model_name": config.vae.model_name,
@@ -86,7 +87,7 @@ def validate_ema(
         if config.model.input_space == "flux2_latents"
         else None
     )
-    model = SiT(config.model, config.repa).to(device)
+    model = SiT(config.model, config.repa, config.early_prediction).to(device)
     model.load_state_dict(ema.state_dict())
     model.eval()
     execution_model = compile_model_regions(model, config.compile)

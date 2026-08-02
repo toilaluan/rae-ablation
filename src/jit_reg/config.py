@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 11
+CONFIG_SCHEMA_VERSION = 12
 FLUX2_SPATIAL_COMPRESSION = 16
 FLUX2_LATENT_CHANNELS = 128
 
@@ -43,10 +43,24 @@ class REPAConfig:
 
 
 @dataclass
+class EarlyPredictionConfig:
+    enabled: bool = False
+    block: int = 4
+    mlp_hidden_size: int | None = None
+    loss_weight: float = 1.0
+
+
+@dataclass
 class ExplorationConfig:
-    k: int = 1
-    selector: str = "none"
-    candidate_chunk_size: int | None = None
+    k_early: int = 1
+    k_full: int = 1
+    early_selector: str = "none"
+    early_candidate_chunk_size: int | None = None
+    full_candidate_chunk_size: int | None = None
+
+    @property
+    def k_total(self) -> int:
+        return self.k_early * self.k_full
 
 
 @dataclass
@@ -237,6 +251,7 @@ class ExperimentConfig:
     vae: VAEConfig = field(default_factory=VAEConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     repa: REPAConfig = field(default_factory=REPAConfig)
+    early_prediction: EarlyPredictionConfig = field(default_factory=EarlyPredictionConfig)
     exploration: ExplorationConfig = field(default_factory=ExplorationConfig)
     compile: CompileConfig = field(default_factory=CompileConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
@@ -285,23 +300,58 @@ class ExperimentConfig:
         elif repa.cache.enabled:
             raise ValueError("repa.cache.enabled requires repa.enabled=true")
 
+        early = self.early_prediction
+        if early.enabled:
+            _positive("early prediction block", early.block)
+            if early.block > self.model.depth:
+                raise ValueError("early_prediction.block must be within model.depth")
+            if early.mlp_hidden_size is not None:
+                _positive("early prediction MLP hidden size", early.mlp_hidden_size)
+            if early.loss_weight < 0:
+                raise ValueError("early_prediction.loss_weight cannot be negative")
+
         explore = self.exploration
-        if not isinstance(explore.k, int) or isinstance(explore.k, bool) or explore.k < 1:
-            raise ValueError("exploration.k must be a positive integer")
-        if explore.selector not in {"none", "final_velocity", "repa"}:
-            raise ValueError("exploration.selector must be none, final_velocity, or repa")
-        if explore.k == 1 and explore.selector != "none":
-            raise ValueError("K=1 requires exploration.selector=none")
-        if explore.k > 1 and explore.selector == "none":
-            raise ValueError("K>1 requires an exploration selector")
-        if explore.selector == "repa" and not repa.enabled:
+        for name, value in (("k_early", explore.k_early), ("k_full", explore.k_full)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"exploration.{name} must be a positive integer")
+        if explore.early_selector not in {"none", "early_prediction", "repa"}:
+            raise ValueError(
+                "exploration.early_selector must be none, early_prediction, or repa"
+            )
+        if explore.k_early == 1 and explore.early_selector != "none":
+            raise ValueError("k_early=1 requires exploration.early_selector=none")
+        if explore.k_early > 1 and explore.early_selector == "none":
+            raise ValueError("k_early>1 requires an early exploration selector")
+        if explore.early_selector == "repa" and not repa.enabled:
             raise ValueError("REPA selection requires repa.enabled=true")
-        if explore.candidate_chunk_size is not None:
-            chunk = explore.candidate_chunk_size
+        if explore.early_selector == "early_prediction" and not early.enabled:
+            raise ValueError(
+                "early prediction selection requires early_prediction.enabled=true"
+            )
+        for name, chunk, candidates, active in (
+            (
+                "early_candidate_chunk_size",
+                explore.early_candidate_chunk_size,
+                explore.k_total,
+                explore.k_early > 1,
+            ),
+            (
+                "full_candidate_chunk_size",
+                explore.full_candidate_chunk_size,
+                explore.k_full,
+                explore.k_full > 1,
+            ),
+        ):
+            if chunk is None:
+                continue
+            if not active:
+                raise ValueError(f"exploration.{name} requires its selection stage")
             if not isinstance(chunk, int) or isinstance(chunk, bool) or chunk < 1:
-                raise ValueError("candidate_chunk_size must be a positive integer")
-            if chunk > explore.k or explore.k % chunk:
-                raise ValueError("candidate_chunk_size must divide exploration.k")
+                raise ValueError(f"exploration.{name} must be a positive integer")
+            if chunk > candidates or candidates % chunk:
+                raise ValueError(
+                    f"exploration.{name} must divide its stage candidate count"
+                )
 
         if self.train.optimizer.kind not in {"adamw", "muon", "fused_muon"}:
             raise ValueError("optimizer.kind must be adamw, muon, or fused_muon")

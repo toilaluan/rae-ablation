@@ -324,8 +324,13 @@ def train(
                 config.model.class_dropout_prob,
                 streams.label_dropout,
             )
-            k = config.exploration.k
-            if k == 1:
+            exploration = config.exploration
+            k_total = exploration.k_total
+            early_candidate_zero_score: Tensor | None = None
+            early_best_score: Tensor | None = None
+            full_first_finalist_score: Tensor | None = None
+            full_selected_score: Tensor | None = None
+            if k_total == 1:
                 selected_noise = torch.randn(
                     clean.shape,
                     device=device,
@@ -333,14 +338,12 @@ def train(
                     generator=streams.noise,
                 )
                 selected_noisy = noisy_interpolate(clean, selected_noise, timesteps)
-                selected_score = clean.new_zeros(clean.shape[0])
-                candidate_zero_score = selected_score
                 selected_indices = torch.zeros(
                     clean.shape[0], device=device, dtype=torch.long
                 )
             else:
                 noise_candidates = torch.randn(
-                    (clean.shape[0], k, *clean.shape[1:]),
+                    (clean.shape[0], k_total, *clean.shape[1:]),
                     device=device,
                     dtype=torch.float32,
                     generator=streams.noise,
@@ -361,15 +364,24 @@ def train(
                         clean,
                         timesteps,
                         model_labels,
-                        selector=config.exploration.selector,
+                        k_early=exploration.k_early,
+                        k_full=exploration.k_full,
+                        early_selector=exploration.early_selector,
                         repa_target=repa_target,
-                        candidate_chunk_size=config.exploration.candidate_chunk_size,
+                        early_candidate_chunk_size=(
+                            exploration.early_candidate_chunk_size
+                        ),
+                        full_candidate_chunk_size=(
+                            exploration.full_candidate_chunk_size
+                        ),
                         velocity_denominator_floor=config.train.velocity_denominator_floor,
                     )
                 selected_noisy, selected_noise = selected.noisy, selected.noise
                 selected_indices = selected.indices
-                selected_score = selected.selected_score
-                candidate_zero_score = selected.candidate_zero_score
+                early_candidate_zero_score = selected.early_candidate_zero_score
+                early_best_score = selected.early_best_score
+                full_first_finalist_score = selected.full_first_finalist_score
+                full_selected_score = selected.full_selected_score
 
             gpu_started = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
             gpu_finished = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
@@ -385,6 +397,7 @@ def train(
                     timesteps,
                     model_labels,
                     return_repa=config.repa.enabled,
+                    return_early_prediction=config.early_prediction.enabled,
                 )
             losses = sit_losses(
                 clean,
@@ -395,6 +408,8 @@ def train(
                 repa_prediction=output.repa_prediction,
                 repa_target=repa_target,
                 repa_weight=config.repa.loss_weight,
+                early_x_prediction=output.early_x_prediction,
+                early_weight=config.early_prediction.loss_weight,
                 velocity_denominator_floor=config.train.velocity_denominator_floor,
             )
             losses.total.backward()
@@ -423,11 +438,15 @@ def train(
             )
             images_seen = state.global_step * config.train.global_batch_size
             cumulative_flops = state.global_step * step_flops
-            logger.log_training(
-                {
+            selector_evaluations = (
+                (k_total if exploration.k_early > 1 else 0)
+                + (exploration.k_full if exploration.k_full > 1 else 0)
+            )
+            training_metrics = {
                     "train/loss": losses.total.item(),
                     "train/image_velocity_loss": losses.velocity.item(),
                     "train/repa_loss": losses.repa.item(),
+                    "train/early_velocity_loss": losses.early_velocity.item(),
                     "train/timestep_mean": timesteps.mean().item(),
                     "train/lr": lr,
                     "train/gradient_norm": float(grad_norm),
@@ -437,16 +456,13 @@ def train(
                     "progress/images_seen": images_seen,
                     "compute/model_flops_per_step": step_flops,
                     "compute/cumulative_model_flops": cumulative_flops,
-                    "exploration/k": k,
-                    "exploration/selected_score": selected_score.mean().item(),
-                    "exploration/candidate_zero_score": candidate_zero_score.mean().item(),
-                    "exploration/score_improvement": (
-                        candidate_zero_score - selected_score
-                    ).mean().item(),
+                    "exploration/k_total": k_total,
+                    "exploration/k_early": exploration.k_early,
+                    "exploration/k_full": exploration.k_full,
                     "exploration/selected_index_mean": selected_indices.float().mean().item(),
                     "throughput/images_per_second": config.train.global_batch_size / elapsed,
-                    "throughput/selector_candidates_per_second": (
-                        config.train.global_batch_size * (k if k > 1 else 0) / elapsed
+                    "throughput/selector_evaluations_per_second": (
+                        config.train.global_batch_size * selector_evaluations / elapsed
                     ),
                     "throughput/jit_tokens_per_second": (
                         config.train.global_batch_size * config.model.grid_size**2 / elapsed
@@ -464,7 +480,35 @@ def train(
                         if device.type == "cuda"
                         else 0.0
                     ),
-                },
+                }
+            if early_candidate_zero_score is not None and early_best_score is not None:
+                training_metrics.update(
+                    {
+                        "exploration/early/candidate_zero_score": (
+                            early_candidate_zero_score.mean().item()
+                        ),
+                        "exploration/early/best_score": early_best_score.mean().item(),
+                        "exploration/early/score_improvement": (
+                            early_candidate_zero_score - early_best_score
+                        ).mean().item(),
+                    }
+                )
+            if full_first_finalist_score is not None and full_selected_score is not None:
+                training_metrics.update(
+                    {
+                        "exploration/full/first_finalist_score": (
+                            full_first_finalist_score.mean().item()
+                        ),
+                        "exploration/full/selected_score": (
+                            full_selected_score.mean().item()
+                        ),
+                        "exploration/full/score_improvement": (
+                            full_first_finalist_score - full_selected_score
+                        ).mean().item(),
+                    }
+                )
+            logger.log_training(
+                training_metrics,
                 step=state.global_step,
             )
             if config.train.max_steps is not None and state.global_step >= config.train.max_steps:

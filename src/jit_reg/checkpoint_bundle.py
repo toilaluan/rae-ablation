@@ -34,7 +34,7 @@ def _expected_plan_hash(directory: Path) -> str:
     metadata_path = directory / "metadata.json"
     if not metadata_path.is_file():
         raise ValueError(
-            "checkpoint predates schema v11; old checkpoints are not supported"
+            "checkpoint predates schema v12; old checkpoints are not supported"
         )
     metadata = json.loads(metadata_path.read_text())
     if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:

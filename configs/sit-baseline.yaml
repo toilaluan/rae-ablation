@@ -1,4 +1,4 @@
-schema_version: 11
+schema_version: 12
 model:
   variant: SiT-B
   input_space: pixels
@@ -10,8 +10,9 @@ model:
   num_heads: 12
   mlp_ratio: 4.0
 exploration:
-  k: 1
-  selector: none
+  k_early: 1
+  k_full: 1
+  early_selector: none
 repa:
   enabled: false
 wandb:

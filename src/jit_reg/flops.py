@@ -3,7 +3,13 @@ from __future__ import annotations
 from .config import ExperimentConfig
 
 
-def _sit_forward_flops(config: ExperimentConfig, *, blocks: int, repa: bool) -> int:
+def _sit_forward_flops(
+    config: ExperimentConfig,
+    *,
+    blocks: int,
+    repa: bool = False,
+    early_prediction: bool = False,
+) -> int:
     """Static matmul/attention FLOPs for one sample; elementwise ops are excluded."""
     model = config.model
     tokens = model.grid_size**2
@@ -26,6 +32,9 @@ def _sit_forward_flops(config: ExperimentConfig, *, blocks: int, repa: bool) -> 
         projection = config.repa.projection_hidden_size
         feature = config.repa.encoder.feature_dim
         total += 2 * tokens * (hidden * projection + projection**2 + projection * feature)
+    if early_prediction:
+        early_hidden = config.early_prediction.mlp_hidden_size or hidden
+        total += 2 * tokens * (hidden * early_hidden + early_hidden * patch_values)
     return total
 
 
@@ -36,19 +45,29 @@ def model_flops_per_step(config: ExperimentConfig) -> int:
         config,
         blocks=config.model.depth,
         repa=config.repa.enabled,
+        early_prediction=config.early_prediction.enabled,
     )
     # A dense transformer backward is approximately two forward passes.
     total = batch * 3 * training_forward
-    if config.exploration.selector == "final_velocity":
-        total += batch * config.exploration.k * _sit_forward_flops(
+    explore = config.exploration
+    if explore.k_early > 1:
+        if explore.early_selector == "early_prediction":
+            blocks = config.early_prediction.block
+            repa = False
+            early_prediction = True
+        else:
+            blocks = config.repa.block
+            repa = True
+            early_prediction = False
+        total += batch * explore.k_total * _sit_forward_flops(
+            config,
+            blocks=blocks,
+            repa=repa,
+            early_prediction=early_prediction,
+        )
+    if explore.k_full > 1:
+        total += batch * explore.k_full * _sit_forward_flops(
             config,
             blocks=config.model.depth,
-            repa=False,
-        )
-    elif config.exploration.selector == "repa":
-        total += batch * config.exploration.k * _sit_forward_flops(
-            config,
-            blocks=config.repa.block,
-            repa=True,
         )
     return total

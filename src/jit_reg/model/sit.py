@@ -8,13 +8,14 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-from ..config import ModelConfig, REPAConfig
+from ..config import EarlyPredictionConfig, ModelConfig, REPAConfig
 from .rope import apply_rope_cos_sin, precompute_rope_tables
 
 
 class SiTOutput(NamedTuple):
     x_prediction: Tensor
     repa_prediction: Tensor | None = None
+    early_x_prediction: Tensor | None = None
 
 
 def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
@@ -158,16 +159,40 @@ class REPAProjection(nn.Module):
         return self.layers(x)
 
 
+class EarlyPredictionHead(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, output_size: int) -> None:
+        super().__init__()
+        self.norm = nn.RMSNorm(input_size, eps=1e-6, elementwise_affine=False)
+        self.hidden = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.SiLU(),
+        )
+        self.projection = nn.Linear(hidden_size, output_size)
+
+    def forward(self, states: Tensor) -> Tensor:
+        return self.projection(self.hidden(self.norm(states.detach())))
+
+
 class SiT(nn.Module):
     """Class-conditional SiT that predicts clean x0 in pixel or VAE space."""
 
-    def __init__(self, config: ModelConfig, repa_config: REPAConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        repa_config: REPAConfig | None = None,
+        early_prediction_config: EarlyPredictionConfig | None = None,
+    ) -> None:
         super().__init__()
         config.validate()
         self.config = config
         self.repa_config = repa_config or REPAConfig()
+        self.early_prediction_config = early_prediction_config or EarlyPredictionConfig()
         if self.repa_config.enabled and not 1 <= self.repa_config.block <= config.depth:
             raise ValueError("repa.block must be within model.depth")
+        if self.early_prediction_config.enabled and not (
+            1 <= self.early_prediction_config.block <= config.depth
+        ):
+            raise ValueError("early_prediction.block must be within model.depth")
         self.grid_size = config.grid_size
         self.patch_projection = nn.Conv2d(
             config.in_channels,
@@ -197,6 +222,16 @@ class SiT(nn.Module):
             if self.repa_config.enabled
             else None
         )
+        early_hidden_size = self.early_prediction_config.mlp_hidden_size or config.hidden_size
+        self.early_prediction_head = (
+            EarlyPredictionHead(
+                config.hidden_size,
+                early_hidden_size,
+                patch_values,
+            )
+            if self.early_prediction_config.enabled
+            else None
+        )
         self.gradient_checkpointing = config.gradient_checkpointing
         self._initialize_weights()
 
@@ -221,6 +256,10 @@ class SiT(nn.Module):
         nn.init.zeros_(self.final_layer.modulation[-1].bias)
         nn.init.zeros_(self.final_layer.projection.weight)
         nn.init.zeros_(self.final_layer.projection.bias)
+        if self.early_prediction_head is not None:
+            projection = self.early_prediction_head.projection
+            nn.init.zeros_(projection.weight)
+            nn.init.zeros_(projection.bias)
 
     def set_gradient_checkpointing(self, enabled: bool = True) -> None:
         self.gradient_checkpointing = enabled
@@ -276,6 +315,19 @@ class SiT(nn.Module):
             states = self._run_block(block, states, conditioning)
         return self.repa_projection(states)
 
+    def forward_early_prediction(
+        self,
+        noisy: Tensor,
+        timestep: Tensor,
+        labels: Tensor,
+    ) -> Tensor:
+        if self.early_prediction_head is None:
+            raise RuntimeError("early prediction is not configured")
+        states, conditioning = self._embed(noisy, timestep, labels)
+        for block in self.blocks[: self.early_prediction_config.block]:
+            states = self._run_block(block, states, conditioning)
+        return self._unpatchify(self.early_prediction_head(states))
+
     def forward(
         self,
         noisy: Tensor,
@@ -283,15 +335,33 @@ class SiT(nn.Module):
         labels: Tensor,
         *,
         return_repa: bool = False,
+        return_early_prediction: bool = False,
     ) -> SiTOutput:
         if return_repa and self.repa_projection is None:
             raise ValueError("return_repa requires repa.enabled=true")
+        if return_early_prediction and self.early_prediction_head is None:
+            raise ValueError(
+                "return_early_prediction requires early_prediction.enabled=true"
+            )
         states, conditioning = self._embed(noisy, timestep, labels)
         repa_prediction = None
+        early_x_prediction = None
         for index, block in enumerate(self.blocks, start=1):
             states = self._run_block(block, states, conditioning)
             if return_repa and index == self.repa_config.block:
                 assert self.repa_projection is not None
                 repa_prediction = self.repa_projection(states)
+            if (
+                return_early_prediction
+                and index == self.early_prediction_config.block
+            ):
+                assert self.early_prediction_head is not None
+                early_x_prediction = self._unpatchify(
+                    self.early_prediction_head(states)
+                )
         prediction = self.final_layer(states, conditioning)
-        return SiTOutput(self._unpatchify(prediction), repa_prediction)
+        return SiTOutput(
+            self._unpatchify(prediction),
+            repa_prediction,
+            early_x_prediction,
+        )

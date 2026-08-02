@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=Path("configs/sit-baseline.yaml"),
-        help="schema-v11 experiment YAML",
+        help="schema-v12 experiment YAML",
     )
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
@@ -78,7 +78,7 @@ def main() -> None:
     streams = RNGStreams.create(config.train.seed, device)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(streams.initialization.initial_seed())
-        model = SiT(config.model, config.repa).to(device)
+        model = SiT(config.model, config.repa, config.early_prediction).to(device)
     cache_active = config.repa.enabled and config.repa.cache.enabled
     latent_cache_active = (
         config.model.input_space == "flux2_latents"
@@ -212,8 +212,10 @@ def main() -> None:
     logger.event(
         f"training initialized: variant={config.model.model_variant}, "
         f"input_shape={config.model.input_shape}, "
-        f"repa={config.repa.enabled}, selector={config.exploration.selector}, "
-        f"K={config.exploration.k}, "
+        f"repa={config.repa.enabled}, early={config.early_prediction.enabled}, "
+        f"early_selector={config.exploration.early_selector}, "
+        f"K={config.exploration.k_total} "
+        f"({config.exploration.k_early}x{config.exploration.k_full}), "
         "parameters="
         f"{logged_config['model_parameters']['total']:,}"
     )

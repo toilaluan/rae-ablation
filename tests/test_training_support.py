@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import torch
 
 from jit_reg.checkpoint import EMA, CheckpointManager
@@ -43,21 +45,26 @@ def test_rng_resume_covers_only_active_streams() -> None:
 def test_flops_include_k_selector_and_repa_prefix() -> None:
     baseline = ExperimentConfig()
     final = ExperimentConfig()
-    final.exploration.k = 4
-    final.exploration.selector = "final_velocity"
+    final.exploration.k_full = 4
     early = ExperimentConfig()
     early.repa.enabled = True
-    early.exploration.k = 4
-    early.exploration.selector = "repa"
+    early.exploration.k_early = 4
+    early.exploration.early_selector = "repa"
+    hybrid = ExperimentConfig()
+    hybrid.early_prediction.enabled = True
+    hybrid.exploration.k_early = 4
+    hybrid.exploration.k_full = 2
+    hybrid.exploration.early_selector = "early_prediction"
     assert model_flops_per_step(final) > model_flops_per_step(early)
     assert model_flops_per_step(early) > model_flops_per_step(baseline)
+    assert model_flops_per_step(hybrid) > model_flops_per_step(final)
 
 
 def test_local_batch_is_data_matched_not_k_scaled() -> None:
     assert local_batch_size(1024, 8) == 128
 
 
-def test_one_step_training_and_schema_v11_checkpoint(tmp_path) -> None:
+def test_one_step_hybrid_training_and_schema_v12_checkpoint(tmp_path) -> None:
     config = ExperimentConfig()
     config.model.image_size = 4
     config.model.patch_size = 2
@@ -77,6 +84,12 @@ def test_one_step_training_and_schema_v11_checkpoint(tmp_path) -> None:
     config.checkpoint.directory = str(tmp_path / "checkpoints")
     config.validation.plan_path = str(tmp_path / "plan.pt")
     config.compile.enabled = False
+    config.early_prediction.enabled = True
+    config.early_prediction.block = 1
+    config.early_prediction.mlp_hidden_size = 8
+    config.exploration.k_early = 2
+    config.exploration.k_full = 2
+    config.exploration.early_selector = "early_prediction"
     config.validate()
     dataset = [
         (torch.zeros(3, 4, 4, dtype=torch.uint8), 0, 0),
@@ -84,7 +97,7 @@ def test_one_step_training_and_schema_v11_checkpoint(tmp_path) -> None:
     ]
     streams = RNGStreams.create(3)
     loader, sampler = make_train_loader(dataset, config, streams)
-    model = SiT(config.model, config.repa)
+    model = SiT(config.model, config.repa, config.early_prediction)
     ema = EMA(model, config.train.ema_decay)
     plan = create_validation_plan(2, 2, 2, 10)
     plan.save(config.validation.plan_path)
@@ -106,3 +119,5 @@ def test_one_step_training_and_schema_v11_checkpoint(tmp_path) -> None:
     assert state.global_step == 1 and state.epoch == 1
     checkpoint = tmp_path / "checkpoints" / "last"
     assert (checkpoint / "config.json").is_file()
+    assert json.loads((checkpoint / "config.json").read_text())["schema_version"] == 12
+    assert json.loads((checkpoint / "metadata.json").read_text())["schema_version"] == 12

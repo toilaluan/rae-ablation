@@ -5,7 +5,13 @@ from copy import deepcopy
 import pytest
 import torch
 
-from jit_reg.config import ExperimentConfig, ModelConfig, REPAConfig, load_config
+from jit_reg.config import (
+    EarlyPredictionConfig,
+    ExperimentConfig,
+    ModelConfig,
+    REPAConfig,
+    load_config,
+)
 from jit_reg.model.sit import FusedSwiGLU, SiT, SiTAttention
 
 
@@ -28,42 +34,68 @@ def tiny_repa() -> REPAConfig:
     return config
 
 
+def tiny_early() -> EarlyPredictionConfig:
+    return EarlyPredictionConfig(enabled=True, block=2, mlp_hidden_size=16)
+
+
 def test_official_presets_are_valid_and_cover_core_modes() -> None:
     expected = {
-        "sit-baseline.yaml": (False, 1, "none"),
-        "sit-repa.yaml": (True, 1, "none"),
-        "sit-k-final.yaml": (False, 4, "final_velocity"),
-        "sit-k-final-repa.yaml": (True, 4, "final_velocity"),
-        "sit-k-repa.yaml": (True, 4, "repa"),
+        "sit-baseline.yaml": (False, False, 1, 1, "none"),
+        "sit-repa.yaml": (True, False, 1, 1, "none"),
+        "sit-k-final.yaml": (False, False, 1, 4, "none"),
+        "sit-k-final-repa.yaml": (True, False, 1, 4, "none"),
+        "sit-k-repa.yaml": (True, False, 4, 1, "repa"),
+        "sit-k-hybrid-early.yaml": (False, True, 4, 2, "early_prediction"),
+        "sit-k-hybrid-repa.yaml": (True, False, 4, 2, "repa"),
     }
     for name, values in expected.items():
         config = load_config(f"configs/{name}")
-        assert (config.repa.enabled, config.exploration.k, config.exploration.selector) == values
+        assert (
+            config.repa.enabled,
+            config.early_prediction.enabled,
+            config.exploration.k_early,
+            config.exploration.k_full,
+            config.exploration.early_selector,
+        ) == values
         assert config.model.variant == "SiT-B"
 
 
 @pytest.mark.parametrize(
-    ("k", "selector", "repa", "message"),
+    ("k_early", "selector", "repa", "early", "message"),
     [
-        (1, "final_velocity", False, "K=1"),
-        (2, "none", False, "K>1"),
-        (2, "repa", False, "REPA selection"),
+        (1, "repa", True, False, "k_early=1"),
+        (2, "none", False, False, "k_early>1"),
+        (2, "repa", False, False, "REPA selection"),
+        (2, "early_prediction", False, False, "early prediction selection"),
     ],
 )
-def test_exploration_validation(k: int, selector: str, repa: bool, message: str) -> None:
+def test_exploration_validation(
+    k_early: int,
+    selector: str,
+    repa: bool,
+    early: bool,
+    message: str,
+) -> None:
     config = ExperimentConfig()
-    config.exploration.k = k
-    config.exploration.selector = selector
+    config.exploration.k_early = k_early
+    config.exploration.early_selector = selector
     config.repa.enabled = repa
+    config.early_prediction.enabled = early
     with pytest.raises(ValueError, match=message):
         config.validate()
 
 
 def test_candidate_chunk_must_divide_k() -> None:
     config = ExperimentConfig()
-    config.exploration.k = 4
-    config.exploration.selector = "final_velocity"
-    config.exploration.candidate_chunk_size = 3
+    config.repa.enabled = True
+    config.exploration.k_early = 4
+    config.exploration.k_full = 2
+    config.exploration.early_selector = "repa"
+    config.exploration.early_candidate_chunk_size = 3
+    with pytest.raises(ValueError, match="divide"):
+        config.validate()
+    config.exploration.early_candidate_chunk_size = None
+    config.exploration.full_candidate_chunk_size = 3
     with pytest.raises(ValueError, match="divide"):
         config.validate()
 
@@ -85,17 +117,44 @@ def test_pixel_and_flux2_geometry() -> None:
     assert latent.grid_size == 8
 
 
-def test_sit_x_prediction_and_repa_prefix_match_full_forward() -> None:
-    model = SiT(tiny_model(), tiny_repa())
+def test_sit_x_prediction_and_prefixes_match_full_forward() -> None:
+    model = SiT(tiny_model(), tiny_repa(), tiny_early())
     noisy = torch.randn(2, 3, 8, 8)
     timestep = torch.tensor([0.2, 0.7])
     labels = torch.tensor([1, 2])
-    output = model(noisy, timestep, labels, return_repa=True)
-    prefix = model.forward_repa(noisy, timestep, labels)
+    output = model(
+        noisy,
+        timestep,
+        labels,
+        return_repa=True,
+        return_early_prediction=True,
+    )
+    repa_prefix = model.forward_repa(noisy, timestep, labels)
+    early_prefix = model.forward_early_prediction(noisy, timestep, labels)
     assert output.x_prediction.shape == noisy.shape
     assert output.repa_prediction is not None
     assert output.repa_prediction.shape == (2, 16, 8)
-    assert torch.equal(output.repa_prediction, prefix)
+    assert torch.equal(output.repa_prediction, repa_prefix)
+    assert output.early_x_prediction is not None
+    assert output.early_x_prediction.shape == noisy.shape
+    assert torch.equal(output.early_x_prediction, early_prefix)
+    assert model(noisy, timestep, labels).early_x_prediction is None
+
+
+def test_early_prediction_head_detaches_transformer_states() -> None:
+    model = SiT(tiny_model(), early_prediction_config=tiny_early())
+    output = model(
+        torch.randn(2, 3, 8, 8),
+        torch.rand(2),
+        torch.tensor([1, 2]),
+        return_early_prediction=True,
+    )
+    assert output.early_x_prediction is not None
+    output.early_x_prediction.sum().backward()
+    assert model.early_prediction_head is not None
+    assert model.early_prediction_head.projection.weight.grad is not None
+    assert model.patch_projection.weight.grad is None
+    assert all(parameter.grad is None for block in model.blocks for parameter in block.parameters())
 
 
 def test_modern_block_components_are_always_enabled() -> None:
