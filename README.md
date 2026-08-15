@@ -82,6 +82,26 @@ CFG defaults to scale 1.0 (inactive). If explicitly enabled, IG is applied to ea
 conditional branch first and CFG combines them afterward. Euler and Heun are
 available.
 
+### Checkpoint prior experiment
+
+By default the flow source is standard Gaussian noise. To use the base x0 prediction
+of a completed, normally trained checkpoint as the source, set its directory and
+choose either its raw training weights or EMA weights:
+
+```yaml
+prior:
+  checkpoint_dir: runs/ddt-baseline/checkpoints/epoch-0080
+  weight_source: ema  # model or ema
+```
+
+For each Gaussian draw, the frozen prior model runs `forward_base_prediction` at
+`t=1` with the true class label. Training and sampling use that prediction as the
+flow endpoint. Setting `checkpoint_dir: null` restores the Gaussian source exactly.
+Checkpoint-prior runs require K=1, and the prior checkpoint must use the same model,
+RAE, and token-cache provenance as the student. Student checkpoints record the
+selected prior weight digest and verify it on resume and sampling without copying
+the prior weights.
+
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
   --checkpoint-dir runs/ddt-k-hybrid/checkpoints/last

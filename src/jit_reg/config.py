@@ -191,6 +191,14 @@ class TrainConfig:
 
 
 @dataclass
+class PriorConfig:
+    """Optional frozen checkpoint used to transform Gaussian flow sources."""
+
+    checkpoint_dir: str | None = None
+    weight_source: str = "ema"
+
+
+@dataclass
 class SamplingConfig:
     num_samples: int = 50_000
     batch_size: int = 32
@@ -252,6 +260,7 @@ class ExperimentConfig:
     exploration: ExplorationConfig = field(default_factory=ExplorationConfig)
     compile: CompileConfig = field(default_factory=CompileConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    prior: PriorConfig = field(default_factory=PriorConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
@@ -286,6 +295,13 @@ class ExperimentConfig:
                 raise ValueError(f"exploration.{name} must be a positive integer")
             if chunk > candidates or candidates % chunk:
                 raise ValueError(f"exploration.{name} must divide its stage candidate count")
+        if self.prior.weight_source not in {"model", "ema"}:
+            raise ValueError("prior.weight_source must be model or ema")
+        if self.prior.checkpoint_dir is not None:
+            if not self.prior.checkpoint_dir:
+                raise ValueError("prior.checkpoint_dir cannot be empty")
+            if explore.k_total != 1:
+                raise ValueError("checkpoint prior experiments require exploration K=1")
         if self.train.optimizer.kind not in {"adamw", "muon", "fused_muon"}:
             raise ValueError("optimizer.kind must be adamw, muon, or fused_muon")
         if self.wandb.mode not in {"online", "offline", "disabled"}:

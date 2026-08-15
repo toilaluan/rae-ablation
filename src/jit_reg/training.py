@@ -14,10 +14,11 @@ from torch.utils.data._utils.collate import default_collate
 from .checkpoint import EMA, CheckpointManager, should_checkpoint
 from .config import ExperimentConfig
 from .exploration import select_candidates
-from .flops import model_flops_per_step
+from .flops import ddt_base_forward_flops, model_flops_per_step
 from .model.tokens import classifier_free_labels
 from .objective import ddt_losses, noisy_interpolate, sample_timesteps
 from .optim import CompositeOptimizer, learning_rate_at_epoch, set_learning_rate
+from .prior import CheckpointPrior, prior_provenance, source_from_gaussian
 from .rng import RNGStreams
 from .token_cache import TokenCache, normalize_tokens
 from .validation import should_validate
@@ -218,6 +219,7 @@ def train(
     validation_plan_path: str | Path,
     logger: RunLogger,
     token_cache: TokenCache,
+    prior: CheckpointPrior | None = None,
     state: TrainState | None = None,
     validation_callback: ValidationCallback | None = None,
 ) -> TrainState:
@@ -229,9 +231,16 @@ def train(
     if token_cache is None:
         raise ValueError("RAE-DDT training requires a complete token cache")
 
-    step_flops = model_flops_per_step(config)
+    base_step_flops = model_flops_per_step(config)
+    prior_step_flops = (
+        config.train.global_batch_size * ddt_base_forward_flops(config)
+        if prior is not None
+        else 0
+    )
+    step_flops = base_step_flops + prior_step_flops
     token_mean = token_cache.mean.to(device)
     token_std = token_cache.std.to(device)
+    prior_seed_sensitivity: float | None = None
     optimizer.zero_grad()
     for epoch_index in range(state.epoch, config.train.epochs):
         logger.event(f"epoch {epoch_index + 1}/{config.train.epochs} started")
@@ -264,10 +273,22 @@ def train(
             exploration = config.exploration
             k_total = exploration.k_total
             diagnostics = None
+            gaussian_source: Tensor | None = None
             if k_total == 1:
-                selected_noise = torch.randn(
+                gaussian_source = torch.randn(
                     clean.shape, device=device, dtype=torch.float32, generator=streams.noise
                 )
+                selected_noise = source_from_gaussian(prior, gaussian_source, labels)
+                if prior is not None and prior_seed_sensitivity is None:
+                    opposite = source_from_gaussian(prior, -gaussian_source, labels)
+                    prior_seed_sensitivity = (
+                        (selected_noise - opposite).square().mean().sqrt().item() / 2**0.5
+                    )
+                    if prior_seed_sensitivity < 0.05:
+                        logger.event(
+                            "warning: checkpoint prior seed sensitivity is below 0.05; "
+                            "the source distribution may be collapsed"
+                        )
                 selected_noisy = noisy_interpolate(clean, selected_noise, timesteps)
                 selected_indices = torch.zeros(clean.shape[0], device=device, dtype=torch.long)
             else:
@@ -338,6 +359,7 @@ def train(
                 "progress/images_seen": state.global_step * config.train.global_batch_size,
                 "compute/model_flops_per_step": step_flops,
                 "compute/cumulative_model_flops": state.global_step * step_flops,
+                "compute/prior_flops_per_step": prior_step_flops,
                 "exploration/k_total": k_total,
                 "exploration/k_early": exploration.k_early,
                 "exploration/k_full": exploration.k_full,
@@ -348,6 +370,18 @@ def train(
                 "throughput/data_wait_seconds": data_wait,
                 "system/peak_memory_gib": torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0.0,
             }
+            if prior is not None and gaussian_source is not None:
+                source = selected_noise.float()
+                metrics.update(
+                    {
+                        "prior/source_mean": source.mean().item(),
+                        "prior/source_std": source.std(correction=0).item(),
+                        "prior/source_rms": source.square().mean().sqrt().item(),
+                        "prior/gaussian_to_source_rms": (source - gaussian_source).square().mean().sqrt().item(),
+                        "prior/source_to_clean_rms": (source - clean).square().mean().sqrt().item(),
+                        "prior/seed_sensitivity": prior_seed_sensitivity,
+                    }
+                )
             if diagnostics is not None:
                 if diagnostics.early_candidate_zero_score is not None:
                     metrics["exploration/early/candidate_zero_score"] = diagnostics.early_candidate_zero_score.mean().item()
@@ -403,6 +437,7 @@ def train(
                 wandb_run_id=logger.run_id,
                 resolved_config=config.as_dict(),
                 token_cache_fingerprint=token_cache.fingerprint,
+                prior_provenance=prior_provenance(prior),
                 fid=None,
             )
         logger.log({"train/epoch_seconds": time.perf_counter() - epoch_started}, step=state.global_step)

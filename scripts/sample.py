@@ -11,6 +11,12 @@ from jit_reg.distributed import broadcast_string, initialize_distributed
 from jit_reg.evaluation import evaluate_npz, save_evaluation
 from jit_reg.model import DDT
 from jit_reg.model.compile import compile_model_regions
+from jit_reg.prior import (
+    load_checkpoint_prior,
+    prior_provenance,
+    source_from_gaussian,
+    validate_prior_provenance,
+)
 from jit_reg.rae import load_rae_codec
 from jit_reg.sample_runtime import (
     FEATURE_SCHEMA_VERSION,
@@ -75,6 +81,12 @@ def main() -> None:
     if not isinstance(cache_fingerprint, str):
         raise ValueError("checkpoint has no token-cache provenance")
     statistics = load_token_statistics(config.rae.cache.directory, cache_fingerprint)
+    prior = load_checkpoint_prior(
+        config,
+        device,
+        token_cache_fingerprint=cache_fingerprint,
+    )
+    validate_prior_provenance(prior_provenance(prior), metadata.get("prior"))
 
     model = DDT(config.model).to(device)
     model.load_state_dict(load_file(str(bundle.weights), device=str(device)))
@@ -88,9 +100,10 @@ def main() -> None:
     ) -> torch.Tensor:
         batch_labels = labels.to(device)
         noise = noise_for_samples(noise_seeds, config.model.input_shape, device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32)
+        source = source_from_gaussian(prior, noise, batch_labels)
         generated = ode_sample(
             execution_model,
-            noise,
+            source,
             batch_labels,
             steps=parameters.sampling_steps,
             timestep_shift=parameters.timestep_shift,
@@ -121,6 +134,7 @@ def main() -> None:
             "conditioning": "four-timestep-plus-eight-class-tokens",
             "prediction": "clean-x-full-and-base",
             "token_cache_fingerprint": cache_fingerprint,
+            "prior": prior_provenance(prior),
             "rae": {
                 "base_repository": config.rae.base_repository,
                 "base_revision": config.rae.base_revision,

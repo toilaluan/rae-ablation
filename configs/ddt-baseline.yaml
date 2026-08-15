@@ -70,6 +70,10 @@ train:
     beta1: 0.9
     beta2: 0.95
 
+prior:
+  checkpoint_dir: null
+  weight_source: ema
+
 sampling:
   num_samples: 50000
   batch_size: 32
@@ -112,4 +116,3 @@ wandb:
   tags: []
   mode: online
   checkpoint_artifacts: false
-

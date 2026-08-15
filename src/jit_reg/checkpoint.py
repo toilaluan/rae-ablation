@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -92,6 +93,7 @@ class CheckpointManager:
         wandb_run_id: str | None,
         resolved_config: dict[str, Any],
         token_cache_fingerprint: str,
+        prior_provenance: Mapping[str, str] | None = None,
         fid: float | None = None,
     ) -> Path:
         if not token_cache_fingerprint:
@@ -137,6 +139,7 @@ class CheckpointManager:
                     "data_fingerprint": data_fingerprint,
                     "validation_plan_hash": validation_plan_hash,
                     "token_cache_fingerprint": token_cache_fingerprint,
+                    "prior": dict(prior_provenance) if prior_provenance is not None else None,
                 },
                 indent=2,
                 sort_keys=True,
@@ -202,6 +205,7 @@ class CheckpointManager:
         expected_data_fingerprint: str | None = None,
         expected_validation_plan_hash: str | None = None,
         expected_token_cache_fingerprint: str | None = None,
+        expected_prior_provenance: Mapping[str, str] | None = None,
     ) -> ResumeState:
         path = Path(checkpoint)
         if not path.is_absolute():
@@ -245,6 +249,9 @@ class CheckpointManager:
             or saved_token_fingerprint is not None
         ):
             raise ValueError("checkpoint token-cache fingerprint mismatch")
+        from .prior import validate_prior_provenance
+
+        validate_prior_provenance(expected_prior_provenance, metadata.get("prior"))
         return ResumeState(**state)
 
     def export_ema(self, ema: EMA, path: str | Path) -> None:

@@ -12,6 +12,7 @@ from .distributed import broadcast_string
 from .evaluation import evaluate_npz, save_evaluation
 from .model import DDT
 from .model.compile import compile_model_regions
+from .prior import CheckpointPrior, prior_provenance, source_from_gaussian
 from .rae import load_rae_codec
 from .rng import preserving_global_rng
 from .sample_runtime import (
@@ -44,6 +45,7 @@ def validate_ema(
     output_root: str | Path,
     sampling: SamplingParameters | Sequence[SamplingParameters],
     token_cache: TokenCache,
+    prior: CheckpointPrior | None = None,
 ) -> tuple[dict[str, float], Path]:
     rank, _world_size = _distributed()
     device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
@@ -68,6 +70,7 @@ def validate_ema(
         "conditioning": "four-timestep-plus-eight-class-tokens",
         "prediction": "clean-x-full-and-base",
         "token_cache_fingerprint": token_cache.fingerprint,
+        "prior": prior_provenance(prior),
     }
     codec = load_rae_codec(config.rae, device)
     model = DDT(config.model).to(device)
@@ -85,9 +88,10 @@ def validate_ema(
             device,
             dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
         )
+        source = source_from_gaussian(prior, noise, labels.to(device))
         generated = ode_sample(
             execution_model,
-            noise,
+            source,
             labels.to(device),
             steps=parameters.sampling_steps,
             timestep_shift=parameters.timestep_shift,
