@@ -43,6 +43,15 @@ pixel-token mean/std, per-channel normalized pixel/RAE correlation, data provena
 and the RAE-cache fingerprint. DDT checkpoints bundle that artifact so sampling does
 not depend on an external mutable codec path.
 
+Reconstruct a single image and print raw/normalized latent statistics plus pixel
+reconstruction metrics:
+
+```bash
+uv run python scripts/reconstruct.py path/to/image.jpg \
+  --codec artifacts/pixel-codec/best \
+  --output reconstruction.png
+```
+
 ## Mixing experiment
 
 The main preset samples `r` from an endpoint-augmented logit-normal distribution:
