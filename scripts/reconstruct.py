@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -11,11 +10,15 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
-from safetensors.torch import load_file
 from torch import Tensor
 
 from jit_reg.config import IMAGE_SIZE, PixelCodecConfig, load_config
-from jit_reg.pixel_codec import PixelCodec, PixelTokenStatistics, load_pixel_codec_artifact
+from jit_reg.pixel_codec import (
+    PixelCodec,
+    PixelTokenStatistics,
+    load_pixel_codec_artifact,
+    load_pixel_codec_checkpoint,
+)
 
 
 @dataclass(frozen=True)
@@ -76,38 +79,19 @@ def resolve_device(value: str) -> torch.device:
     return device
 
 
-def _weights_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(8 * 1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _load_training_checkpoint(
     source: Path,
     device: torch.device,
     config: PixelCodecConfig,
 ) -> LoadedCodec:
-    weights = source if source.is_file() else source / "model.safetensors"
-    if not weights.is_file():
-        raise FileNotFoundError(
-            f"codec path is neither a portable artifact nor a training checkpoint: {source.resolve()}"
-        )
-    state = load_file(str(weights), device=str(device))
-    prefix = "_orig_mod."
-    if state and all(name.startswith(prefix) for name in state):
-        state = {name.removeprefix(prefix): value for name, value in state.items()}
-    model = PixelCodec(config).to(device)
-    model.load_state_dict(state)
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
-    model.eval()
+    checkpoint = load_pixel_codec_checkpoint(source, config, device)
     return LoadedCodec(
-        model=model,
+        model=checkpoint.model,
         statistics=None,
-        directory=source.resolve().parent if source.is_file() else source.resolve(),
-        weights_sha256=_weights_digest(weights),
+        directory=(
+            checkpoint.source.parent if checkpoint.source.is_file() else checkpoint.source
+        ),
+        weights_sha256=checkpoint.weights_sha256,
         source_kind="training_checkpoint",
     )
 

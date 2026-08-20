@@ -197,6 +197,13 @@ class PixelCodecArtifact:
     metadata: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class PixelCodecCheckpoint:
+    source: Path
+    model: PixelCodec
+    weights_sha256: str
+
+
 def _weights_digest(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -206,7 +213,45 @@ def _weights_digest(path: Path) -> str:
 
 
 def _model_state(model: nn.Module) -> dict[str, Tensor]:
-    return {name: value.detach().cpu().contiguous() for name, value in model.state_dict().items()}
+    state = {
+        name: value.detach().cpu().contiguous()
+        for name, value in model.state_dict().items()
+    }
+    return canonicalize_pixel_codec_state_dict(state)
+
+
+def canonicalize_pixel_codec_state_dict(state: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Remove the wrapper prefix used by checkpoints saved from ``torch.compile``."""
+    prefix = "_orig_mod."
+    prefixed = [name.startswith(prefix) for name in state]
+    if any(prefixed) and not all(prefixed):
+        raise ValueError("pixel codec state mixes compiled and canonical parameter names")
+    if all(prefixed) and prefixed:
+        return {name.removeprefix(prefix): value for name, value in state.items()}
+    return state
+
+
+def load_pixel_codec_checkpoint(
+    source: str | Path,
+    config: PixelCodecConfig,
+    device: torch.device | str,
+) -> PixelCodecCheckpoint:
+    """Load a codec training checkpoint directory or standalone safetensors file."""
+    target = Path(source).resolve()
+    weights = target if target.is_file() else target / "model.safetensors"
+    if not weights.is_file():
+        raise FileNotFoundError(f"pixel codec checkpoint weights are missing: {weights}")
+    config.validate()
+    target_device = torch.device(device)
+    state = canonicalize_pixel_codec_state_dict(
+        load_file(str(weights), device=str(target_device))
+    )
+    model = PixelCodec(config).to(target_device)
+    model.load_state_dict(state)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    model.eval()
+    return PixelCodecCheckpoint(target, model, _weights_digest(weights))
 
 
 def save_pixel_codec_artifact(

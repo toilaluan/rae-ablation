@@ -43,6 +43,25 @@ pixel-token mean/std, per-channel normalized pixel/RAE correlation, data provena
 and the RAE-cache fingerprint. DDT checkpoints bundle that artifact so sampling does
 not depend on an external mutable codec path.
 
+To finish an interrupted run from a particular epoch, compute its statistics and
+turn it into the same portable artifact format (the complete RAE cache is required):
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/finalize_pixel_codec.py \
+  --config configs/pixel-codec.yaml \
+  --checkpoint artifacts/pixel-codec/checkpoints/epoch-0002 \
+  --output artifacts/pixel-codec/epoch-0002-artifact
+```
+
+The resulting directory is ready for DDT training:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/ddt-token-mix.yaml \
+  --override pixel_codec.checkpoint=artifacts/pixel-codec/epoch-0002-artifact \
+  --output runs/ddt-token-mix
+```
+
 Reconstruct a single image and print raw/normalized latent statistics plus pixel
 reconstruction metrics:
 

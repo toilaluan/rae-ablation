@@ -24,7 +24,11 @@ from jit_reg.codec_training import (
 from jit_reg.config import load_config
 from jit_reg.data import data_fingerprint, load_imagenet, preprocessing_metadata
 from jit_reg.distributed import initialize_distributed
-from jit_reg.pixel_codec import PixelCodec, save_pixel_codec_artifact
+from jit_reg.pixel_codec import (
+    PixelCodec,
+    canonicalize_pixel_codec_state_dict,
+    save_pixel_codec_artifact,
+)
 from jit_reg.token_cache import TokenCache
 from jit_reg.wandb_utils import RunLogger
 
@@ -115,7 +119,6 @@ def main() -> None:
     validation_loader = _validation_loader(config, validation_dataset, rank, world_size)
 
     model = PixelCodec(config.pixel_codec).to(device)
-    model = torch.compile(model)
     if world_size > 1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     optimizer = torch.optim.AdamW(
@@ -129,7 +132,11 @@ def main() -> None:
     global_step = 0
     best_lpips = float("inf")
     if args.resume is not None:
-        model.load_state_dict(load_file(str(args.resume / "model.safetensors"), device=str(device)))
+        model.load_state_dict(
+            canonicalize_pixel_codec_state_dict(
+                load_file(str(args.resume / "model.safetensors"), device=str(device))
+            )
+        )
         state = torch.load(args.resume / "training.pt", map_location="cpu", weights_only=False)
         optimizer.load_state_dict(state["optimizer"])
         start_epoch = int(state["epoch"])
@@ -139,10 +146,10 @@ def main() -> None:
         if state["cuda_rng"] is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["cuda_rng"])
 
-    execution_model: torch.nn.Module = model
+    execution_model: torch.nn.Module = torch.compile(model)
     if world_size > 1:
         execution_model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[device.index] if device.type == "cuda" else None
+            execution_model, device_ids=[device.index] if device.type == "cuda" else None
         )
     logger = RunLogger(config.wandb, config.as_dict(), rank == 0, log_interval=args.log_interval)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -216,7 +223,11 @@ def main() -> None:
         raise RuntimeError("codec training produced no validated best checkpoint")
     if world_size > 1:
         torch.distributed.barrier()
-    model.load_state_dict(load_file(str(args.output / "best-model.safetensors"), device=str(device)))
+    model.load_state_dict(
+        canonicalize_pixel_codec_state_dict(
+            load_file(str(args.output / "best-model.safetensors"), device=str(device))
+        )
+    )
     statistics_loader = make_statistics_loader(train_dataset, token_cache, config)
     statistics = compute_pixel_token_statistics(model, statistics_loader, token_cache, device)
     if rank == 0:
