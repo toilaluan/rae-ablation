@@ -10,6 +10,7 @@ from .checkpoint import EMA
 from .config import ExperimentConfig
 from .distributed import broadcast_string
 from .evaluation import evaluate_npz, save_evaluation
+from .latent_statistics import latent_statistics_sha256
 from .model import DDT
 from .model.compile import compile_model_regions
 from .pixel_decoder import load_pixel_decoder
@@ -67,12 +68,16 @@ def validate_ema(
     digest = state_dict_sha256(ema.state_dict()) if rank == 0 else None
     digest = broadcast_string(digest, rank)
     decoder, decoder_digest = load_pixel_decoder(config.decoder, device)
+    statistics_digest = latent_statistics_sha256(config.vision.statistics_path)
     feature_schema = {
         "schema_version": FEATURE_SCHEMA_VERSION,
-        "input_space": "dinov3-b16-normalized-block7-patch-tokens",
+        "input_space": (
+            f"dinov3-b16-normalized-block{config.vision.target_layer}-patch-tokens"
+        ),
         "input_shape": list(config.model.input_shape),
         "vision_fingerprint": vision_fingerprint(config.vision),
         "decoder_sha256": decoder_digest,
+        "latent_statistics_sha256": statistics_digest,
         "conditioning": "timestep-mix-ratio-class",
         "prediction": "direct-velocity-noise-minus-clean",
         "sample_mix_ratio": 1.0,

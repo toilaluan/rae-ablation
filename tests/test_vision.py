@@ -3,7 +3,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from jit_reg.config import VisionConfig
+from jit_reg.config import IMAGE_SIZE, VisionConfig
+from jit_reg.latent_statistics import LatentStatistics, SharedLatentNormalizer
 from jit_reg.vision import DINOEndpointEncoder
 
 
@@ -15,7 +16,8 @@ class Embeddings(nn.Module):
     def forward(self, pixels: torch.Tensor, bool_masked_pos: object = None) -> torch.Tensor:
         del bool_masked_pos
         batch = pixels.shape[0]
-        return torch.zeros(batch, 261, 768, device=pixels.device, dtype=pixels.dtype)
+        patches = (pixels.shape[-1] // 16) ** 2
+        return torch.zeros(batch, 5 + patches, 768, device=pixels.device, dtype=pixels.dtype)
 
 
 class Block(nn.Module):
@@ -45,9 +47,11 @@ class FakeDINO(nn.Module):
 def test_dino_extracts_both_normalized_patch_endpoints_in_one_pass() -> None:
     model = FakeDINO()
     encoder = DINOEndpointEncoder(model, VisionConfig())
-    target, semantic = encoder.encode_pair(torch.zeros(1, 3, 256, 256, dtype=torch.uint8))
-    assert target.shape == semantic.shape == (1, 768, 16, 16)
-    assert torch.all(target == sum(range(1, 8)))
+    target, semantic = encoder.encode_pair(
+        torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.uint8)
+    )
+    assert target.shape == semantic.shape == (1, 768, 8, 8)
+    assert torch.all(target == sum(range(1, 3)))
     assert torch.all(semantic == sum(range(1, 13)))
     assert all(not parameter.requires_grad for parameter in encoder.parameters())
     encoder.train()
@@ -57,5 +61,23 @@ def test_dino_extracts_both_normalized_patch_endpoints_in_one_pass() -> None:
 def test_target_only_encoder_stops_at_target_layer() -> None:
     model = FakeDINO()
     encoder = DINOEndpointEncoder(model, VisionConfig(), include_semantic=False)
-    target = encoder.encode_target(torch.zeros(1, 3, 256, 256))
-    assert torch.all(target == sum(range(1, 8)))
+    target = encoder.encode_target(torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE))
+    assert torch.all(target == sum(range(1, 3)))
+
+
+def test_dino_applies_one_shared_normalizer_to_both_endpoints() -> None:
+    statistics = LatentStatistics(
+        mean=torch.ones(768),
+        std=torch.full((768,), 2.0),
+        count=2,
+        vision_fingerprint="vision",
+        data_fingerprint="data",
+    )
+    encoder = DINOEndpointEncoder(
+        FakeDINO(),
+        VisionConfig(),
+        normalizer=SharedLatentNormalizer(statistics),
+    )
+    target, semantic = encoder.encode_pair(torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE))
+    assert torch.all(target == (sum(range(1, 3)) - 1) / 2)
+    assert torch.all(semantic == (sum(range(1, 13)) - 1) / 2)

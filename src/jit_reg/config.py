@@ -45,12 +45,13 @@ class DataConfig:
 class VisionConfig:
     repository: str = DINO_REPOSITORY
     revision: str = DINO_REVISION
-    target_layer: int = 7
+    target_layer: int = 2
     semantic_layer: int = 12
     image_size: int = IMAGE_SIZE
     patch_size: int = DINO_PATCH_SIZE
     hidden_size: int = DINO_CHANNELS
     num_register_tokens: int = 4
+    statistics_path: str = "data/dino-shared-statistics.safetensors"
     compile: CompileConfig = field(default_factory=CompileConfig)
 
     @property
@@ -67,11 +68,15 @@ class VisionConfig:
         if not self.revision:
             raise ValueError("vision.revision must pin an immutable model revision")
         if (self.image_size, self.patch_size, self.hidden_size) != (IMAGE_SIZE, DINO_PATCH_SIZE, DINO_CHANNELS):
-            raise ValueError("v14 requires DINOv3-B/16 at 256px with width 768")
+            raise ValueError(
+                f"v14 requires DINOv3-B/16 at {IMAGE_SIZE}px with width {DINO_CHANNELS}"
+            )
         if not 1 <= self.target_layer < self.semantic_layer <= 12:
             raise ValueError("vision layers must satisfy 1 <= target < semantic <= 12")
         if self.num_register_tokens != 4:
             raise ValueError("the pinned DINOv3-B/16 checkpoint must have four registers")
+        if not self.statistics_path:
+            raise ValueError("vision.statistics_path cannot be empty")
 
 
 @dataclass
@@ -86,7 +91,7 @@ class DecoderLossConfig:
 @dataclass
 class DecoderTrainConfig:
     epochs: int = 40
-    global_batch_size: int = 256
+    global_batch_size: int = 1024
     max_steps: int | None = None
     lr: float = 2e-4
     min_lr: float = 2e-5
@@ -94,7 +99,7 @@ class DecoderTrainConfig:
     ema_decay: float = 0.9995
     seed: int = 0
     validation_interval: int = 1
-    validation_batches: int = 32
+    validation_batches: int = 128
     sample_interval: int = 1_000
 
 
@@ -134,9 +139,9 @@ class DDTConfig:
     input_size: int = DINO_GRID_SIZE
     patch_size: list[int] = field(default_factory=lambda: [1, 1])
     in_channels: int = DINO_CHANNELS
-    hidden_size: list[int] = field(default_factory=lambda: [768, 2048])
+    hidden_size: list[int] = field(default_factory=lambda: [384, 1536])
     depth: list[int] = field(default_factory=lambda: [12, 2])
-    num_heads: list[int] = field(default_factory=lambda: [12, 16])
+    num_heads: list[int] = field(default_factory=lambda: [6, 16])
     mlp_ratio: float = 4.0
     num_classes: int = 1000
     cfg_dropout_prob: float = 0.1
@@ -144,7 +149,7 @@ class DDTConfig:
     num_mix_tokens: int = 4
     num_class_tokens: int = 8
     gradient_checkpointing: bool = False
-    variant: str = "DDT-B/1-DINOv3B-16x16-REPA"
+    variant: str = "DDT-B/1-DINOv3B-8x8-REPA"
 
     @property
     def grid_size(self) -> int:
@@ -208,9 +213,9 @@ class RepaConfig:
 
 @dataclass
 class OptimizerConfig:
-    kind: str = "muon"
+    kind: str = "adamw"
     lr: float = 2e-4
-    min_lr: float = 2e-5
+    min_lr: float = 2e-4
     weight_decay: float = 0.0
     beta1: float = 0.9
     beta2: float = 0.95
@@ -236,7 +241,7 @@ class SamplingConfig:
     batch_size: int = 32
     sampling_steps: int = 50
     solver: str = "euler"
-    timestep_shift: float = 4.0
+    timestep_shift: float = 1.0
     cfg_scale: float = 1.0
     cfg_start: float = 0.0
     cfg_end: float = 1.0
@@ -245,7 +250,7 @@ class SamplingConfig:
 
 @dataclass
 class EvaluationConfig:
-    reference_npz: str = "data/VIRTUAL_imagenet256_labeled.npz"
+    reference_npz: str = "data/VIRTUAL_imagenet128_labeled.npz"
     batch_size: int = 32
     device: str = "auto"
     log_interval: int = 10

@@ -12,7 +12,7 @@ from jit_reg.distributed import broadcast_string, initialize_distributed
 from jit_reg.evaluation import evaluate_npz, save_evaluation
 from jit_reg.model import DDT
 from jit_reg.model.compile import compile_model_regions
-from jit_reg.pixel_decoder import load_pixel_decoder
+from jit_reg.pixel_decoder import decoder_latent_statistics_sha256, load_pixel_decoder
 from jit_reg.sample_runtime import (
     FEATURE_SCHEMA_VERSION,
     SamplingParameters,
@@ -73,6 +73,9 @@ def main() -> None:
     decoder, decoder_digest = load_pixel_decoder(config.decoder, device)
     if metadata.get("decoder_sha256") != decoder_digest:
         raise ValueError("configured decoder does not match checkpoint provenance")
+    statistics_digest = decoder_latent_statistics_sha256(config.decoder.checkpoint)
+    if metadata.get("latent_statistics_sha256") != statistics_digest:
+        raise ValueError("decoder and diffusion checkpoints use different latent statistics")
     if metadata.get("feature_fingerprint") != vision_fingerprint(config.vision):
         raise ValueError("checkpoint DINO feature provenance does not match its config")
 
@@ -112,10 +115,13 @@ def main() -> None:
         model_variant=config.model.model_variant,
         feature_schema={
             "schema_version": FEATURE_SCHEMA_VERSION,
-            "input_space": "dinov3-b16-normalized-block7-patch-tokens",
+            "input_space": (
+                f"dinov3-b16-normalized-block{config.vision.target_layer}-patch-tokens"
+            ),
             "input_shape": list(config.model.input_shape),
             "vision_fingerprint": vision_fingerprint(config.vision),
             "decoder_sha256": decoder_digest,
+            "latent_statistics_sha256": statistics_digest,
             "conditioning": "timestep-mix-ratio-class",
             "prediction": "direct-velocity-noise-minus-clean",
             "sample_mix_ratio": 1.0,

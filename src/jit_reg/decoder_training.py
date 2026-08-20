@@ -190,6 +190,7 @@ def save_decoder_checkpoint(
     generator_optimizer: torch.optim.Optimizer,
     discriminator_optimizer: torch.optim.Optimizer,
     config: ExperimentConfig,
+    latent_statistics_sha256: str,
 ) -> Path:
     name = f"epoch-{state.epoch:04d}"
     target = directory / name
@@ -221,6 +222,7 @@ def save_decoder_checkpoint(
             "generator_optimizer": generator_optimizer.state_dict(),
             "discriminator_optimizer": discriminator_optimizer.state_dict(),
             "vision_fingerprint": vision_fingerprint(config.vision),
+            "latent_statistics_sha256": latent_statistics_sha256,
             "cpu_rng_state": torch.random.get_rng_state(),
             "cuda_rng_states": torch.cuda.get_rng_state_all()
             if torch.cuda.is_available()
@@ -230,6 +232,18 @@ def save_decoder_checkpoint(
     )
     (temporary / "config.json").write_text(
         json.dumps(config.as_dict(), indent=2, sort_keys=True) + "\n"
+    )
+    (temporary / "metadata.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 14,
+                "vision_fingerprint": vision_fingerprint(config.vision),
+                "latent_statistics_sha256": latent_statistics_sha256,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
     )
     os.replace(temporary, target)
     link = directory / "last"
@@ -247,6 +261,7 @@ def load_decoder_checkpoint(
     generator_optimizer: torch.optim.Optimizer,
     discriminator_optimizer: torch.optim.Optimizer,
     config: ExperimentConfig,
+    expected_latent_statistics_sha256: str,
 ) -> DecoderState:
     resolved = (path / "last").resolve() if (path / "last").is_dir() else path.resolve()
     state = torch.load(resolved / "training.pt", map_location="cpu", weights_only=False)
@@ -255,6 +270,14 @@ def load_decoder_checkpoint(
     expected = vision_fingerprint(config.vision)
     if state.get("vision_fingerprint") != expected:
         raise ValueError("decoder checkpoint DINO provenance mismatch")
+    if state.get("latent_statistics_sha256") != expected_latent_statistics_sha256:
+        raise ValueError("decoder checkpoint latent-statistics provenance mismatch")
+    metadata_path = resolved / "metadata.json"
+    if not metadata_path.is_file():
+        raise ValueError("decoder checkpoint has no latent-statistics metadata")
+    metadata = json.loads(metadata_path.read_text())
+    if metadata.get("latent_statistics_sha256") != expected_latent_statistics_sha256:
+        raise ValueError("decoder checkpoint latent-statistics metadata mismatch")
     _unwrap(decoder).load_state_dict(load_file(str(resolved / "decoder.safetensors")))
     ema.load_state_dict(load_file(str(resolved / "ema.safetensors")))
     _unwrap(discriminator).load_state_dict(
@@ -288,6 +311,7 @@ def train_decoder(
     output: Path,
     logger: RunLogger,
     state: DecoderState | None = None,
+    latent_statistics_sha256: str,
 ) -> DecoderState:
     state = state or DecoderState()
     state.wandb_run_id = logger.run_id
@@ -413,6 +437,7 @@ def train_decoder(
                 generator_optimizer,
                 discriminator_optimizer,
                 config,
+                latent_statistics_sha256,
             )
             if config.wandb.checkpoint_artifacts:
                 logger.log_checkpoint(str(checkpoint), f"decoder-epoch-{state.epoch:04d}")

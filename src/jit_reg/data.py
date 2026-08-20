@@ -44,7 +44,8 @@ def preprocessing_metadata(config: DataConfig, image_size: int) -> dict[str, Any
             f"PIL.resize({image_size}x{image_size}, bicubic) when needed",
             "uint8_to_float32_[0,1]",
             "online_frozen_dinov3_b16_imagenet_normalization",
-            "normalized_block7_and_block12_patch_tokens",
+            "shared_final_layernorm_target_and_semantic_patch_tokens",
+            "shared_dataset_per_channel_latent_normalization",
         ],
     }
 

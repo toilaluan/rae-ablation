@@ -35,7 +35,7 @@ def ode_sample(
     labels: Tensor,
     *,
     steps: int = 50,
-    timestep_shift: float = 4.0,
+    timestep_shift: float = 1.0,
     cfg_scale: float = 1.0,
     cfg_interval: tuple[float, float] = (0.0, 1.0),
     solver: Solver = "euler",

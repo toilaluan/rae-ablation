@@ -9,14 +9,17 @@ import torch
 from torch import Tensor, nn
 
 from .config import IMAGE_SIZE, CompileConfig, VisionConfig
+from .latent_statistics import SharedLatentNormalizer
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def vision_fingerprint(config: VisionConfig) -> str:
+    vision_config = asdict(config)
+    vision_config.pop("statistics_path", None)
     payload = {
-        **asdict(config),
+        **vision_config,
         "compile": None,
         "normalization": {"mean": IMAGENET_MEAN, "std": IMAGENET_STD},
         "tokens": "patch-only-after-shared-final-layernorm",
@@ -35,12 +38,14 @@ class DINOEndpointEncoder(nn.Module):
         config: VisionConfig,
         *,
         include_semantic: bool = True,
+        normalizer: SharedLatentNormalizer | None = None,
     ) -> None:
         super().__init__()
         config.validate()
         self.model = model.eval()
         self.config = config
         self.include_semantic = include_semantic
+        self.normalizer = normalizer
         self.register_buffer(
             "pixel_mean",
             torch.tensor(IMAGENET_MEAN, dtype=torch.float32).reshape(1, 3, 1, 1),
@@ -107,7 +112,12 @@ class DINOEndpointEncoder(nn.Module):
         if target is None:
             raise RuntimeError("DINO target layer was not reached")
         semantic = self.model.norm(states) if self.include_semantic else target
-        return self._patch_tokens(target), self._patch_tokens(semantic)
+        target_patches = self._patch_tokens(target)
+        semantic_patches = self._patch_tokens(semantic)
+        if self.normalizer is not None:
+            target_patches = self.normalizer(target_patches)
+            semantic_patches = self.normalizer(semantic_patches)
+        return target_patches, semantic_patches
 
     @torch.no_grad()
     def forward(self, pixels: Tensor) -> tuple[Tensor, Tensor]:
@@ -128,6 +138,7 @@ def load_dino_encoder(
     device: torch.device | str,
     *,
     include_semantic: bool = True,
+    normalizer: SharedLatentNormalizer | None = None,
 ) -> DINOEndpointEncoder:
     from transformers import DINOv3ViTModel
 
@@ -148,6 +159,11 @@ def load_dino_encoder(
     for name, value in expected.items():
         if getattr(actual, name, None) != value:
             raise ValueError(f"pinned DINO config mismatch for {name}")
-    encoder = DINOEndpointEncoder(model, config, include_semantic=include_semantic).to(target)
+    encoder = DINOEndpointEncoder(
+        model,
+        config,
+        include_semantic=include_semantic,
+        normalizer=normalizer,
+    ).to(target)
     encoder.compile(config.compile)
     return encoder

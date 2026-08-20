@@ -54,8 +54,13 @@ class NpzImageReader:
                 shape, fortran_order, dtype = _read_npy_header(handle)
         if fortran_order:
             raise ValueError("sample arr_0 must use C order")
-        if len(shape) != 4 or shape[1:] != (256, 256, 3):
-            raise ValueError(f"sample arr_0 must have shape Nx256x256x3, received {shape}")
+        if (
+            len(shape) != 4
+            or shape[-1] != 3
+            or shape[1] < 1
+            or shape[1] != shape[2]
+        ):
+            raise ValueError(f"sample arr_0 must have shape NxSxSx3, received {shape}")
         if dtype != np.dtype(np.uint8):
             raise ValueError(f"sample arr_0 must use uint8, received {dtype}")
         if shape[0] < 2:

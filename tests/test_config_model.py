@@ -36,13 +36,25 @@ def test_schema_v14_defaults_and_matched_presets() -> None:
     config = ExperimentConfig()
     config.validate()
     assert config.schema_version == CONFIG_SCHEMA_VERSION == 14
-    assert config.vision.token_shape == (768, 16, 16)
+    assert config.vision.token_shape == (768, 8, 8)
     assert config.model.input_shape == config.vision.token_shape
-    assert config.vision.target_layer == 7
+    assert config.vision.target_layer == 2
     assert config.vision.semantic_layer == 12
+    assert config.vision.statistics_path == "data/dino-shared-statistics.safetensors"
+    assert config.model.hidden_size == [384, 1536]
+    assert config.model.num_heads == [6, 16]
+    assert config.train.optimizer.kind == "adamw"
+    assert config.sampling.timestep_shift == 1.0
     assert config.repa == RepaConfig(layer_depth=8, projector_width=2048, coefficient=0.5)
-    assert load_config("configs/dino-tokenmix.yaml").mixing.mode == "token_mix"
-    assert load_config("configs/dino-r1-baseline.yaml").mixing.mode == "target_baseline"
+    token_mix = load_config("configs/dino-tokenmix.yaml")
+    baseline = load_config("configs/dino-r1-baseline.yaml")
+    assert token_mix.mixing.mode == "token_mix"
+    assert baseline.mixing.mode == "target_baseline"
+    assert baseline.vision == token_mix.vision
+    assert baseline.decoder == token_mix.decoder
+    assert baseline.model == token_mix.model
+    assert baseline.train == token_mix.train
+    assert baseline.sampling == token_mix.sampling
 
 
 def test_old_and_unknown_configuration_are_rejected(tmp_path) -> None:

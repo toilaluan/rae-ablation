@@ -38,6 +38,7 @@ class ResumeState:
     rng_streams: dict[str, Tensor]
     feature_fingerprint: str
     decoder_sha256: str
+    latent_statistics_sha256: str
 
 
 def should_checkpoint(completed_epoch: int, total_epochs: int, interval: int) -> bool:
@@ -94,10 +95,13 @@ class CheckpointManager:
         resolved_config: dict[str, Any],
         feature_fingerprint: str,
         decoder_sha256: str,
+        latent_statistics_sha256: str,
         fid: float | None = None,
     ) -> Path:
-        if not feature_fingerprint or not decoder_sha256:
-            raise ValueError("schema-v14 checkpoints require vision and decoder provenance")
+        if not feature_fingerprint or not decoder_sha256 or not latent_statistics_sha256:
+            raise ValueError(
+                "schema-v14 checkpoints require vision, latent-statistics, and decoder provenance"
+            )
         name = f"epoch-{completed_epoch:04d}"
         target = self.directory / name
         if target.exists():
@@ -119,6 +123,7 @@ class CheckpointManager:
             "rng_streams": rng_streams,
             "feature_fingerprint": feature_fingerprint,
             "decoder_sha256": decoder_sha256,
+            "latent_statistics_sha256": latent_statistics_sha256,
         }
         torch.save(training, temporary / "training.pt")
         (temporary / "config.json").write_text(
@@ -141,6 +146,7 @@ class CheckpointManager:
                     "validation_plan_hash": validation_plan_hash,
                     "feature_fingerprint": feature_fingerprint,
                     "decoder_sha256": decoder_sha256,
+                    "latent_statistics_sha256": latent_statistics_sha256,
                 },
                 indent=2,
                 sort_keys=True,
@@ -207,6 +213,7 @@ class CheckpointManager:
         expected_validation_plan_hash: str | None = None,
         expected_feature_fingerprint: str | None = None,
         expected_decoder_sha256: str | None = None,
+        expected_latent_statistics_sha256: str | None = None,
     ) -> ResumeState:
         path = Path(checkpoint)
         if not path.is_absolute():
@@ -242,14 +249,22 @@ class CheckpointManager:
             raise ValueError("checkpoint validation-plan hash mismatch")
         saved_feature = state.get("feature_fingerprint")
         saved_decoder = state.get("decoder_sha256")
+        saved_statistics = state.get("latent_statistics_sha256")
         if metadata.get("feature_fingerprint") != saved_feature:
             raise ValueError("checkpoint vision provenance is inconsistent")
         if metadata.get("decoder_sha256") != saved_decoder:
             raise ValueError("checkpoint decoder provenance is inconsistent")
+        if metadata.get("latent_statistics_sha256") != saved_statistics:
+            raise ValueError("checkpoint latent-statistics provenance is inconsistent")
         if expected_feature_fingerprint is not None and expected_feature_fingerprint != saved_feature:
             raise ValueError("checkpoint vision fingerprint mismatch")
         if expected_decoder_sha256 is not None and expected_decoder_sha256 != saved_decoder:
             raise ValueError("checkpoint decoder digest mismatch")
+        if (
+            expected_latent_statistics_sha256 is not None
+            and expected_latent_statistics_sha256 != saved_statistics
+        ):
+            raise ValueError("checkpoint latent-statistics digest mismatch")
         return ResumeState(**state)
 
     def export_ema(self, ema: EMA, path: str | Path) -> None:

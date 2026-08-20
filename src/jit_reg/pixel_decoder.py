@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -15,7 +16,7 @@ from .model.ddt import DDTEncoderBlock, RMSNorm
 
 
 class TransformerPixelDecoder(nn.Module):
-    """Decode a 16x16 grid of DINO patch tokens directly into RGB patches."""
+    """Decode a DINO patch-token grid directly into RGB patches."""
 
     def __init__(self, config: PixelDecoderConfig | None = None) -> None:
         super().__init__()
@@ -188,6 +189,16 @@ def decoder_weights_path(checkpoint: str | Path) -> Path:
     if not path.is_file():
         raise FileNotFoundError(f"decoder checkpoint is missing: {path}")
     return path
+
+
+def decoder_latent_statistics_sha256(checkpoint: str | Path) -> str:
+    metadata_path = decoder_weights_path(checkpoint).parent / "metadata.json"
+    if not metadata_path.is_file():
+        raise ValueError("decoder checkpoint has no latent-statistics metadata")
+    value = json.loads(metadata_path.read_text()).get("latent_statistics_sha256")
+    if not isinstance(value, str) or not value:
+        raise ValueError("decoder checkpoint has invalid latent-statistics metadata")
+    return value
 
 
 def load_pixel_decoder(

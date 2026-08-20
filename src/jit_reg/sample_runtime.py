@@ -25,7 +25,7 @@ class SamplingParameters:
     batch_size: int = 32
     sampling_steps: int = 50
     solver: str = "euler"
-    timestep_shift: float = 4.0
+    timestep_shift: float = 1.0
     cfg_scale: float = 1.0
     cfg_start: float = 0.0
     cfg_end: float = 1.0

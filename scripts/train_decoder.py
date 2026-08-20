@@ -15,6 +15,11 @@ from jit_reg.decoder_training import (
     train_decoder,
 )
 from jit_reg.distributed import initialize_distributed
+from jit_reg.latent_statistics import (
+    SharedLatentNormalizer,
+    latent_statistics_sha256,
+    load_latent_statistics,
+)
 from jit_reg.model.compile import compile_model_regions
 from jit_reg.pixel_decoder import (
     PatchDiscriminator,
@@ -26,7 +31,7 @@ from jit_reg.wandb_utils import RunLogger
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train the DINO block-7 pixel decoder")
+    parser = argparse.ArgumentParser(description="Train the DINO target-token pixel decoder")
     parser.add_argument("--config", type=Path, default=Path("configs/dino-tokenmix.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path, default=Path("decoder-runs/default"))
@@ -39,11 +44,25 @@ def main() -> None:
     args = build_parser().parse_args()
     config = load_config(args.config, args.override)
     rank, world_size, device = initialize_distributed()
+    statistics_path = Path(config.vision.statistics_path).resolve()
+    config.vision.statistics_path = str(statistics_path)
+    statistics = load_latent_statistics(
+        statistics_path,
+        expected_channels=config.vision.hidden_size,
+        expected_vision_fingerprint=vision_fingerprint(config.vision),
+        expected_data_fingerprint=data_fingerprint(config.data, config.vision.image_size),
+    )
+    statistics_digest = latent_statistics_sha256(statistics_path)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(config.decoder.train.seed)
         decoder = TransformerPixelDecoder(config.decoder).to(device)
         discriminator = PatchDiscriminator(config.decoder.discriminator_channels).to(device)
-    feature_encoder = load_dino_encoder(config.vision, device, include_semantic=False)
+    feature_encoder = load_dino_encoder(
+        config.vision,
+        device,
+        include_semantic=False,
+        normalizer=SharedLatentNormalizer(statistics),
+    )
     objective = ReconstructionObjective(config.decoder).to(device)
     generator_optimizer = torch.optim.AdamW(
         decoder.parameters(), lr=config.decoder.train.lr, betas=(0.9, 0.95)
@@ -62,6 +81,7 @@ def main() -> None:
             generator_optimizer,
             discriminator_optimizer,
             config,
+            statistics_digest,
         )
     else:
         torch.manual_seed(config.decoder.train.seed + rank)
@@ -95,6 +115,7 @@ def main() -> None:
         "dataset": preprocessing_metadata(config.data, config.vision.image_size),
         "data_fingerprint": data_fingerprint(config.data, config.vision.image_size),
         "vision_fingerprint": vision_fingerprint(config.vision),
+        "latent_statistics_sha256": statistics_digest,
     }
     logger = RunLogger(
         config.wandb,
@@ -121,6 +142,7 @@ def main() -> None:
             output=args.output,
             logger=logger,
             state=state,
+            latent_statistics_sha256=statistics_digest,
         )
     finally:
         logger.finish()

@@ -17,6 +17,7 @@ vision:
   patch_size: 16
   hidden_size: 768
   num_register_tokens: 4
+  statistics_path: data/dino-shared-statistics.safetensors
   compile:
     enabled: true
     backend: inductor
@@ -64,7 +65,7 @@ model:
   num_mix_tokens: 4
   num_class_tokens: 8
   gradient_checkpointing: false
-  variant: DDT-B/1-DINOv3B-16x16-REPA
+  variant: DDT-B/1-DINOv3B-8x8-REPA
 
 mixing:
   mode: token_mix

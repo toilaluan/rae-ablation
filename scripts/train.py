@@ -11,10 +11,15 @@ from jit_reg.config import ExperimentConfig, load_config
 from jit_reg.data import data_fingerprint, load_imagenet, preprocessing_metadata
 from jit_reg.distributed import initialize_distributed
 from jit_reg.flops import model_flops_per_step
+from jit_reg.latent_statistics import (
+    SharedLatentNormalizer,
+    latent_statistics_sha256,
+    load_latent_statistics,
+)
 from jit_reg.model import DDT
 from jit_reg.model.compile import compile_model_regions
 from jit_reg.optim import build_optimizer
-from jit_reg.pixel_decoder import decoder_weights_path
+from jit_reg.pixel_decoder import decoder_latent_statistics_sha256, decoder_weights_path
 from jit_reg.rng import RNGStreams
 from jit_reg.sample_runtime import SamplingParameters, checkpoint_sha256
 from jit_reg.training import TrainState, make_train_loader, train
@@ -67,11 +72,27 @@ def main() -> None:
         raise FileNotFoundError(config.evaluation.reference_npz)
 
     rank, world_size, device = initialize_distributed()
+    statistics_path = Path(config.vision.statistics_path).resolve()
+    config.vision.statistics_path = str(statistics_path)
+    statistics = load_latent_statistics(
+        statistics_path,
+        expected_channels=config.vision.hidden_size,
+        expected_vision_fingerprint=vision_fingerprint(config.vision),
+        expected_data_fingerprint=data_fingerprint(config.data, config.vision.image_size),
+    )
+    statistics_digest = latent_statistics_sha256(statistics_path)
+    if decoder_latent_statistics_sha256(config.decoder.checkpoint) != statistics_digest:
+        raise ValueError("decoder checkpoint was trained with different latent statistics")
     streams = RNGStreams.create(config.train.seed, device)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(streams.initialization.initial_seed())
         model = DDT(config.model, config.repa).to(device)
-    feature_encoder = load_dino_encoder(config.vision, device, include_semantic=True)
+    feature_encoder = load_dino_encoder(
+        config.vision,
+        device,
+        include_semantic=True,
+        normalizer=SharedLatentNormalizer(statistics),
+    )
     dataset = load_imagenet(config.data, config.vision.image_size, load_pixels=True)
     fingerprint = data_fingerprint(config.data, config.vision.image_size)
     feature_id = vision_fingerprint(config.vision)
@@ -101,6 +122,7 @@ def main() -> None:
             plan.plan_hash,
             feature_id,
             decoder_digest,
+            statistics_digest,
         )
         optimizer.load_state_dict(resumed.optimizer)
         streams.load_state_dict(resumed.rng_streams)
@@ -126,6 +148,7 @@ def main() -> None:
         "data_fingerprint": fingerprint,
         "validation_plan_hash": plan.plan_hash,
         "vision_fingerprint": feature_id,
+        "latent_statistics_sha256": statistics_digest,
         "decoder_sha256": decoder_digest,
         "diffusion_input_shape": list(config.model.input_shape),
     }
@@ -186,6 +209,7 @@ def main() -> None:
             checkpoint_manager=manager,
             data_fingerprint=fingerprint,
             decoder_sha256=decoder_digest,
+            latent_statistics_sha256=statistics_digest,
             validation_plan_hash=plan.plan_hash,
             validation_plan_path=plan_path,
             logger=logger,

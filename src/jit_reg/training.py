@@ -191,6 +191,7 @@ def train(
     checkpoint_manager: CheckpointManager,
     data_fingerprint: str,
     decoder_sha256: str,
+    latent_statistics_sha256: str,
     validation_plan_hash: str,
     validation_plan_path: str | Path,
     logger: RunLogger,
@@ -307,7 +308,9 @@ def train(
                 "compute/model_flops_per_step": step_flops,
                 "compute/cumulative_model_flops": state.global_step * step_flops,
                 "throughput/images_per_second": config.train.global_batch_size / elapsed,
-                "throughput/tokens_per_second": config.train.global_batch_size * 256 / elapsed,
+                "throughput/tokens_per_second": (
+                    config.train.global_batch_size * config.vision.grid_size**2 / elapsed
+                ),
                 "throughput/step_seconds": elapsed,
                 "throughput/feature_encoder_seconds": feature_seconds,
                 "throughput/data_wait_seconds": data_wait,
@@ -355,6 +358,7 @@ def train(
                 resolved_config=config.as_dict(),
                 feature_fingerprint=feature_id,
                 decoder_sha256=decoder_sha256,
+                latent_statistics_sha256=latent_statistics_sha256,
                 fid=fid_values[0] if fid_values and config.checkpoint.save_best_fid else None,
             )
             if config.wandb.checkpoint_artifacts:
