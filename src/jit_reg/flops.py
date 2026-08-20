@@ -16,7 +16,12 @@ def _mlp_flops(tokens: int, width: int, ratio: float) -> int:
 def ddt_base_forward_flops(config: ExperimentConfig) -> int:
     model = config.model
     spatial = model.grid_size**2
-    tokens = spatial + model.num_timestep_tokens + model.num_class_tokens
+    tokens = (
+        spatial
+        + model.num_timestep_tokens
+        + model.num_ratio_tokens
+        + model.num_class_tokens
+    )
     width, _ = model.hidden_size
     heads, _ = model.num_heads
     patch_values = model.patch_size[0] ** 2 * model.in_channels
@@ -31,7 +36,12 @@ def ddt_base_forward_flops(config: ExperimentConfig) -> int:
 def ddt_full_forward_flops(config: ExperimentConfig, *, include_base_head: bool = False) -> int:
     model = config.model
     spatial = model.grid_size**2
-    enc_tokens = spatial + model.num_timestep_tokens + model.num_class_tokens
+    enc_tokens = (
+        spatial
+        + model.num_timestep_tokens
+        + model.num_ratio_tokens
+        + model.num_class_tokens
+    )
     enc_width, dec_width = model.hidden_size
     enc_heads, dec_heads = model.num_heads
     enc_patch = model.patch_size[0] ** 2 * model.in_channels
@@ -55,13 +65,33 @@ def ddt_full_forward_flops(config: ExperimentConfig, *, include_base_head: bool 
 
 
 def model_flops_per_step(config: ExperimentConfig) -> int:
-    """Approximate global DDT FLOPs for scoring plus winner-only forward/backward."""
+    """Approximate global DDT FLOPs for one forward/backward training step."""
     batch = config.train.global_batch_size
     winner_forward = ddt_full_forward_flops(config, include_base_head=True)
-    total = batch * 3 * winner_forward
-    explore = config.exploration
-    if explore.k_early > 1:
-        total += batch * explore.k_total * ddt_base_forward_flops(config)
-    if explore.k_full > 1:
-        total += batch * explore.k_full * ddt_full_forward_flops(config)
-    return total
+    return batch * 3 * winner_forward
+
+
+def pixel_encoder_flops_per_step(config: ExperimentConfig) -> int:
+    """Approximate global FLOPs for the frozen online pixel-encoder forward."""
+    widths = config.pixel_codec.widths
+    size = 256
+
+    def convolution(spatial: int, in_channels: int, out_channels: int, kernel: int) -> int:
+        return 2 * spatial**2 * in_channels * out_channels * kernel**2
+
+    total = convolution(size, 3, widths[0], 3)
+    for index in range(len(widths) - 1):
+        total += config.pixel_codec.residual_blocks_per_scale * 2 * convolution(
+            size, widths[index], widths[index], 3
+        )
+        size //= 2
+        total += convolution(size, widths[index], widths[index + 1], 3)
+    total += config.pixel_codec.residual_blocks_per_scale * 2 * convolution(
+        size, widths[-1], widths[-1], 3
+    )
+    total += convolution(size, widths[-1], config.pixel_codec.latent_channels, 1)
+    return config.train.global_batch_size * total
+
+
+def total_training_flops_per_step(config: ExperimentConfig) -> int:
+    return model_flops_per_step(config) + pixel_encoder_flops_per_step(config)

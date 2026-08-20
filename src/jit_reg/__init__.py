@@ -1,6 +1,13 @@
-"""RAEv2-compressed ImageNet training with DDT internal guidance and K exploration."""
+"""RAE/pixel token interpolation training with DDT internal guidance."""
 
-from .config import DDTConfig, ExperimentConfig, ExplorationConfig, RAEConfig, load_config
+from .config import (
+    DDTConfig,
+    ExperimentConfig,
+    MixingConfig,
+    PixelCodecConfig,
+    RAEConfig,
+    load_config,
+)
 from .model import DDT, DDTOutput, DiTwDDTHeadIG, classifier_free_labels
 
 __all__ = [
@@ -9,7 +16,8 @@ __all__ = [
     "DDTOutput",
     "DiTwDDTHeadIG",
     "ExperimentConfig",
-    "ExplorationConfig",
+    "MixingConfig",
+    "PixelCodecConfig",
     "RAEConfig",
     "classifier_free_labels",
     "load_config",

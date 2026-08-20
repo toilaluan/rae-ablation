@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 13
+CONFIG_SCHEMA_VERSION = 14
 IMAGE_SIZE = 256
 RAE_CHANNELS = 1024
 RAE_INPUT_SIZE = 8
@@ -24,18 +24,6 @@ def _positive(name: str, *values: int | float) -> None:
 
 
 @dataclass
-class ExplorationConfig:
-    k_early: int = 1
-    k_full: int = 1
-    early_candidate_chunk_size: int | None = None
-    full_candidate_chunk_size: int | None = None
-
-    @property
-    def k_total(self) -> int:
-        return self.k_early * self.k_full
-
-
-@dataclass
 class DDTConfig:
     input_size: int = RAE_INPUT_SIZE
     patch_size: list[int] = field(default_factory=lambda: [1, 1])
@@ -48,6 +36,7 @@ class DDTConfig:
     num_classes: int = 1000
     cfg_dropout_prob: float = 0.1
     num_timestep_tokens: int = 4
+    num_ratio_tokens: int = 4
     num_class_tokens: int = 8
     gradient_checkpointing: bool = False
     variant: str = "DDT-B/1-RAEv2-8x8"
@@ -81,6 +70,7 @@ class DDTConfig:
             self.base_model_depth,
             self.num_classes,
             self.num_timestep_tokens,
+            self.num_ratio_tokens,
             self.num_class_tokens,
         )
         if self.input_size % self.patch_size[0] or self.input_size % self.patch_size[1]:
@@ -165,6 +155,95 @@ class RAEConfig:
 
 
 @dataclass
+class PixelCodecConfig:
+    checkpoint: str = "artifacts/pixel-codec/best"
+    widths: list[int] = field(default_factory=lambda: [32, 64, 128, 256, 384, 384])
+    latent_channels: int = RAE_CHANNELS
+    latent_size: int = RAE_INPUT_SIZE
+    residual_blocks_per_scale: int = 1
+    lpips_weight: float = 1.0
+    cosine_margin: float = 0.5
+    distance_margin: float = 0.25
+    alignment_gradient_ratio: float = 0.1
+
+    def validate(self) -> None:
+        if not self.checkpoint:
+            raise ValueError("pixel_codec.checkpoint cannot be empty")
+        if len(self.widths) != 6:
+            raise ValueError("pixel_codec.widths must contain six resolutions")
+        _positive(
+            "pixel codec dimensions",
+            *self.widths,
+            self.latent_channels,
+            self.latent_size,
+            self.residual_blocks_per_scale,
+            self.lpips_weight,
+            self.alignment_gradient_ratio,
+        )
+        if self.latent_channels != RAE_CHANNELS or self.latent_size != RAE_INPUT_SIZE:
+            raise ValueError("pixel codec must produce 1024x8x8 tokens")
+        if any(width % 32 for width in self.widths):
+            raise ValueError("pixel codec widths must be divisible by 32")
+        for name, value in (
+            ("cosine_margin", self.cosine_margin),
+            ("distance_margin", self.distance_margin),
+        ):
+            if not 0 <= value < 1:
+                raise ValueError(f"pixel_codec.{name} must be in [0, 1)")
+
+
+@dataclass
+class CodecTrainConfig:
+    epochs: int = 50
+    global_batch_size: int = 256
+    max_steps: int | None = None
+    lr: float = 1e-4
+    min_lr: float = 1e-5
+    warmup_epochs: int = 5
+    beta1: float = 0.9
+    beta2: float = 0.95
+    weight_decay: float = 0.0
+    grad_clip: float = 1.0
+    validation_interval: int = 5
+    checkpoint_interval: int = 5
+
+
+@dataclass
+class MixingConfig:
+    distribution: str = "logit_normal"
+    loc: float = 0.0
+    scale: float = 1.0
+    rae_endpoint_probability: float = 0.1
+    pixel_endpoint_probability: float = 0.1
+    fixed_ratio: float | None = None
+    normalization: str = "endpoint_channelwise"
+
+    @property
+    def continuous_probability(self) -> float:
+        if self.fixed_ratio is not None:
+            return 0.0
+        return 1 - self.rae_endpoint_probability - self.pixel_endpoint_probability
+
+    def validate(self) -> None:
+        if self.distribution != "logit_normal":
+            raise ValueError("mixing.distribution must be logit_normal")
+        if not math.isfinite(self.loc) or not math.isfinite(self.scale) or self.scale <= 0:
+            raise ValueError("mixing logit-normal parameters must be finite with positive scale")
+        for name, value in (
+            ("rae_endpoint_probability", self.rae_endpoint_probability),
+            ("pixel_endpoint_probability", self.pixel_endpoint_probability),
+        ):
+            if not 0 <= value <= 1:
+                raise ValueError(f"mixing.{name} must be in [0, 1]")
+        if self.rae_endpoint_probability + self.pixel_endpoint_probability > 1:
+            raise ValueError("mixing endpoint probabilities cannot sum above one")
+        if self.fixed_ratio is not None and not 0 <= self.fixed_ratio <= 1:
+            raise ValueError("mixing.fixed_ratio must be in [0, 1]")
+        if self.normalization != "endpoint_channelwise":
+            raise ValueError("mixing.normalization must be endpoint_channelwise")
+
+
+@dataclass
 class OptimizerConfig:
     kind: str = "muon"
     lr: float = 2e-4
@@ -182,20 +261,11 @@ class TrainConfig:
     grad_clip: float = 1.0
     ema_decay: float = 0.9995
     seed: int = 0
-    timestep_loc: float = 0.0
-    timestep_scale: float = 1.0
-    timestep_shift: float = 4.0
+    timestep_loc: float = 0.8
+    timestep_scale: float = 0.8
     velocity_denominator_floor: float = 0.05
     base_loss_weight: float = 1.0
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
-
-
-@dataclass
-class PriorConfig:
-    """Optional frozen checkpoint used to transform Gaussian flow sources."""
-
-    checkpoint_dir: str | None = None
-    weight_source: str = "ema"
 
 
 @dataclass
@@ -204,7 +274,6 @@ class SamplingConfig:
     batch_size: int = 32
     sampling_steps: int = 50
     solver: str = "euler"
-    timestep_shift: float = 4.0
     ig_scale: float = 1.78
     ig_start: float = 0.1
     ig_end: float = 1.0
@@ -243,7 +312,7 @@ class CheckpointConfig:
 class WandbConfig:
     enabled: bool = False
     entity: str | None = None
-    project: str = "rae-ddt-k-exploration"
+    project: str = "rae-pixel-token-mixing"
     name: str | None = None
     group: str | None = None
     tags: list[str] = field(default_factory=list)
@@ -256,11 +325,12 @@ class ExperimentConfig:
     schema_version: int = CONFIG_SCHEMA_VERSION
     data: DataConfig = field(default_factory=DataConfig)
     rae: RAEConfig = field(default_factory=RAEConfig)
+    pixel_codec: PixelCodecConfig = field(default_factory=PixelCodecConfig)
+    codec_train: CodecTrainConfig = field(default_factory=CodecTrainConfig)
     model: DDTConfig = field(default_factory=DDTConfig)
-    exploration: ExplorationConfig = field(default_factory=ExplorationConfig)
+    mixing: MixingConfig = field(default_factory=MixingConfig)
     compile: CompileConfig = field(default_factory=CompileConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
-    prior: PriorConfig = field(default_factory=PriorConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
@@ -275,33 +345,12 @@ class ExperimentConfig:
             )
         self.model.validate()
         self.rae.validate()
+        self.pixel_codec.validate()
+        self.mixing.validate()
         if self.model.input_shape != (RAE_CHANNELS, RAE_INPUT_SIZE, RAE_INPUT_SIZE):
-            raise ValueError("schema-v13 experiments must consume 1024x8x8 RAE tokens")
+            raise ValueError("schema-v14 experiments must consume 1024x8x8 mixed tokens")
         if self.model.patch_size != [1, 1]:
-            raise ValueError("schema-v13 experiments require model.patch_size [1, 1]")
-        explore = self.exploration
-        for name, value in (("k_early", explore.k_early), ("k_full", explore.k_full)):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                raise ValueError(f"exploration.{name} must be a positive integer")
-        for name, chunk, candidates, active in (
-            ("early_candidate_chunk_size", explore.early_candidate_chunk_size, explore.k_total, explore.k_early > 1),
-            ("full_candidate_chunk_size", explore.full_candidate_chunk_size, explore.k_full, explore.k_full > 1),
-        ):
-            if chunk is None:
-                continue
-            if not active:
-                raise ValueError(f"exploration.{name} requires its selection stage")
-            if not isinstance(chunk, int) or isinstance(chunk, bool) or chunk < 1:
-                raise ValueError(f"exploration.{name} must be a positive integer")
-            if chunk > candidates or candidates % chunk:
-                raise ValueError(f"exploration.{name} must divide its stage candidate count")
-        if self.prior.weight_source not in {"model", "ema"}:
-            raise ValueError("prior.weight_source must be model or ema")
-        if self.prior.checkpoint_dir is not None:
-            if not self.prior.checkpoint_dir:
-                raise ValueError("prior.checkpoint_dir cannot be empty")
-            if explore.k_total != 1:
-                raise ValueError("checkpoint prior experiments require exploration K=1")
+            raise ValueError("schema-v14 experiments require model.patch_size [1, 1]")
         if self.train.optimizer.kind not in {"adamw", "muon", "fused_muon"}:
             raise ValueError("optimizer.kind must be adamw, muon, or fused_muon")
         if self.wandb.mode not in {"online", "offline", "disabled"}:
@@ -322,11 +371,35 @@ class ExperimentConfig:
         _positive(
             "training flow settings",
             self.train.timestep_scale,
-            self.train.timestep_shift,
             self.train.velocity_denominator_floor,
         )
+        codec_train = self.codec_train
+        _positive(
+            "codec training settings",
+            codec_train.epochs,
+            codec_train.global_batch_size,
+            codec_train.lr,
+            codec_train.min_lr,
+            codec_train.grad_clip,
+        )
+        if codec_train.max_steps is not None and codec_train.max_steps < 1:
+            raise ValueError("codec_train.max_steps must be positive")
+        if not 0 <= codec_train.warmup_epochs < codec_train.epochs:
+            raise ValueError("codec_train.warmup_epochs must be within training")
+        if codec_train.min_lr > codec_train.lr:
+            raise ValueError("codec_train.min_lr cannot exceed codec_train.lr")
+        if (
+            codec_train.weight_decay < 0
+            or not 0 <= codec_train.beta1 < 1
+            or not 0 <= codec_train.beta2 < 1
+        ):
+            raise ValueError("codec optimizer decay and beta settings are invalid")
+        if codec_train.validation_interval < 1 or codec_train.checkpoint_interval < 1:
+            raise ValueError("codec validation/checkpoint intervals must be positive")
         if self.train.base_loss_weight < 0:
             raise ValueError("train.base_loss_weight cannot be negative")
+        if self.train.optimizer.min_lr > self.train.optimizer.lr:
+            raise ValueError("train.optimizer.min_lr cannot exceed optimizer.lr")
         for name, value in (("validation.interval", self.validation.interval), ("checkpoint.interval", self.checkpoint.interval)):
             if value < 0:
                 raise ValueError(f"{name} cannot be negative")
@@ -345,11 +418,9 @@ class ExperimentConfig:
             raise ValueError("sampling.solver must be euler or heun")
         if s.num_samples % self.model.num_classes:
             raise ValueError("sampling.num_samples must be class balanced")
-        for name, value in (("timestep_shift", s.timestep_shift), ("ig_scale", s.ig_scale), ("cfg_scale", s.cfg_scale)):
+        for name, value in (("ig_scale", s.ig_scale), ("cfg_scale", s.cfg_scale)):
             if not math.isfinite(value):
                 raise ValueError(f"sampling.{name} must be finite")
-        if s.timestep_shift <= 0:
-            raise ValueError("sampling.timestep_shift must be positive")
         if not 0 <= s.ig_start < s.ig_end <= 1:
             raise ValueError("sampling IG interval must satisfy 0 <= start < end <= 1")
         if not 0 <= s.cfg_start < s.cfg_end <= 1:

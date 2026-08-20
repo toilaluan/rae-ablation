@@ -10,11 +10,11 @@ from jit_reg.checkpoint import EMA, CheckpointManager
 from jit_reg.config import load_config
 from jit_reg.data import data_fingerprint, load_imagenet, preprocessing_metadata
 from jit_reg.distributed import initialize_distributed
-from jit_reg.flops import ddt_base_forward_flops, model_flops_per_step
+from jit_reg.flops import model_flops_per_step, total_training_flops_per_step
 from jit_reg.model import DDT
 from jit_reg.model.compile import compile_model_regions
 from jit_reg.optim import build_optimizer
-from jit_reg.prior import load_checkpoint_prior, prior_provenance
+from jit_reg.pixel_codec import load_pixel_codec_artifact
 from jit_reg.rng import RNGStreams
 from jit_reg.sample_runtime import SamplingParameters
 from jit_reg.token_cache import TokenCache
@@ -27,8 +27,8 @@ torch._dynamo.config.cache_size_limit = 1000
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train DDT exclusively on cached RAEv2 tokens")
-    parser.add_argument("--config", type=Path, default=Path("configs/ddt-baseline.yaml"))
+    parser = argparse.ArgumentParser(description="Train DDT on mixed pixel and RAE tokens")
+    parser.add_argument("--config", type=Path, default=Path("configs/ddt-token-mix.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", type=Path)
@@ -42,7 +42,6 @@ def _sampling_parameters(config: object) -> SamplingParameters:
         batch_size=s.batch_size,
         sampling_steps=s.sampling_steps,
         solver=s.solver,
-        timestep_shift=s.timestep_shift,
         ig_scale=s.ig_scale,
         ig_start=s.ig_start,
         ig_end=s.ig_end,
@@ -71,15 +70,21 @@ def main() -> None:
         torch.manual_seed(streams.initialization.initial_seed())
         model = DDT(config.model).to(device)
 
-    # Label/index-only dataset: this path cannot decode RGB and never loads RAE weights.
-    dataset = load_imagenet(config.data, 256, load_pixels=False)
+    dataset = load_imagenet(config.data, 256, load_pixels=True)
     token_cache = TokenCache(config, len(dataset))
-    prior = load_checkpoint_prior(
-        config,
-        device,
-        token_cache_fingerprint=token_cache.fingerprint,
+    codec_path = (
+        args.resume.resolve() / "pixel-codec"
+        if args.resume is not None
+        else Path(config.pixel_codec.checkpoint)
+    )
+    pixel_codec = load_pixel_codec_artifact(
+        codec_path, device, expected_config=config.pixel_codec
     )
     fingerprint = data_fingerprint(config.data, 256)
+    if pixel_codec.metadata.get("token_cache_fingerprint") != token_cache.fingerprint:
+        raise ValueError("pixel codec was fitted against a different RAE token cache")
+    if pixel_codec.metadata.get("data_fingerprint") != fingerprint:
+        raise ValueError("pixel codec was fitted against different image preprocessing")
     plan_path = Path(config.validation.plan_path)
     if rank == 0 and not plan_path.exists():
         create_validation_plan(
@@ -105,7 +110,7 @@ def main() -> None:
             fingerprint,
             plan.plan_hash,
             token_cache.fingerprint,
-            expected_prior_provenance=prior_provenance(prior),
+            pixel_codec.weights_sha256,
         )
         optimizer.load_state_dict(resumed.optimizer)
         streams.load_state_dict(resumed.rng_streams)
@@ -124,6 +129,7 @@ def main() -> None:
         "data_fingerprint": fingerprint,
         "validation_plan_hash": plan.plan_hash,
         "token_cache_fingerprint": token_cache.fingerprint,
+        "pixel_codec_sha256": pixel_codec.weights_sha256,
         "rae": {
             "base_repository": config.rae.base_repository,
             "base_revision": config.rae.base_revision,
@@ -132,7 +138,7 @@ def main() -> None:
             "remote_code_schema": config.rae.remote_code_schema,
         },
         "diffusion_input_shape": list(config.model.input_shape),
-        "prior": prior_provenance(prior),
+        "mixing": config.mixing.__dict__,
     }
     logged_config["model_parameters"] = {
         "total": sum(parameter.numel() for parameter in model.parameters()),
@@ -141,8 +147,8 @@ def main() -> None:
     logger = RunLogger(config.wandb, logged_config, rank == 0, resume_run_id, args.log_interval)
     logger.event(
         f"training initialized: variant={config.model.model_variant}, input_shape={config.model.input_shape}, "
-        f"K={config.exploration.k_total} ({config.exploration.k_early}x{config.exploration.k_full}), "
-        f"prior={'gaussian' if prior is None else prior.provenance.weight_source + ':' + prior.provenance.checkpoint_dir}, "
+        f"ratio={'fixed:' + str(config.mixing.fixed_ratio) if config.mixing.fixed_ratio is not None else 'logit-normal+endpoints'}, "
+        f"pixel_codec={pixel_codec.weights_sha256[:12]}, "
         f"parameters={logged_config['model_parameters']['total']:,}"
     )
     output_root = Path(config.checkpoint.directory).parent / "validation"
@@ -157,12 +163,13 @@ def main() -> None:
             output_root=output_root,
             sampling=sampling_parameters,
             token_cache=token_cache,
-            prior=prior,
+            pixel_codec=pixel_codec,
         )
         per_step = model_flops_per_step(config)
-        if prior is not None:
-            per_step += config.train.global_batch_size * ddt_base_forward_flops(config)
         metrics["compute/cumulative_model_flops"] = float(state.global_step * per_step)
+        metrics["compute/cumulative_total_flops"] = float(
+            state.global_step * total_training_flops_per_step(config)
+        )
         return metrics
 
     try:
@@ -185,7 +192,7 @@ def main() -> None:
             validation_plan_path=plan_path,
             logger=logger,
             token_cache=token_cache,
-            prior=prior,
+            pixel_codec=pixel_codec,
             state=state,
             validation_callback=validate_callback,
         )

@@ -1,0 +1,31 @@
+schema_version: 14
+
+pixel_codec:
+  checkpoint: artifacts/pixel-codec/best
+  widths: [32, 64, 128, 256, 384, 384]
+  latent_channels: 1024
+  latent_size: 8
+  residual_blocks_per_scale: 1
+  lpips_weight: 1.0
+  cosine_margin: 0.5
+  distance_margin: 0.25
+  alignment_gradient_ratio: 0.1
+
+codec_train:
+  epochs: 50
+  global_batch_size: 256
+  max_steps: null
+  lr: 1.0e-4
+  min_lr: 1.0e-5
+  warmup_epochs: 5
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.0
+  grad_clip: 1.0
+  validation_interval: 5
+  checkpoint_interval: 5
+
+wandb:
+  project: rae-pixel-token-mixing
+  name: pixel-codec
+

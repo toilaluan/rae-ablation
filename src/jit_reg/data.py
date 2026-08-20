@@ -43,8 +43,10 @@ def preprocessing_metadata(config: DataConfig, image_size: int) -> dict[str, Any
             "PIL.convert(RGB)",
             f"PIL.resize({image_size}x{image_size}, bicubic) when needed",
             "uint8_to_float32_[0,1]",
-            "frozen_raev2_compressor_encode",
-            "per_channel_population_normalization",
+            "frozen_pixel_codec_encode_online",
+            "cached_raev2_compressor_lookup",
+            "independent_per_channel_population_normalization",
+            "per_example_pixel_rae_interpolation",
         ],
     }
 

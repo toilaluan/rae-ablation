@@ -24,7 +24,7 @@ from jit_reg.token_cache import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Cache raw BF16 RAEv2 compressor tokens")
-    parser.add_argument("--config", type=Path, default=Path("configs/ddt-baseline.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/ddt-token-mix.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     return parser
 

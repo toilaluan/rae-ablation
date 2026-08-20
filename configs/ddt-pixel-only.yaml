@@ -1,0 +1,22 @@
+schema_version: 14
+
+pixel_codec:
+  checkpoint: artifacts/pixel-codec/best
+
+mixing:
+  distribution: logit_normal
+  loc: 0.0
+  scale: 1.0
+  rae_endpoint_probability: 0.0
+  pixel_endpoint_probability: 0.0
+  fixed_ratio: 1.0
+  normalization: endpoint_channelwise
+
+train:
+  timestep_loc: 0.8
+  timestep_scale: 0.8
+
+wandb:
+  project: rae-pixel-token-mixing
+  name: ddt-pixel-only
+

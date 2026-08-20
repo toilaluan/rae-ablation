@@ -16,6 +16,7 @@ class CheckpointBundle:
     weights: Path
     plan: ValidationPlan
     validation_plan_hash: str
+    pixel_codec: Path
 
 
 def resolve_checkpoint_directory(path: str | Path) -> Path:
@@ -34,7 +35,7 @@ def _expected_plan_hash(directory: Path) -> str:
     metadata_path = directory / "metadata.json"
     if not metadata_path.is_file():
         raise ValueError(
-            "checkpoint predates schema v13; old checkpoints are not supported"
+            "checkpoint predates schema v14; old checkpoints are not supported"
         )
     metadata = json.loads(metadata_path.read_text())
     if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
@@ -107,4 +108,7 @@ def load_checkpoint_bundle(path: str | Path) -> CheckpointBundle:
         weights = directory / "ema-export.safetensors"
     if not weights.is_file():
         raise FileNotFoundError(f"checkpoint EMA weights are missing: {directory}")
-    return CheckpointBundle(directory, config, weights, plan, expected_hash)
+    pixel_codec = directory / "pixel-codec"
+    if not (pixel_codec / "model.safetensors").is_file():
+        raise FileNotFoundError(f"checkpoint pixel codec is missing: {pixel_codec}")
+    return CheckpointBundle(directory, config, weights, plan, expected_hash, pixel_codec)

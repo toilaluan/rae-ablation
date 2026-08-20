@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,9 +12,10 @@ from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
 
 from .model.compile import clean_state_dict
+from .pixel_codec import PixelCodecArtifact
 
-CHECKPOINT_SCHEMA_VERSION = 13
-TRAINING_STATE_SCHEMA_VERSION = 13
+CHECKPOINT_SCHEMA_VERSION = 14
+TRAINING_STATE_SCHEMA_VERSION = 14
 
 
 def _contiguous(state: dict[str, object]) -> dict[str, Tensor]:
@@ -38,6 +38,7 @@ class ResumeState:
     optimizer: dict[str, Any]
     rng_streams: dict[str, Tensor]
     token_cache_fingerprint: str
+    pixel_codec_sha256: str
 
 
 def should_checkpoint(completed_epoch: int, total_epochs: int, interval: int) -> bool:
@@ -93,11 +94,11 @@ class CheckpointManager:
         wandb_run_id: str | None,
         resolved_config: dict[str, Any],
         token_cache_fingerprint: str,
-        prior_provenance: Mapping[str, str] | None = None,
+        pixel_codec: PixelCodecArtifact,
         fid: float | None = None,
     ) -> Path:
         if not token_cache_fingerprint:
-            raise ValueError("schema-v13 checkpoints require token-cache provenance")
+            raise ValueError("schema-v14 checkpoints require token-cache provenance")
         name = f"epoch-{completed_epoch:04d}"
         target = self.directory / name
         if target.exists():
@@ -118,6 +119,7 @@ class CheckpointManager:
             "optimizer": optimizer_state,
             "rng_streams": rng_streams,
             "token_cache_fingerprint": token_cache_fingerprint,
+            "pixel_codec_sha256": pixel_codec.weights_sha256,
         }
         torch.save(training, temporary / "training.pt")
         (temporary / "config.json").write_text(
@@ -130,6 +132,7 @@ class CheckpointManager:
         if plan_state.get("plan_hash") != validation_plan_hash:
             raise ValueError("validation plan file and hash do not match")
         shutil.copy2(plan_path, temporary / "validation-plan.pt")
+        shutil.copytree(pixel_codec.directory, temporary / "pixel-codec")
         (temporary / "metadata.json").write_text(
             json.dumps(
                 {
@@ -139,7 +142,7 @@ class CheckpointManager:
                     "data_fingerprint": data_fingerprint,
                     "validation_plan_hash": validation_plan_hash,
                     "token_cache_fingerprint": token_cache_fingerprint,
-                    "prior": dict(prior_provenance) if prior_provenance is not None else None,
+                    "pixel_codec_sha256": pixel_codec.weights_sha256,
                 },
                 indent=2,
                 sort_keys=True,
@@ -205,7 +208,7 @@ class CheckpointManager:
         expected_data_fingerprint: str | None = None,
         expected_validation_plan_hash: str | None = None,
         expected_token_cache_fingerprint: str | None = None,
-        expected_prior_provenance: Mapping[str, str] | None = None,
+        expected_pixel_codec_sha256: str | None = None,
     ) -> ResumeState:
         path = Path(checkpoint)
         if not path.is_absolute():
@@ -213,7 +216,7 @@ class CheckpointManager:
         metadata_path = path / "metadata.json"
         if not metadata_path.is_file():
             raise ValueError(
-                "checkpoint predates schema v13; old checkpoints are not supported"
+                "checkpoint predates schema v14; old checkpoints are not supported"
             )
         metadata = json.loads(metadata_path.read_text())
         if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
@@ -249,9 +252,15 @@ class CheckpointManager:
             or saved_token_fingerprint is not None
         ):
             raise ValueError("checkpoint token-cache fingerprint mismatch")
-        from .prior import validate_prior_provenance
-
-        validate_prior_provenance(expected_prior_provenance, metadata.get("prior"))
+        saved_codec_digest = state.get("pixel_codec_sha256")
+        if (
+            not isinstance(saved_codec_digest, str)
+            or metadata.get("pixel_codec_sha256") != saved_codec_digest
+            or not (path / "pixel-codec" / "model.safetensors").is_file()
+        ):
+            raise ValueError("checkpoint pixel-codec provenance is inconsistent")
+        if expected_pixel_codec_sha256 is not None and expected_pixel_codec_sha256 != saved_codec_digest:
+            raise ValueError("checkpoint pixel-codec digest mismatch")
         return ResumeState(**state)
 
     def export_ema(self, ema: EMA, path: str | Path) -> None:

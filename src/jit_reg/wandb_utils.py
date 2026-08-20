@@ -51,18 +51,14 @@ class RunLogger:
         self.log(metrics, step=step)
         if not self.is_main_process or step % self.log_interval:
             return
-        selection_gain = metrics.get(
-            "exploration/full/score_improvement",
-            metrics.get("exploration/early/score_improvement", 0.0),
-        )
         self.event(
             "train: "
             f"step={step} epoch={metrics['train/epoch']:.3f} "
             f"loss={metrics['train/loss']:.6f} "
             f"full={metrics['train/full_velocity_loss']:.6f} "
             f"base={metrics['train/base_velocity_loss']:.6f} "
-            f"K={metrics['exploration/k_total']} "
-            f"selection_gain={selection_gain:.6f} "
+            f"r_mean={metrics['mixing/ratio_mean']:.4f} "
+            f"x0_std={metrics['mixing/x0_std']:.4f} "
             f"lr={metrics['train/lr']:.3e} "
             f"grad_norm={metrics['train/gradient_norm']:.4f} "
             f"throughput={metrics['throughput/images_per_second']:.2f} images/s "

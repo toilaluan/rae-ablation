@@ -12,8 +12,7 @@ from .distributed import broadcast_string
 from .evaluation import evaluate_npz, save_evaluation
 from .model import DDT
 from .model.compile import compile_model_regions
-from .prior import CheckpointPrior, prior_provenance, source_from_gaussian
-from .rae import load_rae_codec
+from .pixel_codec import PixelCodecArtifact
 from .rng import preserving_global_rng
 from .sample_runtime import (
     FEATURE_SCHEMA_VERSION,
@@ -45,7 +44,7 @@ def validate_ema(
     output_root: str | Path,
     sampling: SamplingParameters | Sequence[SamplingParameters],
     token_cache: TokenCache,
-    prior: CheckpointPrior | None = None,
+    pixel_codec: PixelCodecArtifact,
 ) -> tuple[dict[str, float], Path]:
     rank, _world_size = _distributed()
     device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
@@ -65,14 +64,15 @@ def validate_ema(
     digest = broadcast_string(digest, rank)
     feature_schema = {
         "schema_version": FEATURE_SCHEMA_VERSION,
-        "input_space": "normalized-raev2-compressor-tokens",
+        "input_space": "normalized-pixel-codec-tokens",
         "input_shape": list(config.model.input_shape),
-        "conditioning": "four-timestep-plus-eight-class-tokens",
+        "conditioning": "four-timestep-plus-four-ratio-plus-eight-class-tokens",
         "prediction": "clean-x-full-and-base",
         "token_cache_fingerprint": token_cache.fingerprint,
-        "prior": prior_provenance(prior),
+        "pixel_codec_sha256": pixel_codec.weights_sha256,
+        "mix_ratio": 1.0,
     }
-    codec = load_rae_codec(config.rae, device)
+    codec = pixel_codec.model
     model = DDT(config.model).to(device)
     model.load_state_dict(ema.state_dict())
     model.eval()
@@ -88,13 +88,12 @@ def validate_ema(
             device,
             dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
         )
-        source = source_from_gaussian(prior, noise, labels.to(device))
         generated = ode_sample(
             execution_model,
-            source,
+            noise,
             labels.to(device),
             steps=parameters.sampling_steps,
-            timestep_shift=parameters.timestep_shift,
+            mix_ratio=1.0,
             ig_scale=parameters.ig_scale,
             ig_interval=(parameters.ig_start, parameters.ig_end),
             cfg_scale=parameters.cfg_scale,
@@ -103,7 +102,8 @@ def validate_ema(
             num_classes=config.model.num_classes,
             velocity_denominator_floor=config.train.velocity_denominator_floor,
         )
-        return codec.decode(token_cache.denormalize(generated)).clamp(0, 1)
+        raw_pixel_tokens = pixel_codec.statistics.denormalize(generated)
+        return codec.decode(raw_pixel_tokens).clamp(0, 1)
 
     started = time.perf_counter()
     archive = sample_to_archive(

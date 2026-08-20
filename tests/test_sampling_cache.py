@@ -28,8 +28,15 @@ class GuidanceModel(nn.Module):
         super().__init__()
         self.config = SimpleNamespace(num_classes=2)
 
-    def forward(self, noisy: torch.Tensor, timestep: torch.Tensor, labels: torch.Tensor) -> DDTOutput:
+    def forward(
+        self,
+        noisy: torch.Tensor,
+        timestep: torch.Tensor,
+        ratio: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> DDTOutput:
         del timestep
+        assert torch.equal(ratio, torch.ones_like(ratio))
         shape = (labels.shape[0], *((1,) * (noisy.ndim - 1)))
         conditional = labels.reshape(shape).to(noisy.dtype)
         full = torch.ones_like(noisy) * (2 + conditional)
@@ -40,14 +47,13 @@ class GuidanceModel(nn.Module):
 def test_pure_internal_guidance_and_combined_cfg() -> None:
     model = GuidanceModel()
     noise = torch.zeros(1, 1, 1, 1)
-    pure = ode_sample(model, noise, torch.tensor([1]), steps=1, timestep_shift=1, ig_scale=2, num_classes=2)
+    pure = ode_sample(model, noise, torch.tensor([1]), steps=1, ig_scale=2, num_classes=2)
     assert pure.item() == pytest.approx(5.0)
     combined = ode_sample(
         model,
         noise,
         torch.tensor([1]),
         steps=1,
-        timestep_shift=1,
         ig_scale=2,
         cfg_scale=2,
         num_classes=2,
@@ -59,7 +65,6 @@ def test_pure_internal_guidance_and_combined_cfg() -> None:
         noise,
         torch.tensor([1]),
         steps=1,
-        timestep_shift=1,
         ig_scale=99,
         ig_interval=(0.1, 0.9),
         num_classes=2,

@@ -25,7 +25,6 @@ class SamplingParameters:
     batch_size: int = 32
     sampling_steps: int = 50
     solver: str = "euler"
-    timestep_shift: float = 4.0
     ig_scale: float = 1.78
     ig_start: float = 0.1
     ig_end: float = 1.0
@@ -47,8 +46,6 @@ class SamplingParameters:
             raise ValueError("sampling batch size, steps, and log interval must be positive")
         if self.solver not in {"euler", "heun"}:
             raise ValueError("sampling solver must be euler or heun")
-        if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
-            raise ValueError("timestep shift must be finite and positive")
         if not math.isfinite(self.ig_scale) or not math.isfinite(self.cfg_scale):
             raise ValueError("guidance scales must be finite")
         if not 0 <= self.ig_start < self.ig_end <= 1:
@@ -58,8 +55,8 @@ class SamplingParameters:
 
 
 GenerateBatch = Callable[[Tensor, Tensor, Tensor], Tensor]
-SAMPLING_MANIFEST_SCHEMA_VERSION = 17
-FEATURE_SCHEMA_VERSION = 13
+SAMPLING_MANIFEST_SCHEMA_VERSION = 18
+FEATURE_SCHEMA_VERSION = 14
 
 
 def _float_slug(value: float) -> str:
@@ -74,7 +71,6 @@ def sampling_output_name(sample_count: int, parameters: SamplingParameters) -> s
         f"samples-{parameters.solver}-n{sample_count}-steps{parameters.sampling_steps}"
         f"-ig{_float_slug(parameters.ig_scale)}"
         f"-cfg{_float_slug(parameters.cfg_scale)}"
-        f"-shift{_float_slug(parameters.timestep_shift)}"
         f"-igwindow{_float_slug(parameters.ig_start)}-{_float_slug(parameters.ig_end)}"
         f"-cfgwindow{_float_slug(parameters.cfg_start)}-{_float_slug(parameters.cfg_end)}"
     )
@@ -191,7 +187,6 @@ def _manifest_base(
             "ig_scale": parameters.ig_scale,
             "ig_interval": [parameters.ig_start, parameters.ig_end],
             "cfg_scale": parameters.cfg_scale,
-            "timestep_shift": parameters.timestep_shift,
             "cfg_interval": [parameters.cfg_start, parameters.cfg_end],
         },
     }
@@ -402,7 +397,6 @@ def sample_to_archive(
             f"batch_size={parameters.batch_size} solver={parameters.solver} "
             f"steps={parameters.sampling_steps} nfe={parameters.sampling_nfe} "
             f"ig={parameters.ig_scale:g} cfg={parameters.cfg_scale:g} "
-            f"timestep_shift={parameters.timestep_shift:g} "
             f"ig_interval=[{parameters.ig_start:g}, {parameters.ig_end:g}] "
             f"cfg_interval=[{parameters.cfg_start:g}, {parameters.cfg_end:g}]"
         )

@@ -7,7 +7,7 @@ from typing import Literal
 import torch
 from torch import Tensor, nn
 
-from .objective import shift_timestep, x_to_velocity
+from .objective import x_to_velocity
 
 Solver = Literal["euler", "heun"]
 
@@ -39,7 +39,7 @@ def ode_sample(
     labels: Tensor,
     *,
     steps: int = 50,
-    timestep_shift: float = 4.0,
+    mix_ratio: float = 1.0,
     ig_scale: float = 1.78,
     ig_interval: tuple[float, float] = (0.1, 1.0),
     cfg_scale: float = 1.0,
@@ -51,8 +51,8 @@ def ode_sample(
     """Integrate noise (t=1) to data (t=0), guiding x before velocity conversion."""
     if steps < 1 or solver not in {"euler", "heun"}:
         raise ValueError("sampling requires positive steps and euler or heun solver")
-    if not math.isfinite(timestep_shift) or timestep_shift <= 0:
-        raise ValueError("timestep shift must be finite and positive")
+    if not math.isfinite(mix_ratio) or not 0 <= mix_ratio <= 1:
+        raise ValueError("sampling mix ratio must be in [0, 1]")
     for name, scale in (("IG", ig_scale), ("CFG", cfg_scale)):
         if not math.isfinite(scale):
             raise ValueError(f"{name} scale must be finite")
@@ -67,9 +67,7 @@ def ode_sample(
         raise ValueError("num_classes is required")
 
     state = noise.float()
-    schedule = shift_timestep(
-        torch.linspace(1, 0, steps + 1, device=noise.device), timestep_shift
-    )
+    schedule = torch.linspace(1, 0, steps + 1, device=noise.device)
     null_labels = torch.full_like(labels, num_classes)
 
     def predict_x(x: Tensor, timestep: Tensor) -> Tensor:
@@ -77,12 +75,14 @@ def ode_sample(
         if use_cfg:
             model_x = torch.cat((x, x)).to(noise.dtype)
             model_t = timestep.expand(2 * x.shape[0])
+            model_r = torch.full_like(model_t, mix_ratio)
             model_labels = torch.cat((labels, null_labels))
         else:
             model_x = x.to(noise.dtype)
             model_t = timestep.expand(x.shape[0])
+            model_r = torch.full_like(model_t, mix_ratio)
             model_labels = labels
-        output = model(model_x, model_t, model_labels)
+        output = model(model_x, model_t, model_r, model_labels)
         full, base = output.full_prediction.float(), output.base_prediction.float()
         if not use_cfg:
             return _guided_x(full, base, model_t, ig_scale, ig_interval)

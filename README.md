@@ -1,117 +1,98 @@
-# RAE-DDT with internal guidance and K-exploration
+# Pixel/RAE token-mixing DDT
 
-This repository implements one schema-v13 pipeline:
+This repository implements a schema-v14 ImageNet-256 experiment that keeps the
+fast-converging representation features of RAE tokens while generating through a
+lightweight pixel reconstruction path:
 
-`ImageNet-256 RGB → frozen RAEv2 compressor → normalized 1024×8×8 tokens → DDT`
+`RGB → pixel codec → normalized 1024×8×8 pixel tokens`
 
-Training never loads images or RAE weights. The cache builder is the only RGB/encode
-path; sampling is the only RAE/decode path. Schema-v12 configurations, checkpoints,
-and cache manifests are intentionally rejected without migration.
+`RGB → frozen RAEv2 encoder → normalized 1024×8×8 RAE tokens`
 
-## Architecture
+The two endpoints are normalized independently with exact train-set, per-channel
+statistics. Training then samples a ratio `r` and constructs
 
-The model follows upstream `DiTwDDTHeadIG`, adjusted to an 8×8 input grid. A 1×1
-projection produces width-768 spatial tokens. Twelve encoder blocks jointly process
-64 spatial, four timestep, and eight class tokens. The base x-prediction head exits
-after encoder block four. The full path projects to width 2048, applies two
-adaLN-conditioned decoder blocks, and predicts x with a separate head.
+`x₀ = r · pixel_tokens + (1 - r) · rae_tokens`
 
-Both heads train with flow matching:
+without renormalizing the mixture. The DDT receives `(xₜ, t, r, class)`, where
+`xₜ = (1 - t)x₀ + tε`. At generation and evaluation, `r=1`; the generated endpoint
+is denormalized with pixel-token statistics and decoded by the small pixel decoder.
 
-`x_t = (1 - t) clean + t noise`
+## Pixel codec
 
-X predictions are converted to velocity using `max(t, 0.05)`. The loss is
-`full_loss + train.base_loss_weight * base_loss`; the default base weight is 1.0.
-Timesteps are logit-normal and use the compact-token shift 4.
+The deterministic convolutional codec maps 256×256 RGB images to 1024×8×8 latents.
+Its reconstruction objective is L1 plus LPIPS. The encoder is also aligned to frozen,
+normalized RAE features using both corresponding-token cosine loss and the full
+64×64 within-image cosine-similarity matrix. The alignment coefficient is chosen
+each step so its gradient norm at the shared pixel-token bottleneck is 10% of the
+reconstruction gradient norm.
 
-## Pinned codec
-
-- Base: `toilaluan/raev2-dinov3l-k7@46ce5a7e76df99eb5528020d3c65cef528a355fa`
-- Compressor: `toilaluan/raev2-compressor@846e2213dcf6218d3b726448ae52d8104c925c0f`
-
-The base is loaded first and injected into the compressor with remote code enabled.
-CUDA uses BF16; CPU uses FP32.
-
-## Cache
-
-Build the resumable cache before training:
+Build the frozen RAE cache once, then train the codec:
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/cache_tokens.py \
-  --config configs/ddt-baseline.yaml
+  --config configs/pixel-codec.yaml
+
+uv run torchrun --standalone --nproc-per-node=8 scripts/train_pixel_codec.py \
+  --config configs/pixel-codec.yaml \
+  --output artifacts/pixel-codec
 ```
 
-Raw outputs are stored as BF16 with a byte-per-example completion bitmap. Once all
-values exist, ranks partition the memory map, accumulate per-channel sums and squared
-sums in FP64, all-reduce them, and save FP32 population mean/std. An interruption
-after encoding resumes at the statistics pass without loading the codec.
+The codec command selects the best validation-LPIPS checkpoint and writes the
+portable artifact at `artifacts/pixel-codec/best`. It contains frozen weights,
+pixel-token mean/std, per-channel normalized pixel/RAE correlation, data provenance,
+and the RAE-cache fingerprint. DDT checkpoints bundle that artifact so sampling does
+not depend on an external mutable codec path.
 
-For the pinned 1,281,167-example train split, `values.bf16` is 167,925,121,024 bytes
-(156.3925 GiB), the bitmap is about 1.22 MiB, and statistics are 8 KiB. Provision at
-least 170 GiB free. An uncompressed 1024×16×16 BF16 cache would be about 625.57 GiB.
+## Mixing experiment
 
-## Presets and training
+The main preset samples `r` from an endpoint-augmented logit-normal distribution:
 
-The four presets are:
+- 10% exact `r=0` (RAE endpoint)
+- 80% `sigmoid(N(0, 1))`
+- 10% exact `r=1` (pixel endpoint)
 
-| Preset | K early | K full |
-|---|---:|---:|
-| `configs/ddt-baseline.yaml` | 1 | 1 |
-| `configs/ddt-k-early.yaml` | 4 | 1 |
-| `configs/ddt-k-final.yaml` | 1 | 4 |
-| `configs/ddt-k-hybrid.yaml` | 4 | 2 |
+The pixel-only preset is the compute-matched control and fixes `r=1`. Both use the
+same model, optimizer, online RGB pixel encoding, cached RAE tokens, and flow
+timestep distribution `sigmoid(N(0.8, 0.8))`.
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/ddt-k-hybrid.yaml \
-  --output runs/ddt-k-hybrid
+  --config configs/ddt-token-mix.yaml \
+  --output runs/ddt-token-mix
+
+uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/ddt-pixel-only.yaml \
+  --output runs/ddt-pixel-only
 ```
 
-For K exploration, every early-stage candidate is scored with the base prefix under
-no-grad. The globally best `k_full` candidates are scored by the full path, and only
-the winning candidate receives the dual-head training forward/backward. Candidate
-chunking is configurable per stage and stable ties prefer the lower original index.
+The DDT predicts clean `x₀` with full and internal-guidance base heads; both are
+trained through velocity loss. Per-step logs include sampled-r statistics, both
+endpoint statistics, mixed-token statistics, endpoint cosine correlation, and the
+variance expected from the measured endpoint correlation.
 
-## Sampling
+## FID and visualizations
 
-Internal guidance is enabled by default:
-
-`guided = base + 1.78 * (full - base)` for `t ∈ [0.1, 1.0]`.
-
-CFG defaults to scale 1.0 (inactive). If explicitly enabled, IG is applied to each
-conditional branch first and CFG combines them afterward. Euler and Heun are
-available.
-
-### Checkpoint prior experiment
-
-By default the flow source is standard Gaussian noise. To use the base x0 prediction
-of a completed, normally trained checkpoint as the source, set its directory and
-choose either its raw training weights or EMA weights:
-
-```yaml
-prior:
-  checkpoint_dir: runs/ddt-baseline/checkpoints/epoch-0080
-  weight_source: ema  # model or ema
-```
-
-For each Gaussian draw, the frozen prior model runs `forward_base_prediction` at
-`t=1` with the true class label. Training and sampling use that prediction as the
-flow endpoint. Setting `checkpoint_dir: null` restores the Gaussian source exactly.
-Checkpoint-prior runs require K=1, and the prior checkpoint must use the same model,
-RAE, and token-cache provenance as the student. Student checkpoints record the
-selected prior weight digest and verify it on resume and sampling without copying
-the prior weights.
+Periodic and final validation always integrate with `r=1`, decode with the bundled
+pixel decoder, save image grids/archives, and compute FID against the configured
+ImageNet reference archive. Standalone sampling uses the same path:
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --checkpoint-dir runs/ddt-k-hybrid/checkpoints/last
+  --checkpoint-dir runs/ddt-token-mix/checkpoints/last \
+  --evaluate
 ```
 
-## Verification
+Internal guidance defaults to `base + 1.78 · (full - base)` for `t ∈ [0.1, 1]`.
+Euler and Heun solvers are supported; CFG is available but defaults to inactive.
+
+## Reproducibility and compatibility
+
+RAEv2 sources remain revision-pinned. The existing raw BF16 RAE cache format is
+unchanged and resumable; its exact FP64-accumulated normalization statistics are
+reused. Schema-v13 experiment configurations and checkpoints are intentionally
+rejected because K-exploration and the checkpoint-prior experiment were removed.
 
 ```bash
 uv run pytest -q
 uv run ruff check .
 ```
-
-Remote CUDA codec validation is opt-in through the integration test marker.

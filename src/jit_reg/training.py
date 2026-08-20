@@ -13,12 +13,18 @@ from torch.utils.data._utils.collate import default_collate
 
 from .checkpoint import EMA, CheckpointManager, should_checkpoint
 from .config import ExperimentConfig
-from .exploration import select_candidates
-from .flops import ddt_base_forward_flops, model_flops_per_step
+from .data import prepare_pixels
+from .flops import model_flops_per_step, pixel_encoder_flops_per_step
 from .model.tokens import classifier_free_labels
-from .objective import ddt_losses, noisy_interpolate, sample_timesteps
+from .objective import (
+    ddt_losses,
+    mix_endpoints,
+    noisy_interpolate,
+    sample_mix_ratios,
+    sample_timesteps,
+)
 from .optim import CompositeOptimizer, learning_rate_at_epoch, set_learning_rate
-from .prior import CheckpointPrior, prior_provenance, source_from_gaussian
+from .pixel_codec import PixelCodecArtifact
 from .rng import RNGStreams
 from .token_cache import TokenCache, normalize_tokens
 from .validation import should_validate
@@ -26,7 +32,8 @@ from .wandb_utils import RunLogger
 
 
 class TrainBatch(NamedTuple):
-    tokens: Tensor
+    pixels: Tensor
+    rae_tokens: Tensor
     labels: Tensor
     indices: Tensor
 
@@ -41,10 +48,12 @@ def prepare_train_batch(
 ) -> TrainBatch:
     if (mean is None) != (std is None):
         raise ValueError("mean and std must be supplied together")
-    tokens = batch.tokens.to(device, non_blocking=non_blocking)
+    pixels = prepare_pixels(batch.pixels, device, non_blocking=non_blocking)
+    tokens = batch.rae_tokens.to(device, non_blocking=non_blocking)
     if mean is not None and std is not None:
         tokens = normalize_tokens(tokens, mean, std)
     return TrainBatch(
+        pixels,
         tokens,
         batch.labels.to(device, dtype=torch.long, non_blocking=non_blocking),
         batch.indices.to(device, dtype=torch.long, non_blocking=non_blocking),
@@ -137,10 +146,13 @@ class _TrainBatchCollator:
         self.cache = cache
 
     def __call__(self, samples: list[Any]) -> TrainBatch:
-        _pixels, label_values, index_values = zip(*samples, strict=True)
+        pixel_values, label_values, index_values = zip(*samples, strict=True)
+        if any(value is None for value in pixel_values):
+            raise ValueError("mixed-token training requires RGB pixels")
+        pixels = default_collate(pixel_values)
         labels = default_collate(label_values)
         indices = default_collate(index_values)
-        return TrainBatch(self.cache.raw_lookup(indices), labels, indices)
+        return TrainBatch(pixels, self.cache.raw_lookup(indices), labels, indices)
 
 
 def distributed_info() -> tuple[int, int]:
@@ -219,7 +231,7 @@ def train(
     validation_plan_path: str | Path,
     logger: RunLogger,
     token_cache: TokenCache,
-    prior: CheckpointPrior | None = None,
+    pixel_codec: PixelCodecArtifact,
     state: TrainState | None = None,
     validation_callback: ValidationCallback | None = None,
 ) -> TrainState:
@@ -232,15 +244,14 @@ def train(
         raise ValueError("RAE-DDT training requires a complete token cache")
 
     base_step_flops = model_flops_per_step(config)
-    prior_step_flops = (
-        config.train.global_batch_size * ddt_base_forward_flops(config)
-        if prior is not None
-        else 0
-    )
-    step_flops = base_step_flops + prior_step_flops
+    pixel_encoder_step_flops = pixel_encoder_flops_per_step(config)
+    step_flops = base_step_flops + pixel_encoder_step_flops
     token_mean = token_cache.mean.to(device)
     token_std = token_cache.std.to(device)
-    prior_seed_sensitivity: float | None = None
+    pixel_mean = pixel_codec.statistics.mean.to(device)
+    pixel_std = pixel_codec.statistics.std.to(device)
+    codec_model = pixel_codec.model
+    codec_model.eval()
     optimizer.zero_grad()
     for epoch_index in range(state.epoch, config.train.epochs):
         logger.event(f"epoch {epoch_index + 1}/{config.train.epochs} started")
@@ -254,15 +265,32 @@ def train(
             # Include first-batch pipeline warmup in the first step. Later steps
             # start after the preceding iteration has finished logging.
             step_started = epoch_started if batch_index == 0 else time.perf_counter()
-            clean, labels, _indices = iterator.consume()
-            clean = clean.float()
+            pixels, rae_tokens, labels, _indices = iterator.consume()
+            rae_tokens = rae_tokens.float()
+            with torch.inference_mode(), torch.autocast(
+                device.type,
+                dtype=torch.bfloat16,
+                enabled=device.type == "cuda",
+            ):
+                raw_pixel_tokens = codec_model.encode(pixels)
+            pixel_tokens = normalize_tokens(raw_pixel_tokens, pixel_mean, pixel_std)
+            ratios = sample_mix_ratios(
+                rae_tokens.shape[0],
+                streams.mix_ratio,
+                device,
+                loc=config.mixing.loc,
+                scale=config.mixing.scale,
+                rae_endpoint_probability=config.mixing.rae_endpoint_probability,
+                pixel_endpoint_probability=config.mixing.pixel_endpoint_probability,
+                fixed_ratio=config.mixing.fixed_ratio,
+            )
+            clean = mix_endpoints(pixel_tokens, rae_tokens, ratios)
             timesteps = sample_timesteps(
                 clean.shape[0],
                 streams.timesteps,
                 device,
                 loc=config.train.timestep_loc,
                 scale=config.train.timestep_scale,
-                shift=config.train.timestep_shift,
             )
             model_labels = classifier_free_labels(
                 labels,
@@ -270,53 +298,11 @@ def train(
                 config.model.cfg_dropout_prob,
                 streams.label_dropout,
             )
-            exploration = config.exploration
-            k_total = exploration.k_total
-            diagnostics = None
-            gaussian_source: Tensor | None = None
-            if k_total == 1:
-                gaussian_source = torch.randn(
-                    clean.shape, device=device, dtype=torch.float32, generator=streams.noise
-                )
-                selected_noise = source_from_gaussian(prior, gaussian_source, labels)
-                if prior is not None and prior_seed_sensitivity is None:
-                    opposite = source_from_gaussian(prior, -gaussian_source, labels)
-                    prior_seed_sensitivity = (
-                        (selected_noise - opposite).square().mean().sqrt().item() / 2**0.5
-                    )
-                    if prior_seed_sensitivity < 0.05:
-                        logger.event(
-                            "warning: checkpoint prior seed sensitivity is below 0.05; "
-                            "the source distribution may be collapsed"
-                        )
-                selected_noisy = noisy_interpolate(clean, selected_noise, timesteps)
-                selected_indices = torch.zeros(clean.shape[0], device=device, dtype=torch.long)
-            else:
-                noise_candidates = torch.randn(
-                    (clean.shape[0], k_total, *clean.shape[1:]),
-                    device=device,
-                    dtype=torch.float32,
-                    generator=streams.noise,
-                )
-                t = timesteps.reshape(clean.shape[0], 1, 1, 1, 1)
-                noisy_candidates = (1 - t) * clean[:, None] + t * noise_candidates
-                diagnostics = select_candidates(
-                    execution_model,
-                    noisy_candidates,
-                    noise_candidates,
-                    clean,
-                    timesteps,
-                    model_labels,
-                    k_early=exploration.k_early,
-                    k_full=exploration.k_full,
-                    early_candidate_chunk_size=exploration.early_candidate_chunk_size,
-                    full_candidate_chunk_size=exploration.full_candidate_chunk_size,
-                    velocity_denominator_floor=config.train.velocity_denominator_floor,
-                )
-                selected_noisy, selected_noise = diagnostics.noisy, diagnostics.noise
-                selected_indices = diagnostics.indices
-
-            output = execution_model(selected_noisy, timesteps, model_labels)
+            selected_noise = torch.randn(
+                clean.shape, device=device, dtype=torch.float32, generator=streams.noise
+            )
+            selected_noisy = noisy_interpolate(clean, selected_noise, timesteps)
+            output = execution_model(selected_noisy, timesteps, ratios, model_labels)
             losses = ddt_losses(
                 clean,
                 selected_noise,
@@ -357,46 +343,35 @@ def train(
                 "train/epoch": progress,
                 "train/global_step": state.global_step,
                 "progress/images_seen": state.global_step * config.train.global_batch_size,
-                "compute/model_flops_per_step": step_flops,
-                "compute/cumulative_model_flops": state.global_step * step_flops,
-                "compute/prior_flops_per_step": prior_step_flops,
-                "exploration/k_total": k_total,
-                "exploration/k_early": exploration.k_early,
-                "exploration/k_full": exploration.k_full,
-                "exploration/selected_index_mean": selected_indices.float().mean().item(),
+                "compute/model_flops_per_step": base_step_flops,
+                "compute/pixel_encoder_flops_per_step": pixel_encoder_step_flops,
+                "compute/total_flops_per_step": step_flops,
+                "compute/cumulative_model_flops": state.global_step * base_step_flops,
+                "compute/cumulative_total_flops": state.global_step * step_flops,
+                "mixing/ratio_mean": ratios.mean().item(),
+                "mixing/ratio_std": ratios.std(correction=0).item(),
+                "mixing/rae_endpoint_fraction": (ratios == 0).float().mean().item(),
+                "mixing/pixel_endpoint_fraction": (ratios == 1).float().mean().item(),
+                "mixing/pixel_mean": pixel_tokens.mean().item(),
+                "mixing/pixel_std": pixel_tokens.std(correction=0).item(),
+                "mixing/rae_mean": rae_tokens.mean().item(),
+                "mixing/rae_std": rae_tokens.std(correction=0).item(),
+                "mixing/x0_mean": clean.mean().item(),
+                "mixing/x0_std": clean.std(correction=0).item(),
+                "mixing/expected_x0_variance": pixel_codec.statistics.expected_mixture_variance(
+                    ratios
+                ).mean().item(),
+                "mixing/endpoint_cosine": torch.nn.functional.cosine_similarity(
+                    pixel_tokens.flatten(2).transpose(1, 2),
+                    rae_tokens.flatten(2).transpose(1, 2),
+                    dim=-1,
+                ).mean().item(),
                 "throughput/images_per_second": config.train.global_batch_size / elapsed,
                 "throughput/tokens_per_second": config.train.global_batch_size * 64 / elapsed,
                 "throughput/step_seconds": elapsed,
                 "throughput/data_wait_seconds": data_wait,
                 "system/peak_memory_gib": torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0.0,
             }
-            if prior is not None and gaussian_source is not None:
-                source = selected_noise.float()
-                metrics.update(
-                    {
-                        "prior/source_mean": source.mean().item(),
-                        "prior/source_std": source.std(correction=0).item(),
-                        "prior/source_rms": source.square().mean().sqrt().item(),
-                        "prior/gaussian_to_source_rms": (source - gaussian_source).square().mean().sqrt().item(),
-                        "prior/source_to_clean_rms": (source - clean).square().mean().sqrt().item(),
-                        "prior/seed_sensitivity": prior_seed_sensitivity,
-                    }
-                )
-            if diagnostics is not None:
-                if diagnostics.early_candidate_zero_score is not None:
-                    metrics["exploration/early/candidate_zero_score"] = diagnostics.early_candidate_zero_score.mean().item()
-                    metrics["exploration/early/best_score"] = diagnostics.early_best_score.mean().item()  # type: ignore[union-attr]
-                    metrics["exploration/early/score_improvement"] = (
-                        diagnostics.early_candidate_zero_score
-                        - diagnostics.early_best_score  # type: ignore[operator]
-                    ).mean().item()
-                if diagnostics.full_first_finalist_score is not None:
-                    metrics["exploration/full/first_finalist_score"] = diagnostics.full_first_finalist_score.mean().item()
-                    metrics["exploration/full/selected_score"] = diagnostics.full_selected_score.mean().item()  # type: ignore[union-attr]
-                    metrics["exploration/full/score_improvement"] = (
-                        diagnostics.full_first_finalist_score
-                        - diagnostics.full_selected_score  # type: ignore[operator]
-                    ).mean().item()
             logger.log_training(metrics, step=state.global_step)
             if config.train.max_steps is not None and state.global_step >= config.train.max_steps:
                 break
@@ -423,6 +398,14 @@ def train(
             should_checkpoint(state.epoch, config.train.epochs, config.checkpoint.interval)
             or final_epoch
         ):
+            fid = next(
+                (
+                    value
+                    for name, value in validation_metrics.items()
+                    if name.startswith("validation/FID-")
+                ),
+                None,
+            )
             checkpoint_manager.save(
                 completed_epoch=state.epoch,
                 global_step=state.global_step,
@@ -437,8 +420,8 @@ def train(
                 wandb_run_id=logger.run_id,
                 resolved_config=config.as_dict(),
                 token_cache_fingerprint=token_cache.fingerprint,
-                prior_provenance=prior_provenance(prior),
-                fid=None,
+                pixel_codec=pixel_codec,
+                fid=fid if config.checkpoint.save_best_fid else None,
             )
         logger.log({"train/epoch_seconds": time.perf_counter() - epoch_started}, step=state.global_step)
         if final_epoch:

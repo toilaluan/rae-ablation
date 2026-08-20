@@ -29,13 +29,6 @@ def sample_normal(
     )
 
 
-def shift_timestep(timestep: Tensor, shift: float = 4.0) -> Tensor:
-    """Apply the resolution-dependent logit shift used by RAE stage-2."""
-    if shift <= 0:
-        raise ValueError("timestep shift must be positive")
-    return shift * timestep / (1 + (shift - 1) * timestep)
-
-
 def sample_timesteps(
     batch_size: int,
     generator: torch.Generator,
@@ -43,12 +36,49 @@ def sample_timesteps(
     *,
     loc: float = 0.0,
     scale: float = 1.0,
-    shift: float = 4.0,
 ) -> Tensor:
-    unshifted = sample_normal(
+    return sample_normal(
         batch_size, generator, device, loc=loc, scale=scale
     ).sigmoid()
-    return shift_timestep(unshifted, shift)
+
+
+def sample_mix_ratios(
+    batch_size: int,
+    generator: torch.Generator,
+    device: torch.device | str,
+    *,
+    loc: float = 0.0,
+    scale: float = 1.0,
+    rae_endpoint_probability: float = 0.1,
+    pixel_endpoint_probability: float = 0.1,
+    fixed_ratio: float | None = None,
+) -> Tensor:
+    if batch_size < 1 or scale <= 0:
+        raise ValueError("ratio sampling requires positive batch size and scale")
+    if fixed_ratio is not None:
+        if not 0 <= fixed_ratio <= 1:
+            raise ValueError("fixed ratio must be in [0, 1]")
+        return torch.full((batch_size,), fixed_ratio, device=device, dtype=torch.float32)
+    if (
+        not 0 <= rae_endpoint_probability <= 1
+        or not 0 <= pixel_endpoint_probability <= 1
+        or rae_endpoint_probability + pixel_endpoint_probability > 1
+    ):
+        raise ValueError("ratio endpoint probabilities are invalid")
+    selector = torch.rand(batch_size, generator=generator, device=device)
+    continuous = sample_normal(
+        batch_size, generator, device, loc=loc, scale=scale
+    ).sigmoid()
+    result = torch.where(
+        selector < rae_endpoint_probability,
+        torch.zeros_like(continuous),
+        continuous,
+    )
+    return torch.where(
+        selector >= 1 - pixel_endpoint_probability,
+        torch.ones_like(result),
+        result,
+    )
 
 
 def _expand(timestep: Tensor, like: Tensor) -> Tensor:
@@ -64,6 +94,15 @@ def noisy_interpolate(clean: Tensor, noise: Tensor, timestep: Tensor) -> Tensor:
         raise ValueError("clean data and noise shapes must match")
     t = _expand(timestep, clean)
     return (1 - t) * clean.float() + t * noise.float()
+
+
+def mix_endpoints(pixel: Tensor, rae: Tensor, ratio: Tensor) -> Tensor:
+    if pixel.shape != rae.shape:
+        raise ValueError("pixel and RAE token shapes must match")
+    if ratio.shape != (pixel.shape[0],):
+        raise ValueError("mix ratio must have shape [B]")
+    r = _expand(ratio, pixel)
+    return r * pixel.float() + (1 - r) * rae.float()
 
 
 def x_to_velocity(

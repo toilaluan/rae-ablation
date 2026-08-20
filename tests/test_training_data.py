@@ -20,10 +20,12 @@ def test_train_collator_loads_raw_tokens_without_cpu_normalization() -> None:
             del indices
             raise AssertionError("training collator must not normalize tokens on CPU")
 
+    pixels = [torch.zeros(3, 256, 256), torch.ones(3, 256, 256)]
     batch = _TrainBatchCollator(RawOnlyCache())(
-        [(None, 11, 2), (None, 13, 5)]  # type: ignore[arg-type]
+        [(pixels[0], 11, 2), (pixels[1], 13, 5)]
     )
-    assert batch.tokens is raw
+    assert torch.equal(batch.pixels, torch.stack(pixels))
+    assert batch.rae_tokens is raw
     assert torch.equal(batch.labels, torch.tensor([11, 13]))
     assert torch.equal(batch.indices, torch.tensor([2, 5]))
 
@@ -36,15 +38,20 @@ def test_prepared_batch_iterator_normalizes_raw_tokens_on_target_device() -> Non
         ],
         dtype=torch.bfloat16,
     )
-    source = iter([TrainBatch(raw, torch.tensor([3, 4]), torch.tensor([8, 9]))])
+    pixels = torch.rand(2, 3, 256, 256)
+    source = iter(
+        [TrainBatch(pixels, raw, torch.tensor([3, 4]), torch.tensor([8, 9]))]
+    )
     mean = torch.tensor([1.0, 2.0])
     std = torch.tensor([2.0, 4.0])
 
     iterator = _PreparedBatchIterator(source, torch.device("cpu"), mean, std)
     batch = next(iterator)
 
-    assert batch.tokens.dtype == torch.float32
-    assert torch.equal(batch.tokens, normalize_tokens(raw, mean, std))
+    assert batch.pixels.dtype == torch.float32
+    assert torch.equal(batch.pixels, pixels)
+    assert batch.rae_tokens.dtype == torch.float32
+    assert torch.equal(batch.rae_tokens, normalize_tokens(raw, mean, std))
     assert batch.labels.dtype == torch.long
     assert batch.indices.dtype == torch.long
     with pytest.raises(StopIteration):
@@ -74,7 +81,17 @@ def test_raw_lookup_does_not_copy_advanced_index_result_twice() -> None:
 def test_cuda_prepared_batch_uses_prefetch_stream() -> None:
     raw = torch.arange(8, dtype=torch.float32).reshape(2, 1, 2, 2).to(torch.bfloat16)
     raw = raw.pin_memory()
-    source = iter([TrainBatch(raw, torch.tensor([1, 2]).pin_memory(), torch.tensor([3, 4]).pin_memory())])
+    pixels = torch.rand(2, 3, 256, 256).pin_memory()
+    source = iter(
+        [
+            TrainBatch(
+                pixels,
+                raw,
+                torch.tensor([1, 2]).pin_memory(),
+                torch.tensor([3, 4]).pin_memory(),
+            )
+        ]
+    )
     mean = torch.tensor([1.0])
     std = torch.tensor([2.0])
 
@@ -83,6 +100,7 @@ def test_cuda_prepared_batch_uses_prefetch_stream() -> None:
     torch.cuda.current_stream().synchronize()
 
     assert iterator._stream is not None
-    assert batch.tokens.is_cuda
-    assert torch.equal(batch.tokens.cpu(), normalize_tokens(raw, mean, std))
+    assert batch.pixels.is_cuda
+    assert batch.rae_tokens.is_cuda
+    assert torch.equal(batch.rae_tokens.cpu(), normalize_tokens(raw, mean, std))
     iterator.close()
