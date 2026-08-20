@@ -128,7 +128,7 @@ class RAEConfig:
     compressor_revision: str = RAE_COMPRESSOR_REVISION
     trust_remote_code: bool = True
     remote_code_schema: int = 1
-    micro_batch_size: int = 16
+    micro_batch_size: int = 128
     cache: TokenCacheConfig = field(default_factory=TokenCacheConfig)
 
     def validate(self) -> None:

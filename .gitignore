@@ -20,3 +20,4 @@ wandb/
 .hf-cache/
 data/
 generated/
+artifacts/

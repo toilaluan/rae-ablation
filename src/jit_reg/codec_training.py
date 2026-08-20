@@ -120,6 +120,7 @@ class LPIPSReconstructionLoss(nn.Module):
         perceptual = self.lpips(
             reconstruction.float().mul(2).sub(1), pixels.float().mul(2).sub(1)
         ).mean()
+        # perceptual = torch.zeros((), device=reconstruction.device)
         return l1 + self.weight * perceptual, l1, perceptual
 
 

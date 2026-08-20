@@ -115,6 +115,7 @@ def main() -> None:
     validation_loader = _validation_loader(config, validation_dataset, rank, world_size)
 
     model = PixelCodec(config.pixel_codec).to(device)
+    model = torch.compile(model)
     if world_size > 1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     optimizer = torch.optim.AdamW(
