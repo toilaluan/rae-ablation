@@ -1,18 +1,30 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 from PIL import Image
+from safetensors.torch import load_file
 from torch import Tensor
 
-from jit_reg.config import IMAGE_SIZE
-from jit_reg.pixel_codec import load_pixel_codec_artifact
+from jit_reg.config import IMAGE_SIZE, PixelCodecConfig, load_config
+from jit_reg.pixel_codec import PixelCodec, PixelTokenStatistics, load_pixel_codec_artifact
+
+
+@dataclass(frozen=True)
+class LoadedCodec:
+    model: PixelCodec
+    statistics: PixelTokenStatistics | None
+    directory: Path
+    weights_sha256: str
+    source_kind: str
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,6 +37,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("artifacts/pixel-codec/best"),
         help="pixel codec artifact directory (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/pixel-codec.yaml"),
+        help="model config used when --codec is a training checkpoint (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="config override used when loading a training checkpoint",
     )
     parser.add_argument(
         "--output",
@@ -41,10 +66,67 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_device(value: str) -> torch.device:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if value == "auto" else torch.device(value)
+    device = (
+        torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if value == "auto"
+        else torch.device(value)
+    )
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
     return device
+
+
+def _weights_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_training_checkpoint(
+    source: Path,
+    device: torch.device,
+    config: PixelCodecConfig,
+) -> LoadedCodec:
+    weights = source if source.is_file() else source / "model.safetensors"
+    if not weights.is_file():
+        raise FileNotFoundError(
+            f"codec path is neither a portable artifact nor a training checkpoint: {source.resolve()}"
+        )
+    state = load_file(str(weights), device=str(device))
+    prefix = "_orig_mod."
+    if state and all(name.startswith(prefix) for name in state):
+        state = {name.removeprefix(prefix): value for name, value in state.items()}
+    model = PixelCodec(config).to(device)
+    model.load_state_dict(state)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    model.eval()
+    return LoadedCodec(
+        model=model,
+        statistics=None,
+        directory=source.resolve().parent if source.is_file() else source.resolve(),
+        weights_sha256=_weights_digest(weights),
+        source_kind="training_checkpoint",
+    )
+
+
+def load_codec(
+    source: Path,
+    device: torch.device,
+    config: PixelCodecConfig,
+) -> LoadedCodec:
+    if source.is_dir() and (source / "metadata.json").exists():
+        artifact = load_pixel_codec_artifact(source, device)
+        return LoadedCodec(
+            model=artifact.model,
+            statistics=artifact.statistics,
+            directory=artifact.directory,
+            weights_sha256=artifact.weights_sha256,
+            source_kind="portable_artifact",
+        )
+    return _load_training_checkpoint(source, device, config)
 
 
 def load_image(path: Path, device: torch.device) -> tuple[Tensor, tuple[int, int]]:
@@ -94,13 +176,16 @@ def save_image(pixels: Tensor, path: Path) -> None:
 def main() -> None:
     args = build_parser().parse_args()
     device = resolve_device(args.device)
-    artifact = load_pixel_codec_artifact(args.codec, device)
+    config = load_config(args.config, args.override)
+    codec = load_codec(args.codec, device, config.pixel_codec)
     pixels, original_size = load_image(args.image, device)
 
     with torch.inference_mode():
-        latent = artifact.model.encode(pixels)
-        normalized_latent = artifact.statistics.normalize(latent)
-        reconstruction = artifact.model.decode(latent)
+        latent = codec.model.encode(pixels)
+        normalized_latent = (
+            codec.statistics.normalize(latent) if codec.statistics is not None else None
+        )
+        reconstruction = codec.model.decode(latent)
 
     save_image(reconstruction, args.output)
     difference = reconstruction.float() - pixels.float()
@@ -110,13 +195,23 @@ def main() -> None:
         "input_size": list(original_size),
         "codec_input_size": [IMAGE_SIZE, IMAGE_SIZE],
         "output": str(args.output.resolve()),
-        "codec": str(artifact.directory),
-        "weights_sha256": artifact.weights_sha256,
+        "codec": str(codec.directory),
+        "codec_source": codec.source_kind,
+        "weights_sha256": codec.weights_sha256,
         "device": str(device),
         "latent_shape": list(latent.shape),
         "latent": {
             "raw": tensor_statistics(latent),
-            "normalized": tensor_statistics(normalized_latent),
+            "normalized": (
+                tensor_statistics(normalized_latent)
+                if normalized_latent is not None
+                else None
+            ),
+            "normalization_note": (
+                None
+                if normalized_latent is not None
+                else "unavailable: training checkpoints do not contain dataset statistics"
+            ),
         },
         "reconstruction": {
             "mae": difference.abs().mean().item(),

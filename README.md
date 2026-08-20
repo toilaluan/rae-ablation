@@ -52,6 +52,11 @@ uv run python scripts/reconstruct.py path/to/image.jpg \
   --output reconstruction.png
 ```
 
+An in-progress training checkpoint can also be inspected by passing a directory such
+as `artifacts/pixel-codec/checkpoints/epoch-0002`. In that case, the architecture is
+read from `--config` and normalized latent statistics are unavailable until training
+creates the final portable artifact.
+
 ## Mixing experiment
 
 The main preset samples `r` from an endpoint-augmented logit-normal distribution:
