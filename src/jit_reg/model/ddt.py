@@ -43,6 +43,15 @@ class SwiGLU(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
+class MLP(nn.Module):
+    def __init__(self, width: int, mlp_ratio: float) -> None:
+        super().__init__()
+        hidden = max(1, int(width * mlp_ratio))
+        self.w1 = nn.Linear(width, hidden)
+        self.w2 = nn.Linear(hidden, width)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.w2(F.silu(self.w1(x)))
 
 class NormalizedAttention(nn.Module):
     def __init__(
@@ -105,7 +114,7 @@ class DDTEncoderBlock(nn.Module):
         self.norm1 = RMSNorm(width)
         self.attention = NormalizedAttention(width, num_heads, spatial_size, condition_tokens)
         self.norm2 = RMSNorm(width)
-        self.feed_forward = SwiGLU(width, mlp_ratio)
+        self.feed_forward = MLP(width, mlp_ratio)
 
     def forward(self, x: Tensor) -> Tensor:
         x = x + self.attention(self.norm1(x))
@@ -118,7 +127,7 @@ class DDTDecoderBlock(nn.Module):
         self.norm1 = RMSNorm(width)
         self.attention = NormalizedAttention(width, num_heads, spatial_size)
         self.norm2 = RMSNorm(width)
-        self.feed_forward = SwiGLU(width, mlp_ratio)
+        self.feed_forward = MLP(width, mlp_ratio)
         self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(width, 6 * width))
 
     def forward(self, x: Tensor, conditioning: Tensor) -> Tensor:
