@@ -43,8 +43,8 @@ def preprocessing_metadata(config: DataConfig, image_size: int) -> dict[str, Any
             "PIL.convert(RGB)",
             f"PIL.resize({image_size}x{image_size}, bicubic) when needed",
             "uint8_to_float32_[0,1]",
-            "frozen_raev2_compressor_encode",
-            "per_channel_population_normalization",
+            "online_frozen_dinov3_b16_imagenet_normalization",
+            "normalized_block7_and_block12_patch_tokens",
         ],
     }
 
@@ -88,12 +88,13 @@ def load_imagenet(
     image_size: int,
     *,
     load_pixels: bool = True,
+    split: str | None = None,
 ) -> ImageNetDataset:
     from datasets import load_dataset
 
     dataset = load_dataset(
         config.repository,
-        split=config.split,
+        split=split or config.split,
         num_proc=12,
         revision=config.revision,
     )

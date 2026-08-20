@@ -51,18 +51,13 @@ class RunLogger:
         self.log(metrics, step=step)
         if not self.is_main_process or step % self.log_interval:
             return
-        selection_gain = metrics.get(
-            "exploration/full/score_improvement",
-            metrics.get("exploration/early/score_improvement", 0.0),
-        )
         self.event(
             "train: "
             f"step={step} epoch={metrics['train/epoch']:.3f} "
             f"loss={metrics['train/loss']:.6f} "
-            f"full={metrics['train/full_velocity_loss']:.6f} "
-            f"base={metrics['train/base_velocity_loss']:.6f} "
-            f"K={metrics['exploration/k_total']} "
-            f"selection_gain={selection_gain:.6f} "
+            f"velocity={metrics['train/velocity_loss']:.6f} "
+            f"repa={metrics['train/repa_loss']:.6f} "
+            f"r={metrics['train/r_mean']:.3f} "
             f"lr={metrics['train/lr']:.3e} "
             f"grad_norm={metrics['train/gradient_norm']:.4f} "
             f"throughput={metrics['throughput/images_per_second']:.2f} images/s "
@@ -71,12 +66,31 @@ class RunLogger:
             f"peak_memory={metrics['system/peak_memory_gib']:.2f} GiB"
         )
 
-    def log_grid(self, path: str, caption: str, step: int) -> None:
+    def log_decoder_training(self, metrics: dict[str, Any], step: int) -> None:
+        self.log(metrics, step=step)
+        if not self.is_main_process or step % self.log_interval:
+            return
+        self.event(
+            "decoder: "
+            f"step={step} loss={metrics['decoder/loss']:.6f} "
+            f"l1={metrics['decoder/l1']:.6f} "
+            f"lpips={metrics['decoder/lpips']:.6f} "
+            f"g_adv={metrics['decoder/generator_adversarial']:.6f} "
+            f"d={metrics['decoder/discriminator']:.6f} "
+            f"gan={bool(metrics['decoder/gan_active'])} "
+            f"lr={metrics['decoder/lr']:.3e} "
+            f"throughput={metrics['throughput/images_per_second']:.2f} images/s "
+            f"step_time={metrics['throughput/step_seconds']:.3f}s"
+        )
+
+    def log_grid(
+        self, path: str, caption: str, step: int, key: str = "validation/sample_preview"
+    ) -> None:
         if self.run is not None:
             import wandb
 
             self.run.log(
-                {"validation/sample_preview": wandb.Image(path, caption=caption)}, step=step
+                {key: wandb.Image(path, caption=caption)}, step=step
             )
 
     def log_checkpoint(self, path: str, name: str) -> None:

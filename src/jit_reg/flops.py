@@ -5,33 +5,23 @@ from .config import ExperimentConfig
 
 def _attention_flops(tokens: int, width: int, heads: int) -> int:
     head_dim = width // heads
-    return 2 * tokens * width * (3 * width) + 4 * heads * tokens * tokens * head_dim + 2 * tokens * width * width
+    projections = 2 * tokens * width * (3 * width)
+    attention = 4 * heads * tokens * tokens * head_dim
+    output = 2 * tokens * width * width
+    return projections + attention + output
 
 
 def _mlp_flops(tokens: int, width: int, ratio: float) -> int:
     hidden = max(1, int(2 * width * ratio / 3))
-    return 4 * tokens * width * hidden + 2 * tokens * hidden * width
+    return 6 * tokens * width * hidden
 
 
-def ddt_base_forward_flops(config: ExperimentConfig) -> int:
+def ddt_forward_flops(config: ExperimentConfig, *, include_repa: bool = True) -> int:
+    """Approximate FLOPs for one v14 diffusion forward pass."""
     model = config.model
     spatial = model.grid_size**2
-    tokens = spatial + model.num_timestep_tokens + model.num_class_tokens
-    width, _ = model.hidden_size
-    heads, _ = model.num_heads
-    patch_values = model.patch_size[0] ** 2 * model.in_channels
-    projection = 2 * spatial * patch_values * width
-    blocks = model.base_model_depth * (
-        _attention_flops(tokens, width, heads) + _mlp_flops(tokens, width, model.mlp_ratio)
-    )
-    base_head = 2 * spatial * width * patch_values + 4 * spatial * width * width
-    return projection + blocks + base_head
-
-
-def ddt_full_forward_flops(config: ExperimentConfig, *, include_base_head: bool = False) -> int:
-    model = config.model
-    spatial = model.grid_size**2
-    enc_tokens = spatial + model.num_timestep_tokens + model.num_class_tokens
+    condition = model.num_timestep_tokens + model.num_mix_tokens + model.num_class_tokens
+    enc_tokens = spatial + condition
     enc_width, dec_width = model.hidden_size
     enc_heads, dec_heads = model.num_heads
     enc_patch = model.patch_size[0] ** 2 * model.in_channels
@@ -49,19 +39,16 @@ def ddt_full_forward_flops(config: ExperimentConfig, *, include_base_head: bool 
         + 12 * spatial * dec_width * dec_width
     )
     total += 2 * spatial * dec_width * dec_patch + 4 * spatial * dec_width * dec_width
-    if include_base_head:
-        total += 2 * spatial * enc_width * enc_patch + 4 * spatial * enc_width * enc_width
+    if include_repa:
+        repa_width = config.repa.projector_width
+        total += 2 * spatial * (
+            enc_width * repa_width
+            + repa_width * repa_width
+            + repa_width * model.in_channels
+        )
     return total
 
 
 def model_flops_per_step(config: ExperimentConfig) -> int:
-    """Approximate global DDT FLOPs for scoring plus winner-only forward/backward."""
-    batch = config.train.global_batch_size
-    winner_forward = ddt_full_forward_flops(config, include_base_head=True)
-    total = batch * 3 * winner_forward
-    explore = config.exploration
-    if explore.k_early > 1:
-        total += batch * explore.k_total * ddt_base_forward_flops(config)
-    if explore.k_full > 1:
-        total += batch * explore.k_full * ddt_full_forward_flops(config)
-    return total
+    """Approximate global forward/backward DDT FLOPs, excluding frozen DINO."""
+    return config.train.global_batch_size * 3 * ddt_forward_flops(config)

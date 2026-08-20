@@ -1,16 +1,16 @@
-"""RAEv2-compressed ImageNet training with DDT internal guidance and K exploration."""
+"""DINOv3 token-space diffusion with token mixing and REPA alignment."""
 
-from .config import DDTConfig, ExperimentConfig, ExplorationConfig, RAEConfig, load_config
-from .model import DDT, DDTOutput, DiTwDDTHeadIG, classifier_free_labels
+from .config import DDTConfig, ExperimentConfig, MixingConfig, RepaConfig, VisionConfig, load_config
+from .model import DDT, DDTOutput, classifier_free_labels
 
 __all__ = [
     "DDT",
     "DDTConfig",
     "DDTOutput",
-    "DiTwDDTHeadIG",
     "ExperimentConfig",
-    "ExplorationConfig",
-    "RAEConfig",
+    "MixingConfig",
+    "RepaConfig",
+    "VisionConfig",
     "classifier_free_labels",
     "load_config",
 ]

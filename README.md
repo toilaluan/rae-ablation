@@ -1,117 +1,89 @@
-# RAE-DDT with internal guidance and K-exploration
+# DINOv3 token-mixing diffusion
 
-This repository implements one schema-v13 pipeline:
+This repository trains an ImageNet-256 diffusion transformer directly in a frozen
+DINOv3-B/16 feature space. The previous RAE, checkpoint prior, internal-guidance
+head, K-exploration, and persistent token cache have been removed.
 
-`ImageNet-256 RGB → frozen RAEv2 compressor → normalized 1024×8×8 tokens → DDT`
+The default pipeline extracts two endpoints in one online DINO traversal:
 
-Training never loads images or RAE weights. The cache builder is the only RGB/encode
-path; sampling is the only RAE/decode path. Schema-v12 configurations, checkpoints,
-and cache manifests are intentionally rejected without migration.
+- target: block 7 patch tokens;
+- semantic: final block 12 patch tokens;
+- normalization: the same frozen DINO final LayerNorm is applied to both endpoints;
+- token layout: CLS and four register tokens are removed, leaving `768x16x16`.
 
-## Architecture
+## Stages
 
-The model follows upstream `DiTwDDTHeadIG`, adjusted to an 8×8 input grid. A 1×1
-projection produces width-768 spatial tokens. Twelve encoder blocks jointly process
-64 spatial, four timestep, and eight class tokens. The base x-prediction head exits
-after encoder block four. The full path projects to width 2048, applies two
-adaLN-conditioned decoder blocks, and predicts x with a separate head.
-
-Both heads train with flow matching:
-
-`x_t = (1 - t) clean + t noise`
-
-X predictions are converted to velocity using `max(t, 0.05)`. The loss is
-`full_loss + train.base_loss_weight * base_loss`; the default base weight is 1.0.
-Timesteps are logit-normal and use the compact-token shift 4.
-
-## Pinned codec
-
-- Base: `toilaluan/raev2-dinov3l-k7@46ce5a7e76df99eb5528020d3c65cef528a355fa`
-- Compressor: `toilaluan/raev2-compressor@846e2213dcf6218d3b726448ae52d8104c925c0f`
-
-The base is loaded first and injected into the compressor with remote code enabled.
-CUDA uses BF16; CPU uses FP32.
-
-## Cache
-
-Build the resumable cache before training:
+Install the environment, then train the transformer pixel decoder first:
 
 ```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/cache_tokens.py \
-  --config configs/ddt-baseline.yaml
+uv sync --extra dev
+torchrun --standalone --nproc-per-node=8 scripts/train_decoder.py \
+  --config configs/dino-tokenmix.yaml \
+  --output runs/pixel-decoder
 ```
 
-Raw outputs are stored as BF16 with a byte-per-example completion bitmap. Once all
-values exist, ranks partition the memory map, accumulate per-channel sums and squared
-sums in FP64, all-reduce them, and save FP32 population mean/std. An interruption
-after encoding resumes at the statistics pass without loading the codec.
+The decoder maps normalized block-7 tokens to RGB using an eight-block transformer.
+Its objective is L1 + LPIPS, with an optional spectral-normalized PatchGAN that starts
+after `decoder.loss.gan_start_fraction` of training. Checkpoints contain raw and EMA
+decoder weights, discriminator state, optimizer state, provenance, and previews.
 
-For the pinned 1,281,167-example train split, `values.bf16` is 167,925,121,024 bytes
-(156.3925 GiB), the bitmap is about 1.22 MiB, and statistics are 8 KiB. Provision at
-least 170 GiB free. An uncompressed 1024×16×16 BF16 cache would be about 625.57 GiB.
-
-## Presets and training
-
-The four presets are:
-
-| Preset | K early | K full |
-|---|---:|---:|
-| `configs/ddt-baseline.yaml` | 1 | 1 |
-| `configs/ddt-k-early.yaml` | 4 | 1 |
-| `configs/ddt-k-final.yaml` | 1 | 4 |
-| `configs/ddt-k-hybrid.yaml` | 4 | 2 |
+Point `decoder.checkpoint` at the decoder run (or a specific checkpoint), then train
+diffusion:
 
 ```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/ddt-k-hybrid.yaml \
-  --output runs/ddt-k-hybrid
+torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/dino-tokenmix.yaml \
+  --override decoder.checkpoint=runs/pixel-decoder/checkpoints/last \
+  --output runs/tokenmix-seed0
 ```
 
-For K exploration, every early-stage candidate is scored with the base prefix under
-no-grad. The globally best `k_full` candidates are scored by the full path, and only
-the winning candidate receives the dual-head training forward/backward. Candidate
-chunking is configurable per stage and stable ties prefer the lower original index.
+For each image, training samples `r` from a logit-normal distribution, with a 0.2
+atom at `r=1`, and constructs:
 
-## Sampling
-
-Internal guidance is enabled by default:
-
-`guided = base + 1.78 * (full - base)` for `t ∈ [0.1, 1.0]`.
-
-CFG defaults to scale 1.0 (inactive). If explicitly enabled, IG is applied to each
-conditional branch first and CFG combines them afterward. Euler and Heun are
-available.
-
-### Checkpoint prior experiment
-
-By default the flow source is standard Gaussian noise. To use the base x0 prediction
-of a completed, normally trained checkpoint as the source, set its directory and
-choose either its raw training weights or EMA weights:
-
-```yaml
-prior:
-  checkpoint_dir: runs/ddt-baseline/checkpoints/epoch-0080
-  weight_source: ema  # model or ema
+```text
+x0 = (1 - r) * final_tokens + r * block7_tokens
+xt = (1 - t) * x0 + t * noise
+velocity target = noise - x0
 ```
 
-For each Gaussian draw, the frozen prior model runs `forward_base_prediction` at
-`t=1` with the true class label. Training and sampling use that prediction as the
-flow endpoint. Setting `checkpoint_dir: null` restores the Gaussian source exactly.
-Checkpoint-prior runs require K=1, and the prior checkpoint must use the same model,
-RAE, and token-cache provenance as the student. Student checkpoints record the
-selected prior weight digest and verify it on resume and sampling without copying
-the prior weights.
+The model is explicitly conditioned on `t`, `r`, and the class label. REPA aligns
+diffusion encoder block 8 with final DINO tokens through a
+`768 -> 2048 -> 2048 -> 768` projector at coefficient 0.5. Sampling fixes `r=1`
+and supports ordinary classifier-free guidance.
+
+## Matched baseline
+
+Run the baseline with the same decoder checkpoint, seed, data, model, optimizer,
+REPA loss, validation plan, and sampling settings:
 
 ```bash
-uv run torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --checkpoint-dir runs/ddt-k-hybrid/checkpoints/last
+torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/dino-r1-baseline.yaml \
+  --override decoder.checkpoint=runs/pixel-decoder/checkpoints/last \
+  --output runs/r1-baseline-seed0
 ```
 
-## Verification
+The only intended experimental difference is `mixing.mode=target_baseline`, which
+sets every training example to `r=1`.
+
+## Sampling and evaluation
 
 ```bash
-uv run pytest -q
-uv run ruff check .
+torchrun --standalone --nproc-per-node=8 scripts/sample.py \
+  --checkpoint-dir runs/tokenmix-seed0/checkpoints/last \
+  --evaluate
 ```
 
-Remote CUDA codec validation is opt-in through the integration test marker.
+Sampling is deterministic from the saved class-balanced validation plan, resumable,
+and emits an ADM-compatible NPZ, preview grid, manifest, and optional FID result.
+Training and decoder training retain console logs, W&B metrics and image grids,
+EMA weights, resumable optimizer/RNG state, provenance validation, and optional W&B
+checkpoint artifacts.
+
+## Efficiency ablation
+
+Measure convergence against the matched DINO `r=1` baseline first. A FLUX.2 VAE
+experiment is useful as phase two: it tests whether token mixing helps beyond a
+semantic foundation-model space, but VAE latents do not naturally provide the two
+semantically ordered endpoints used here. Define a comparable second endpoint and
+hold decoder/model compute fixed before interpreting it as an efficiency result.

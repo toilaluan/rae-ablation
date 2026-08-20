@@ -3,17 +3,17 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
+from .config import MixingConfig
 
-class DDTLoss(NamedTuple):
+
+class DiffusionLoss(NamedTuple):
     total: Tensor
-    full_velocity: Tensor
-    base_velocity: Tensor
-
-    @property
-    def velocity(self) -> Tensor:
-        return self.full_velocity
+    velocity: Tensor
+    repa: Tensor
+    cosine_similarity: Tensor
 
 
 def sample_normal(
@@ -30,7 +30,6 @@ def sample_normal(
 
 
 def shift_timestep(timestep: Tensor, shift: float = 4.0) -> Tensor:
-    """Apply the resolution-dependent logit shift used by RAE stage-2."""
     if shift <= 0:
         raise ValueError("timestep shift must be positive")
     return shift * timestep / (1 + (shift - 1) * timestep)
@@ -45,42 +44,50 @@ def sample_timesteps(
     scale: float = 1.0,
     shift: float = 4.0,
 ) -> Tensor:
-    unshifted = sample_normal(
-        batch_size, generator, device, loc=loc, scale=scale
-    ).sigmoid()
+    unshifted = sample_normal(batch_size, generator, device, loc=loc, scale=scale).sigmoid()
     return shift_timestep(unshifted, shift)
 
 
-def _expand(timestep: Tensor, like: Tensor) -> Tensor:
-    value = timestep.float()
-    while value.ndim < like.ndim:
-        value = value.unsqueeze(-1)
-    return value
+def sample_mix_ratio(
+    batch_size: int,
+    generator: torch.Generator,
+    device: torch.device | str,
+    config: MixingConfig,
+) -> Tensor:
+    if config.mode == "target_baseline":
+        return torch.ones(batch_size, device=device, dtype=torch.float32)
+    continuous = sample_normal(
+        batch_size,
+        generator,
+        device,
+        loc=config.logit_normal_loc,
+        scale=config.logit_normal_scale,
+    ).sigmoid()
+    endpoint = torch.rand(
+        batch_size, generator=generator, device=device, dtype=torch.float32
+    ) < config.endpoint_probability
+    return torch.where(endpoint, torch.ones_like(continuous), continuous)
+
+
+def _expand(value: Tensor, like: Tensor) -> Tensor:
+    result = value.float()
+    while result.ndim < like.ndim:
+        result = result.unsqueeze(-1)
+    return result
+
+
+def mix_endpoints(semantic: Tensor, target: Tensor, ratio: Tensor) -> Tensor:
+    if semantic.shape != target.shape or ratio.shape != (target.shape[0],):
+        raise ValueError("endpoint tensors or mix ratio have incompatible shapes")
+    r = _expand(ratio, target)
+    return semantic.float() * (1 - r) + target.float() * r
 
 
 def noisy_interpolate(clean: Tensor, noise: Tensor, timestep: Tensor) -> Tensor:
-    """Straight flow path: x_t = (1 - t) * clean + t * noise."""
     if clean.shape != noise.shape:
         raise ValueError("clean data and noise shapes must match")
     t = _expand(timestep, clean)
     return (1 - t) * clean.float() + t * noise.float()
-
-
-def x_to_velocity(
-    noisy: Tensor,
-    x_prediction: Tensor,
-    timestep: Tensor,
-    floor: float = 0.05,
-) -> Tensor:
-    """Convert a clean-x prediction to dx/dt with max(t, floor) denominator."""
-    if noisy.shape != x_prediction.shape:
-        raise ValueError("noisy data and x-prediction shapes must match")
-    if floor <= 0:
-        raise ValueError("velocity denominator floor must be positive")
-    denominator = timestep.float().clamp_min(floor)
-    while denominator.ndim < noisy.ndim:
-        denominator = denominator.unsqueeze(-1)
-    return (noisy.float() - x_prediction.float()) / denominator
 
 
 def target_velocity(clean: Tensor, noise: Tensor) -> Tensor:
@@ -89,47 +96,31 @@ def target_velocity(clean: Tensor, noise: Tensor) -> Tensor:
     return noise.float() - clean.float()
 
 
-def per_sample_velocity_mse(
-    clean: Tensor,
-    noise: Tensor,
-    noisy: Tensor,
-    timestep: Tensor,
-    x_prediction: Tensor,
-    *,
-    floor: float = 0.05,
-) -> Tensor:
-    predicted = x_to_velocity(noisy, x_prediction, timestep, floor)
-    target = target_velocity(clean, noise)
-    return (predicted - target).square().flatten(1).mean(dim=1)
+def repa_cosine_loss(projection: Tensor, semantic: Tensor) -> tuple[Tensor, Tensor]:
+    if projection.ndim != 3 or semantic.ndim != 4:
+        raise ValueError("REPA expects [B,N,C] projections and [B,C,H,W] targets")
+    target = semantic.flatten(2).transpose(1, 2)
+    if projection.shape != target.shape:
+        raise ValueError("REPA projection and semantic target shapes must match")
+    similarity = (
+        F.normalize(projection.float(), dim=-1) * F.normalize(target.float(), dim=-1)
+    ).sum(dim=-1)
+    return -similarity.mean(), similarity.mean()
 
 
-def ddt_losses(
+def diffusion_losses(
     clean: Tensor,
     noise: Tensor,
-    noisy: Tensor,
-    timestep: Tensor,
-    full_prediction: Tensor,
-    base_prediction: Tensor,
+    prediction: Tensor,
+    projection: Tensor,
+    semantic: Tensor,
     *,
-    base_loss_weight: float = 1.0,
-    velocity_denominator_floor: float = 0.05,
-) -> DDTLoss:
-    if base_loss_weight < 0:
-        raise ValueError("base loss weight cannot be negative")
-    full = per_sample_velocity_mse(
-        clean,
-        noise,
-        noisy,
-        timestep,
-        full_prediction,
-        floor=velocity_denominator_floor,
-    ).mean()
-    base = per_sample_velocity_mse(
-        clean,
-        noise,
-        noisy,
-        timestep,
-        base_prediction,
-        floor=velocity_denominator_floor,
-    ).mean()
-    return DDTLoss(full + base_loss_weight * base, full, base)
+    repa_coefficient: float = 0.5,
+) -> DiffusionLoss:
+    if prediction.shape != clean.shape:
+        raise ValueError("velocity prediction and clean data shapes must match")
+    if repa_coefficient < 0:
+        raise ValueError("REPA coefficient cannot be negative")
+    velocity = F.mse_loss(prediction.float(), target_velocity(clean, noise))
+    repa, similarity = repa_cosine_loss(projection, semantic)
+    return DiffusionLoss(velocity + repa_coefficient * repa, velocity, repa, similarity)

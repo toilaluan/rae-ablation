@@ -7,28 +7,28 @@ from pathlib import Path
 import torch
 
 from jit_reg.checkpoint import EMA, CheckpointManager
-from jit_reg.config import load_config
+from jit_reg.config import ExperimentConfig, load_config
 from jit_reg.data import data_fingerprint, load_imagenet, preprocessing_metadata
 from jit_reg.distributed import initialize_distributed
-from jit_reg.flops import ddt_base_forward_flops, model_flops_per_step
+from jit_reg.flops import model_flops_per_step
 from jit_reg.model import DDT
 from jit_reg.model.compile import compile_model_regions
 from jit_reg.optim import build_optimizer
-from jit_reg.prior import load_checkpoint_prior, prior_provenance
+from jit_reg.pixel_decoder import decoder_weights_path
 from jit_reg.rng import RNGStreams
-from jit_reg.sample_runtime import SamplingParameters
-from jit_reg.token_cache import TokenCache
+from jit_reg.sample_runtime import SamplingParameters, checkpoint_sha256
 from jit_reg.training import TrainState, make_train_loader, train
 from jit_reg.validation import ValidationPlan, create_validation_plan
 from jit_reg.validation_runtime import validate_ema
+from jit_reg.vision import load_dino_encoder, vision_fingerprint
 from jit_reg.wandb_utils import RunLogger
 
 torch._dynamo.config.cache_size_limit = 1000
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train DDT exclusively on cached RAEv2 tokens")
-    parser.add_argument("--config", type=Path, default=Path("configs/ddt-baseline.yaml"))
+    parser = argparse.ArgumentParser(description="Train DDT on online DINOv3 endpoints")
+    parser.add_argument("--config", type=Path, default=Path("configs/dino-tokenmix.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", type=Path)
@@ -36,16 +36,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _sampling_parameters(config: object) -> SamplingParameters:
-    s = config.sampling  # type: ignore[attr-defined]
+def _sampling_parameters(config: ExperimentConfig) -> SamplingParameters:
+    s = config.sampling
     return SamplingParameters(
         batch_size=s.batch_size,
         sampling_steps=s.sampling_steps,
         solver=s.solver,
         timestep_shift=s.timestep_shift,
-        ig_scale=s.ig_scale,
-        ig_start=s.ig_start,
-        ig_end=s.ig_end,
         cfg_scale=s.cfg_scale,
         cfg_start=s.cfg_start,
         cfg_end=s.cfg_end,
@@ -60,6 +57,10 @@ def main() -> None:
         config.checkpoint.directory = str(args.output / "checkpoints")
         config.validation.plan_path = str(args.output / "validation-plan.pt")
     config.validate()
+    if config.decoder.checkpoint is None:
+        raise ValueError("decoder.checkpoint must point to a trained pixel decoder")
+    config.decoder.checkpoint = str(Path(config.decoder.checkpoint).resolve())
+    decoder_digest = checkpoint_sha256(decoder_weights_path(config.decoder.checkpoint))
     sampling_parameters = _sampling_parameters(config)
     sampling_parameters.validate()
     if not Path(config.evaluation.reference_npz).is_file():
@@ -69,17 +70,11 @@ def main() -> None:
     streams = RNGStreams.create(config.train.seed, device)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(streams.initialization.initial_seed())
-        model = DDT(config.model).to(device)
-
-    # Label/index-only dataset: this path cannot decode RGB and never loads RAE weights.
-    dataset = load_imagenet(config.data, 256, load_pixels=False)
-    token_cache = TokenCache(config, len(dataset))
-    prior = load_checkpoint_prior(
-        config,
-        device,
-        token_cache_fingerprint=token_cache.fingerprint,
-    )
-    fingerprint = data_fingerprint(config.data, 256)
+        model = DDT(config.model, config.repa).to(device)
+    feature_encoder = load_dino_encoder(config.vision, device, include_semantic=True)
+    dataset = load_imagenet(config.data, config.vision.image_size, load_pixels=True)
+    fingerprint = data_fingerprint(config.data, config.vision.image_size)
+    feature_id = vision_fingerprint(config.vision)
     plan_path = Path(config.validation.plan_path)
     if rank == 0 and not plan_path.exists():
         create_validation_plan(
@@ -104,51 +99,54 @@ def main() -> None:
             ema,
             fingerprint,
             plan.plan_hash,
-            token_cache.fingerprint,
-            expected_prior_provenance=prior_provenance(prior),
+            feature_id,
+            decoder_digest,
         )
         optimizer.load_state_dict(resumed.optimizer)
         streams.load_state_dict(resumed.rng_streams)
-        state = TrainState(resumed.epoch, resumed.global_step, resumed.last_completed_validation_epoch)
+        state = TrainState(
+            resumed.epoch,
+            resumed.global_step,
+            resumed.last_completed_validation_epoch,
+        )
         resume_run_id = resumed.wandb_run_id
 
     execution_model = compile_model_regions(model, config.compile)
     if world_size > 1:
         execution_model = torch.nn.parallel.DistributedDataParallel(
-            execution_model, device_ids=[device.index] if device.type == "cuda" else None
+            execution_model,
+            device_ids=[device.index] if device.type == "cuda" else None,
         )
-    loader, sampler = make_train_loader(dataset, config, streams, token_cache)
+    loader, sampler = make_train_loader(dataset, config, streams)
     logged_config = config.as_dict()
     logged_config["provenance"] = {
-        "dataset_and_preprocessing": preprocessing_metadata(config.data, 256),
+        "dataset_and_preprocessing": preprocessing_metadata(
+            config.data, config.vision.image_size
+        ),
         "data_fingerprint": fingerprint,
         "validation_plan_hash": plan.plan_hash,
-        "token_cache_fingerprint": token_cache.fingerprint,
-        "rae": {
-            "base_repository": config.rae.base_repository,
-            "base_revision": config.rae.base_revision,
-            "compressor_repository": config.rae.compressor_repository,
-            "compressor_revision": config.rae.compressor_revision,
-            "remote_code_schema": config.rae.remote_code_schema,
-        },
+        "vision_fingerprint": feature_id,
+        "decoder_sha256": decoder_digest,
         "diffusion_input_shape": list(config.model.input_shape),
-        "prior": prior_provenance(prior),
     }
     logged_config["model_parameters"] = {
         "total": sum(parameter.numel() for parameter in model.parameters()),
-        "trainable": sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
+        "trainable": sum(
+            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+        ),
     }
-    logger = RunLogger(config.wandb, logged_config, rank == 0, resume_run_id, args.log_interval)
+    logger = RunLogger(
+        config.wandb, logged_config, rank == 0, resume_run_id, args.log_interval
+    )
     logger.event(
-        f"training initialized: variant={config.model.model_variant}, input_shape={config.model.input_shape}, "
-        f"K={config.exploration.k_total} ({config.exploration.k_early}x{config.exploration.k_full}), "
-        f"prior={'gaussian' if prior is None else prior.provenance.weight_source + ':' + prior.provenance.checkpoint_dir}, "
+        f"training initialized: variant={config.model.model_variant}, "
+        f"mixing={config.mixing.mode}, input_shape={config.model.input_shape}, "
         f"parameters={logged_config['model_parameters']['total']:,}"
     )
     output_root = Path(config.checkpoint.directory).parent / "validation"
 
     def validate_callback(epoch: int, final: bool) -> dict[str, float]:
-        metrics, _output = validate_ema(
+        metrics, output = validate_ema(
             ema=ema,
             config=config,
             plan=plan,
@@ -156,23 +154,29 @@ def main() -> None:
             final=final,
             output_root=output_root,
             sampling=sampling_parameters,
-            token_cache=token_cache,
-            prior=prior,
         )
-        per_step = model_flops_per_step(config)
-        if prior is not None:
-            per_step += config.train.global_batch_size * ddt_base_forward_flops(config)
-        metrics["compute/cumulative_model_flops"] = float(state.global_step * per_step)
+        metrics["compute/cumulative_model_flops"] = float(
+            state.global_step * model_flops_per_step(config)
+        )
+        preview = output / "preview.png"
+        if preview.is_file():
+            logger.log_grid(str(preview), f"EMA epoch {epoch}", state.global_step)
         return metrics
 
     try:
         if config.validation.validate_now:
             started = time.perf_counter()
-            logger.log(validate_callback(state.epoch, state.epoch >= config.train.epochs), step=state.global_step)
-            logger.event(f"forced validation finished in {time.perf_counter() - started:.1f}s")
+            logger.log(
+                validate_callback(state.epoch, state.epoch >= config.train.epochs),
+                step=state.global_step,
+            )
+            logger.event(
+                f"forced validation finished in {time.perf_counter() - started:.1f}s"
+            )
         train(
             canonical_model=model,
             execution_model=execution_model,
+            feature_encoder=feature_encoder,
             loader=loader,
             sampler=sampler,
             optimizer=optimizer,
@@ -181,11 +185,10 @@ def main() -> None:
             config=config,
             checkpoint_manager=manager,
             data_fingerprint=fingerprint,
+            decoder_sha256=decoder_digest,
             validation_plan_hash=plan.plan_hash,
             validation_plan_path=plan_path,
             logger=logger,
-            token_cache=token_cache,
-            prior=prior,
             state=state,
             validation_callback=validate_callback,
         )

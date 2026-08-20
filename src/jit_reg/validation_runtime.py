@@ -12,8 +12,7 @@ from .distributed import broadcast_string
 from .evaluation import evaluate_npz, save_evaluation
 from .model import DDT
 from .model.compile import compile_model_regions
-from .prior import CheckpointPrior, prior_provenance, source_from_gaussian
-from .rae import load_rae_codec
+from .pixel_decoder import load_pixel_decoder
 from .rng import preserving_global_rng
 from .sample_runtime import (
     FEATURE_SCHEMA_VERSION,
@@ -23,8 +22,8 @@ from .sample_runtime import (
     state_dict_sha256,
 )
 from .sampling import ode_sample
-from .token_cache import TokenCache
 from .validation import ValidationPlan, noise_for_samples
+from .vision import vision_fingerprint
 
 
 def _distributed() -> tuple[int, int]:
@@ -44,11 +43,11 @@ def validate_ema(
     final: bool,
     output_root: str | Path,
     sampling: SamplingParameters | Sequence[SamplingParameters],
-    token_cache: TokenCache,
-    prior: CheckpointPrior | None = None,
 ) -> tuple[dict[str, float], Path]:
     rank, _world_size = _distributed()
-    device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+    )
     if isinstance(sampling, SamplingParameters):
         parameters = sampling
     else:
@@ -57,23 +56,28 @@ def validate_ema(
         except StopIteration as error:
             raise ValueError("validation requires sampling parameters") from error
     parameters.validate()
-    sample_count = config.validation.final_samples if final else config.validation.periodic_samples
+    sample_count = (
+        config.validation.final_samples
+        if final
+        else config.validation.periodic_samples
+    )
     run_kind = "final" if final else "periodic"
     root = Path(output_root) / f"epoch-{completed_epoch:04d}-{run_kind}"
     root.mkdir(parents=True, exist_ok=True)
     digest = state_dict_sha256(ema.state_dict()) if rank == 0 else None
     digest = broadcast_string(digest, rank)
+    decoder, decoder_digest = load_pixel_decoder(config.decoder, device)
     feature_schema = {
         "schema_version": FEATURE_SCHEMA_VERSION,
-        "input_space": "normalized-raev2-compressor-tokens",
+        "input_space": "dinov3-b16-normalized-block7-patch-tokens",
         "input_shape": list(config.model.input_shape),
-        "conditioning": "four-timestep-plus-eight-class-tokens",
-        "prediction": "clean-x-full-and-base",
-        "token_cache_fingerprint": token_cache.fingerprint,
-        "prior": prior_provenance(prior),
+        "vision_fingerprint": vision_fingerprint(config.vision),
+        "decoder_sha256": decoder_digest,
+        "conditioning": "timestep-mix-ratio-class",
+        "prediction": "direct-velocity-noise-minus-clean",
+        "sample_mix_ratio": 1.0,
     }
-    codec = load_rae_codec(config.rae, device)
-    model = DDT(config.model).to(device)
+    model = DDT(config.model, config.repa).to(device)
     model.load_state_dict(ema.state_dict())
     model.eval()
     execution_model = compile_model_regions(model, config.compile)
@@ -88,22 +92,18 @@ def validate_ema(
             device,
             dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
         )
-        source = source_from_gaussian(prior, noise, labels.to(device))
         generated = ode_sample(
             execution_model,
-            source,
+            noise,
             labels.to(device),
             steps=parameters.sampling_steps,
             timestep_shift=parameters.timestep_shift,
-            ig_scale=parameters.ig_scale,
-            ig_interval=(parameters.ig_start, parameters.ig_end),
             cfg_scale=parameters.cfg_scale,
             cfg_interval=(parameters.cfg_start, parameters.cfg_end),
             solver=parameters.solver,
             num_classes=config.model.num_classes,
-            velocity_denominator_floor=config.train.velocity_denominator_floor,
         )
-        return codec.decode(token_cache.denormalize(generated)).clamp(0, 1)
+        return decoder(generated.to(next(decoder.parameters()).dtype)).float().clamp(0, 1)
 
     started = time.perf_counter()
     archive = sample_to_archive(
@@ -111,8 +111,8 @@ def validate_ema(
         plan=plan,
         sample_count=sample_count,
         num_classes=config.model.num_classes,
-        image_size=256,
-        patch_size=config.model.patch_size[0],
+        image_size=config.vision.image_size,
+        patch_size=config.vision.patch_size,
         grid_size=config.model.grid_size,
         model_variant=config.model.model_variant,
         feature_schema=feature_schema,
@@ -120,16 +120,26 @@ def validate_ema(
         parameters=parameters,
         generate_batch=generate_batch,
     )
-    metrics: dict[str, float] = {"throughput/validation_sampling_seconds": time.perf_counter() - started}
+    metrics: dict[str, float] = {
+        "throughput/validation_sampling_seconds": time.perf_counter() - started
+    }
     if rank == 0:
         raw = evaluate_npz(
             archive,
             config.evaluation.reference_npz,
             batch_size=config.evaluation.batch_size,
-            device=device if config.evaluation.device == "auto" else torch.device(config.evaluation.device),
+            device=(
+                device
+                if config.evaluation.device == "auto"
+                else torch.device(config.evaluation.device)
+            ),
             log_interval=config.evaluation.log_interval,
         )
         save_evaluation(output / "evaluation.json", raw, plan.plan_hash)
-        suffix = f"{sample_count // 1000}K" if sample_count % 1000 == 0 else str(sample_count)
+        suffix = (
+            f"{sample_count // 1000}K"
+            if sample_count % 1000 == 0
+            else str(sample_count)
+        )
         metrics[f"validation/FID-{suffix}"] = float(raw["FID"])
     return metrics, output

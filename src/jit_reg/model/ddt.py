@@ -8,17 +8,13 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-from ..config import DDTConfig
+from ..config import DDTConfig, RepaConfig
 from .rope import apply_rope_cos_sin, precompute_rope_tables
 
 
 class DDTOutput(NamedTuple):
-    full_prediction: Tensor
-    base_prediction: Tensor
-
-    @property
-    def x_prediction(self) -> Tensor:
-        return self.full_prediction
+    velocity: Tensor
+    repa_projection: Tensor
 
 
 def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
@@ -173,12 +169,18 @@ class LabelEmbedder(nn.Module):
 
 
 class DDT(nn.Module):
-    """Two-stage label-conditional DDT with an internal-guidance base head."""
+    """Label-conditional DDT with mix conditioning and a training-only REPA head."""
 
-    def __init__(self, config: DDTConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: DDTConfig | None = None,
+        repa_config: RepaConfig | None = None,
+    ) -> None:
         super().__init__()
         self.config = config or DDTConfig()
+        self.repa_config = repa_config or RepaConfig()
         self.config.validate()
+        self.repa_config.validate(self.config.depth[0])
         enc_width, dec_width = self.config.hidden_size
         enc_depth, dec_depth = self.config.depth
         enc_heads, dec_heads = self.config.num_heads
@@ -194,10 +196,15 @@ class DDT(nn.Module):
         self.timestep_embedder = GaussianFourierEmbedding(
             enc_width, self.config.num_timestep_tokens
         )
+        self.mix_embedder = GaussianFourierEmbedding(enc_width, self.config.num_mix_tokens)
         self.class_embedder = LabelEmbedder(
             enc_width, self.config.num_classes, self.config.num_class_tokens
         )
-        condition_tokens = self.config.num_timestep_tokens + self.config.num_class_tokens
+        condition_tokens = (
+            self.config.num_timestep_tokens
+            + self.config.num_mix_tokens
+            + self.config.num_class_tokens
+        )
         self.encoder_blocks = nn.ModuleList(
             DDTEncoderBlock(
                 enc_width,
@@ -221,7 +228,13 @@ class DDT(nn.Module):
             for _ in range(dec_depth)
         )
         self.full_head = DDTFinalLayer(dec_width, x_patch, self.in_channels)
-        self.base_head = DDTFinalLayer(enc_width, s_patch, self.in_channels)
+        self.repa_projector = nn.Sequential(
+            nn.Linear(enc_width, self.repa_config.projector_width),
+            nn.SiLU(),
+            nn.Linear(self.repa_config.projector_width, self.repa_config.projector_width),
+            nn.SiLU(),
+            nn.Linear(self.repa_config.projector_width, self.config.in_channels),
+        )
         self.gradient_checkpointing = self.config.gradient_checkpointing
         self._initialize_weights()
 
@@ -245,25 +258,25 @@ class DDT(nn.Module):
     def final_layer(self) -> DDTFinalLayer:
         return self.full_head
 
-    @property
-    def base_final_layer(self) -> DDTFinalLayer:
-        return self.base_head
-
     def _initialize_weights(self) -> None:
         for projection in (self.spatial_projection, self.full_input_projection):
             nn.init.xavier_uniform_(projection.weight.flatten(1))
             nn.init.zeros_(projection.bias)
         nn.init.normal_(self.class_embedder.embedding.weight, std=0.02)
-        for layer in (self.timestep_embedder.mlp[0], self.timestep_embedder.mlp[2]):
+        for layer in (
+            self.timestep_embedder.mlp[0],
+            self.timestep_embedder.mlp[2],
+            self.mix_embedder.mlp[0],
+            self.mix_embedder.mlp[2],
+        ):
             nn.init.normal_(layer.weight, std=0.02)
         for block in self.decoder_blocks:
             nn.init.zeros_(block.modulation[-1].weight)
             nn.init.zeros_(block.modulation[-1].bias)
-        for head in (self.full_head, self.base_head):
-            nn.init.zeros_(head.modulation[-1].weight)
-            nn.init.zeros_(head.modulation[-1].bias)
-            nn.init.zeros_(head.projection.weight)
-            nn.init.zeros_(head.projection.bias)
+        nn.init.zeros_(self.full_head.modulation[-1].weight)
+        nn.init.zeros_(self.full_head.modulation[-1].bias)
+        nn.init.zeros_(self.full_head.projection.weight)
+        nn.init.zeros_(self.full_head.projection.bias)
 
     def set_gradient_checkpointing(self, enabled: bool) -> None:
         self.gradient_checkpointing = enabled
@@ -288,16 +301,26 @@ class DDT(nn.Module):
             .reshape(batch, self.in_channels, side * patch_size, side * patch_size)
         )
 
-    def _validate_inputs(self, x: Tensor, timestep: Tensor, labels: Tensor) -> None:
+    def _validate_inputs(
+        self, x: Tensor, timestep: Tensor, mix_ratio: Tensor, labels: Tensor
+    ) -> None:
         if tuple(x.shape[1:]) != self.config.input_shape:
             raise ValueError(f"DDT input must have shape [B, {self.config.input_shape}]")
-        if timestep.shape != (x.shape[0],) or labels.shape != (x.shape[0],):
-            raise ValueError("timestep and labels must have shape [B]")
+        if any(value.shape != (x.shape[0],) for value in (timestep, mix_ratio, labels)):
+            raise ValueError("timestep, mix_ratio, and labels must have shape [B]")
 
-    def _sequence(self, x: Tensor, timestep: Tensor, labels: Tensor) -> tuple[Tensor, Tensor]:
+    def _sequence(
+        self, x: Tensor, timestep: Tensor, mix_ratio: Tensor, labels: Tensor
+    ) -> tuple[Tensor, Tensor]:
         spatial = self._tokens(self.spatial_projection, x)
         timestep_base, timestep_tokens = self.timestep_embedder(timestep)
-        return torch.cat((spatial, timestep_tokens, self.class_embedder(labels)), dim=1), timestep_base
+        mix_base, mix_tokens = self.mix_embedder(mix_ratio)
+        return (
+            torch.cat(
+                (spatial, timestep_tokens, mix_tokens, self.class_embedder(labels)), dim=1
+            ),
+            timestep_base + mix_base,
+        )
 
     def _encoder_block(self, block: DDTEncoderBlock, states: Tensor) -> Tensor:
         if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
@@ -311,10 +334,6 @@ class DDT(nn.Module):
             return checkpoint(block, states, conditioning, use_reentrant=False)
         return block(states, conditioning)
 
-    def _base_from_states(self, states: Tensor, timestep_base: Tensor) -> Tensor:
-        base = F.silu(timestep_base + states[:, : self.spatial_tokens])
-        return self._unpatchify(self.base_head(base, base), self.config.patch_size[0])
-
     def _full_from_states(self, x: Tensor, states: Tensor, timestep_base: Tensor) -> Tensor:
         conditioning = self.encoder_to_decoder(
             F.silu(timestep_base + states[:, : self.spatial_tokens])
@@ -326,41 +345,28 @@ class DDT(nn.Module):
             self.full_head(decoded, conditioning), self.config.patch_size[1]
         )
 
-    def forward_base_prediction(self, x: Tensor, timestep: Tensor, labels: Tensor) -> Tensor:
-        self._validate_inputs(x, timestep, labels)
+    def forward_velocity(
+        self, x: Tensor, timestep: Tensor, mix_ratio: Tensor, labels: Tensor
+    ) -> Tensor:
+        self._validate_inputs(x, timestep, mix_ratio, labels)
         with self._autocast(x):
-            states, timestep_base = self._sequence(x, timestep, labels)
-            for block in self.encoder_blocks[: self.config.base_model_depth]:
-                states = self._encoder_block(block, states)
-            return self._base_from_states(states, timestep_base)
-
-    def forward_full_prediction(self, x: Tensor, timestep: Tensor, labels: Tensor) -> Tensor:
-        self._validate_inputs(x, timestep, labels)
-        with self._autocast(x):
-            states, timestep_base = self._sequence(x, timestep, labels)
+            states, timestep_base = self._sequence(x, timestep, mix_ratio, labels)
             for block in self.encoder_blocks:
                 states = self._encoder_block(block, states)
             return self._full_from_states(x, states, timestep_base)
 
-    def forward(self, x: Tensor, timestep: Tensor, labels: Tensor) -> DDTOutput:
-        self._validate_inputs(x, timestep, labels)
+    def forward(
+        self, x: Tensor, timestep: Tensor, mix_ratio: Tensor, labels: Tensor
+    ) -> DDTOutput:
+        self._validate_inputs(x, timestep, mix_ratio, labels)
         with self._autocast(x):
-            states, timestep_base = self._sequence(x, timestep, labels)
-            base_states: Tensor | None = None
+            states, timestep_base = self._sequence(x, timestep, mix_ratio, labels)
+            repa_states: Tensor | None = None
             for index, block in enumerate(self.encoder_blocks, start=1):
                 states = self._encoder_block(block, states)
-                if index == self.config.base_model_depth:
-                    base_states = states
-            assert base_states is not None
-            full = self._full_from_states(x, states, timestep_base)
-            base = self._base_from_states(base_states, timestep_base)
-            return DDTOutput(full, base)
-
-
-class DiTwDDTHeadIG(DDT):
-    """Upstream-compatible constructor name for the schema-v13 implementation."""
-
-    def __init__(self, config: DDTConfig | None = None, **kwargs: object) -> None:
-        if config is not None and kwargs:
-            raise ValueError("pass either a DDTConfig or keyword configuration, not both")
-        super().__init__(config or DDTConfig(**kwargs))  # type: ignore[arg-type]
+                if index == self.repa_config.layer_depth:
+                    repa_states = states[:, : self.spatial_tokens]
+            assert repa_states is not None
+            velocity = self._full_from_states(x, states, timestep_base)
+            projection = self.repa_projector(repa_states)
+            return DDTOutput(velocity, projection)

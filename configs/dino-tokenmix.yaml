@@ -1,0 +1,126 @@
+schema_version: 14
+
+data:
+  repository: benjamin-paine/imagenet-1k-256x256
+  revision: 1bd0400450249a7fe90c0aece37d0d03e7ea956a
+  split: train
+  validation_split: validation
+  workers: 16
+  prefetch_factor: 4
+
+vision:
+  repository: facebook/dinov3-vitb16-pretrain-lvd1689m
+  revision: 5931719e67bbdb9737e363e781fb0c67687896bc
+  target_layer: 7
+  semantic_layer: 12
+  image_size: 256
+  patch_size: 16
+  hidden_size: 768
+  num_register_tokens: 4
+  compile:
+    enabled: true
+    backend: inductor
+    mode: default
+    fullgraph: true
+    dynamic: false
+
+decoder:
+  checkpoint: null
+  width: 768
+  depth: 8
+  num_heads: 12
+  mlp_ratio: 4.0
+  output_patch_size: 16
+  discriminator_channels: 64
+  loss:
+    l1_weight: 1.0
+    lpips_weight: 1.0
+    gan_weight: 0.1
+    gan_enabled: true
+    gan_start_fraction: 0.2
+  train:
+    epochs: 40
+    global_batch_size: 256
+    lr: 0.0002
+    min_lr: 0.00002
+    grad_clip: 1.0
+    ema_decay: 0.9995
+    seed: 0
+    validation_interval: 1
+    validation_batches: 32
+    sample_interval: 1000
+
+model:
+  input_size: 16
+  patch_size: [1, 1]
+  in_channels: 768
+  hidden_size: [768, 2048]
+  depth: [12, 2]
+  num_heads: [12, 16]
+  mlp_ratio: 4.0
+  num_classes: 1000
+  cfg_dropout_prob: 0.1
+  num_timestep_tokens: 4
+  num_mix_tokens: 4
+  num_class_tokens: 8
+  gradient_checkpointing: false
+  variant: DDT-B/1-DINOv3B-16x16-REPA
+
+mixing:
+  mode: token_mix
+  endpoint_probability: 0.2
+  logit_normal_loc: 0.0
+  logit_normal_scale: 1.0
+
+repa:
+  layer_depth: 8
+  projector_width: 2048
+  coefficient: 0.5
+
+train:
+  epochs: 80
+  global_batch_size: 1024
+  grad_clip: 1.0
+  ema_decay: 0.9995
+  seed: 0
+  timestep_loc: 0.0
+  timestep_scale: 1.0
+  timestep_shift: 4.0
+  optimizer:
+    kind: muon
+    lr: 0.0002
+    min_lr: 0.00002
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.95
+
+sampling:
+  num_samples: 50000
+  batch_size: 32
+  sampling_steps: 50
+  solver: euler
+  timestep_shift: 4.0
+  cfg_scale: 1.0
+  cfg_start: 0.0
+  cfg_end: 1.0
+  log_interval: 10
+
+validation:
+  interval: 5
+  periodic_samples: 10000
+  final_samples: 50000
+  plan_path: validation-plan.pt
+  validate_now: false
+
+checkpoint:
+  directory: checkpoints
+  interval: 5
+  keep_last_n: 8
+  save_best_fid: true
+
+wandb:
+  enabled: false
+  project: dino-token-mixing-repa
+  tags: [dinov3, token-mixing, repa]
+  mode: online
+  checkpoint_artifacts: false

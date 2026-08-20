@@ -7,101 +7,18 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 13
+CONFIG_SCHEMA_VERSION = 14
 IMAGE_SIZE = 256
-RAE_CHANNELS = 1024
-RAE_INPUT_SIZE = 8
-RAE_TOKEN_COUNT = RAE_INPUT_SIZE**2
-RAE_BASE_REPOSITORY = "toilaluan/raev2-dinov3l-k7"
-RAE_BASE_REVISION = "46ce5a7e76df99eb5528020d3c65cef528a355fa"
-RAE_COMPRESSOR_REPOSITORY = "toilaluan/raev2-compressor"
-RAE_COMPRESSOR_REVISION = "846e2213dcf6218d3b726448ae52d8104c925c0f"
+DINO_CHANNELS = 768
+DINO_PATCH_SIZE = 16
+DINO_GRID_SIZE = IMAGE_SIZE // DINO_PATCH_SIZE
+DINO_REPOSITORY = "facebook/dinov3-vitb16-pretrain-lvd1689m"
+DINO_REVISION = "5931719e67bbdb9737e363e781fb0c67687896bc"
 
 
 def _positive(name: str, *values: int | float) -> None:
     if any(value <= 0 for value in values):
         raise ValueError(f"{name} must be positive")
-
-
-@dataclass
-class ExplorationConfig:
-    k_early: int = 1
-    k_full: int = 1
-    early_candidate_chunk_size: int | None = None
-    full_candidate_chunk_size: int | None = None
-
-    @property
-    def k_total(self) -> int:
-        return self.k_early * self.k_full
-
-
-@dataclass
-class DDTConfig:
-    input_size: int = RAE_INPUT_SIZE
-    patch_size: list[int] = field(default_factory=lambda: [1, 1])
-    in_channels: int = RAE_CHANNELS
-    hidden_size: list[int] = field(default_factory=lambda: [768, 2048])
-    depth: list[int] = field(default_factory=lambda: [12, 2])
-    num_heads: list[int] = field(default_factory=lambda: [12, 16])
-    mlp_ratio: float = 4.0
-    base_model_depth: int = 4
-    num_classes: int = 1000
-    cfg_dropout_prob: float = 0.1
-    num_timestep_tokens: int = 4
-    num_class_tokens: int = 8
-    gradient_checkpointing: bool = False
-    variant: str = "DDT-B/1-RAEv2-8x8"
-
-    @property
-    def grid_size(self) -> int:
-        return self.input_size // self.patch_size[0]
-
-    @property
-    def input_shape(self) -> tuple[int, int, int]:
-        return self.in_channels, self.input_size, self.input_size
-
-    @property
-    def model_variant(self) -> str:
-        return self.variant
-
-    def validate(self) -> None:
-        if len(self.patch_size) != 2 or len(self.hidden_size) != 2:
-            raise ValueError("model.patch_size and model.hidden_size must contain two values")
-        if len(self.depth) != 2 or len(self.num_heads) != 2:
-            raise ValueError("model.depth and model.num_heads must contain two values")
-        _positive(
-            "DDT dimensions",
-            self.input_size,
-            *self.patch_size,
-            self.in_channels,
-            *self.hidden_size,
-            *self.depth,
-            *self.num_heads,
-            self.mlp_ratio,
-            self.base_model_depth,
-            self.num_classes,
-            self.num_timestep_tokens,
-            self.num_class_tokens,
-        )
-        if self.input_size % self.patch_size[0] or self.input_size % self.patch_size[1]:
-            raise ValueError("DDT input size must be divisible by both patch sizes")
-        for stage, (width, heads) in enumerate(
-            zip(self.hidden_size, self.num_heads, strict=True)
-        ):
-            if width % heads:
-                raise ValueError(f"model.hidden_size[{stage}] must be divisible by num_heads")
-            if (width // heads) % 4:
-                raise ValueError("attention head dimensions must be divisible by four for 2D RoPE")
-        if self.base_model_depth > self.depth[0]:
-            raise ValueError("model.base_model_depth must be within encoder depth")
-        if not 0 <= self.cfg_dropout_prob < 1:
-            raise ValueError("model.cfg_dropout_prob must be in [0, 1)")
-        if not self.variant:
-            raise ValueError("model.variant cannot be empty")
-
-
-# ModelConfig is retained as a descriptive alias, not the old generic model schema.
-ModelConfig = DDTConfig
 
 
 @dataclass
@@ -118,50 +35,175 @@ class DataConfig:
     repository: str = "benjamin-paine/imagenet-1k-256x256"
     revision: str = "1bd0400450249a7fe90c0aece37d0d03e7ea956a"
     split: str = "train"
+    validation_split: str = "validation"
     workers: int = 16
     prefetch_factor: int = 4
     max_samples: int | None = None
 
 
 @dataclass
-class TokenCacheConfig:
-    directory: str = "data/rae-tokens"
-    batch_size: int = 128
-    log_interval: int = 10
+class VisionConfig:
+    repository: str = DINO_REPOSITORY
+    revision: str = DINO_REVISION
+    target_layer: int = 7
+    semantic_layer: int = 12
+    image_size: int = IMAGE_SIZE
+    patch_size: int = DINO_PATCH_SIZE
+    hidden_size: int = DINO_CHANNELS
+    num_register_tokens: int = 4
+    compile: CompileConfig = field(default_factory=CompileConfig)
+
+    @property
+    def grid_size(self) -> int:
+        return self.image_size // self.patch_size
+
+    @property
+    def token_shape(self) -> tuple[int, int, int]:
+        return self.hidden_size, self.grid_size, self.grid_size
+
+    def validate(self) -> None:
+        if self.repository != DINO_REPOSITORY:
+            raise ValueError(f"vision.repository must be {DINO_REPOSITORY}")
+        if not self.revision:
+            raise ValueError("vision.revision must pin an immutable model revision")
+        if (self.image_size, self.patch_size, self.hidden_size) != (IMAGE_SIZE, DINO_PATCH_SIZE, DINO_CHANNELS):
+            raise ValueError("v14 requires DINOv3-B/16 at 256px with width 768")
+        if not 1 <= self.target_layer < self.semantic_layer <= 12:
+            raise ValueError("vision layers must satisfy 1 <= target < semantic <= 12")
+        if self.num_register_tokens != 4:
+            raise ValueError("the pinned DINOv3-B/16 checkpoint must have four registers")
 
 
 @dataclass
-class RAEConfig:
-    base_repository: str = RAE_BASE_REPOSITORY
-    base_revision: str = RAE_BASE_REVISION
-    compressor_repository: str = RAE_COMPRESSOR_REPOSITORY
-    compressor_revision: str = RAE_COMPRESSOR_REVISION
-    trust_remote_code: bool = True
-    remote_code_schema: int = 1
-    micro_batch_size: int = 16
-    cache: TokenCacheConfig = field(default_factory=TokenCacheConfig)
+class DecoderLossConfig:
+    l1_weight: float = 1.0
+    lpips_weight: float = 1.0
+    gan_weight: float = 0.1
+    gan_enabled: bool = True
+    gan_start_fraction: float = 0.2
+
+
+@dataclass
+class DecoderTrainConfig:
+    epochs: int = 40
+    global_batch_size: int = 256
+    max_steps: int | None = None
+    lr: float = 2e-4
+    min_lr: float = 2e-5
+    grad_clip: float = 1.0
+    ema_decay: float = 0.9995
+    seed: int = 0
+    validation_interval: int = 1
+    validation_batches: int = 32
+    sample_interval: int = 1_000
+
+
+@dataclass
+class PixelDecoderConfig:
+    checkpoint: str | None = None
+    width: int = 768
+    depth: int = 8
+    num_heads: int = 12
+    mlp_ratio: float = 4.0
+    output_patch_size: int = 16
+    discriminator_channels: int = 64
+    loss: DecoderLossConfig = field(default_factory=DecoderLossConfig)
+    train: DecoderTrainConfig = field(default_factory=DecoderTrainConfig)
 
     def validate(self) -> None:
-        expected = (
-            ("base_repository", self.base_repository, RAE_BASE_REPOSITORY),
-            ("base_revision", self.base_revision, RAE_BASE_REVISION),
-            ("compressor_repository", self.compressor_repository, RAE_COMPRESSOR_REPOSITORY),
-            ("compressor_revision", self.compressor_revision, RAE_COMPRESSOR_REVISION),
-        )
-        for name, actual, pinned in expected:
-            if actual != pinned:
-                raise ValueError(f"rae.{name} must use pinned source {pinned}")
-        if self.trust_remote_code is not True:
-            raise ValueError("rae.trust_remote_code must be true")
-        _positive(
-            "RAE settings",
-            self.remote_code_schema,
-            self.micro_batch_size,
-            self.cache.batch_size,
-            self.cache.log_interval,
-        )
-        if not self.cache.directory:
-            raise ValueError("rae.cache.directory cannot be empty")
+        _positive("decoder dimensions", self.width, self.depth, self.num_heads, self.mlp_ratio, self.output_patch_size, self.discriminator_channels)
+        if self.width % self.num_heads:
+            raise ValueError("decoder.width must be divisible by decoder.num_heads")
+        if self.output_patch_size != DINO_PATCH_SIZE:
+            raise ValueError("decoder.output_patch_size must match DINO patch size")
+        loss = self.loss
+        if min(loss.l1_weight, loss.lpips_weight, loss.gan_weight) < 0:
+            raise ValueError("decoder loss weights cannot be negative")
+        if not 0 <= loss.gan_start_fraction < 1:
+            raise ValueError("decoder.loss.gan_start_fraction must be in [0,1)")
+        train = self.train
+        _positive("decoder training settings", train.epochs, train.global_batch_size, train.lr, train.min_lr, train.grad_clip, train.validation_interval, train.validation_batches, train.sample_interval)
+        if train.max_steps is not None and train.max_steps < 1:
+            raise ValueError("decoder.train.max_steps must be positive")
+        if not 0 < train.ema_decay < 1:
+            raise ValueError("decoder.train.ema_decay must be in (0,1)")
+
+
+@dataclass
+class DDTConfig:
+    input_size: int = DINO_GRID_SIZE
+    patch_size: list[int] = field(default_factory=lambda: [1, 1])
+    in_channels: int = DINO_CHANNELS
+    hidden_size: list[int] = field(default_factory=lambda: [768, 2048])
+    depth: list[int] = field(default_factory=lambda: [12, 2])
+    num_heads: list[int] = field(default_factory=lambda: [12, 16])
+    mlp_ratio: float = 4.0
+    num_classes: int = 1000
+    cfg_dropout_prob: float = 0.1
+    num_timestep_tokens: int = 4
+    num_mix_tokens: int = 4
+    num_class_tokens: int = 8
+    gradient_checkpointing: bool = False
+    variant: str = "DDT-B/1-DINOv3B-16x16-REPA"
+
+    @property
+    def grid_size(self) -> int:
+        return self.input_size // self.patch_size[0]
+
+    @property
+    def input_shape(self) -> tuple[int, int, int]:
+        return self.in_channels, self.input_size, self.input_size
+
+    @property
+    def model_variant(self) -> str:
+        return self.variant
+
+    def validate(self) -> None:
+        if any(len(value) != 2 for value in (self.patch_size, self.hidden_size, self.depth, self.num_heads)):
+            raise ValueError("model paired dimensions must contain two values")
+        _positive("DDT dimensions", self.input_size, *self.patch_size, self.in_channels, *self.hidden_size, *self.depth, *self.num_heads, self.mlp_ratio, self.num_classes, self.num_timestep_tokens, self.num_mix_tokens, self.num_class_tokens)
+        if any(self.input_size % patch for patch in self.patch_size):
+            raise ValueError("model input size must be divisible by both patch sizes")
+        if self.patch_size[0] != self.patch_size[1]:
+            raise ValueError("encoder and decoder patch sizes must match")
+        for width, heads in zip(self.hidden_size, self.num_heads, strict=True):
+            if width % heads or (width // heads) % 4:
+                raise ValueError("attention head dimensions must be divisible by four")
+        if not 0 <= self.cfg_dropout_prob < 1:
+            raise ValueError("model.cfg_dropout_prob must be in [0,1)")
+        if not self.variant:
+            raise ValueError("model.variant cannot be empty")
+
+
+ModelConfig = DDTConfig
+
+
+@dataclass
+class MixingConfig:
+    mode: str = "token_mix"
+    endpoint_probability: float = 0.2
+    logit_normal_loc: float = 0.0
+    logit_normal_scale: float = 1.0
+
+    def validate(self) -> None:
+        if self.mode not in {"token_mix", "target_baseline"}:
+            raise ValueError("mixing.mode must be token_mix or target_baseline")
+        if not 0 <= self.endpoint_probability <= 1:
+            raise ValueError("mixing.endpoint_probability must be in [0,1]")
+        if not math.isfinite(self.logit_normal_loc) or self.logit_normal_scale <= 0:
+            raise ValueError("mixing logit-normal parameters are invalid")
+
+
+@dataclass
+class RepaConfig:
+    layer_depth: int = 8
+    projector_width: int = 2048
+    coefficient: float = 0.5
+
+    def validate(self, model_depth: int) -> None:
+        if not 1 <= self.layer_depth <= model_depth:
+            raise ValueError("repa.layer_depth must be within the diffusion encoder")
+        _positive("REPA settings", self.projector_width, self.coefficient)
 
 
 @dataclass
@@ -185,17 +227,7 @@ class TrainConfig:
     timestep_loc: float = 0.0
     timestep_scale: float = 1.0
     timestep_shift: float = 4.0
-    velocity_denominator_floor: float = 0.05
-    base_loss_weight: float = 1.0
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
-
-
-@dataclass
-class PriorConfig:
-    """Optional frozen checkpoint used to transform Gaussian flow sources."""
-
-    checkpoint_dir: str | None = None
-    weight_source: str = "ema"
 
 
 @dataclass
@@ -205,9 +237,6 @@ class SamplingConfig:
     sampling_steps: int = 50
     solver: str = "euler"
     timestep_shift: float = 4.0
-    ig_scale: float = 1.78
-    ig_start: float = 0.1
-    ig_end: float = 1.0
     cfg_scale: float = 1.0
     cfg_start: float = 0.0
     cfg_end: float = 1.0
@@ -243,7 +272,7 @@ class CheckpointConfig:
 class WandbConfig:
     enabled: bool = False
     entity: str | None = None
-    project: str = "rae-ddt-k-exploration"
+    project: str = "dino-token-mixing-repa"
     name: str | None = None
     group: str | None = None
     tags: list[str] = field(default_factory=list)
@@ -255,12 +284,13 @@ class WandbConfig:
 class ExperimentConfig:
     schema_version: int = CONFIG_SCHEMA_VERSION
     data: DataConfig = field(default_factory=DataConfig)
-    rae: RAEConfig = field(default_factory=RAEConfig)
+    vision: VisionConfig = field(default_factory=VisionConfig)
+    decoder: PixelDecoderConfig = field(default_factory=PixelDecoderConfig)
     model: DDTConfig = field(default_factory=DDTConfig)
-    exploration: ExplorationConfig = field(default_factory=ExplorationConfig)
+    mixing: MixingConfig = field(default_factory=MixingConfig)
+    repa: RepaConfig = field(default_factory=RepaConfig)
     compile: CompileConfig = field(default_factory=CompileConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
-    prior: PriorConfig = field(default_factory=PriorConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
@@ -269,39 +299,14 @@ class ExperimentConfig:
 
     def validate(self) -> None:
         if self.schema_version != CONFIG_SCHEMA_VERSION:
-            raise ValueError(
-                f"configuration schema version {self.schema_version!r} is unsupported; "
-                f"schema_version: {CONFIG_SCHEMA_VERSION} is required (clean break)"
-            )
+            raise ValueError(f"configuration schema version {self.schema_version!r} is unsupported; schema_version: {CONFIG_SCHEMA_VERSION} is required (clean break)")
+        self.vision.validate()
+        self.decoder.validate()
         self.model.validate()
-        self.rae.validate()
-        if self.model.input_shape != (RAE_CHANNELS, RAE_INPUT_SIZE, RAE_INPUT_SIZE):
-            raise ValueError("schema-v13 experiments must consume 1024x8x8 RAE tokens")
-        if self.model.patch_size != [1, 1]:
-            raise ValueError("schema-v13 experiments require model.patch_size [1, 1]")
-        explore = self.exploration
-        for name, value in (("k_early", explore.k_early), ("k_full", explore.k_full)):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                raise ValueError(f"exploration.{name} must be a positive integer")
-        for name, chunk, candidates, active in (
-            ("early_candidate_chunk_size", explore.early_candidate_chunk_size, explore.k_total, explore.k_early > 1),
-            ("full_candidate_chunk_size", explore.full_candidate_chunk_size, explore.k_full, explore.k_full > 1),
-        ):
-            if chunk is None:
-                continue
-            if not active:
-                raise ValueError(f"exploration.{name} requires its selection stage")
-            if not isinstance(chunk, int) or isinstance(chunk, bool) or chunk < 1:
-                raise ValueError(f"exploration.{name} must be a positive integer")
-            if chunk > candidates or candidates % chunk:
-                raise ValueError(f"exploration.{name} must divide its stage candidate count")
-        if self.prior.weight_source not in {"model", "ema"}:
-            raise ValueError("prior.weight_source must be model or ema")
-        if self.prior.checkpoint_dir is not None:
-            if not self.prior.checkpoint_dir:
-                raise ValueError("prior.checkpoint_dir cannot be empty")
-            if explore.k_total != 1:
-                raise ValueError("checkpoint prior experiments require exploration K=1")
+        self.mixing.validate()
+        self.repa.validate(self.model.depth[0])
+        if self.model.input_shape != self.vision.token_shape:
+            raise ValueError("vision and diffusion token shapes must match")
         if self.train.optimizer.kind not in {"adamw", "muon", "fused_muon"}:
             raise ValueError("optimizer.kind must be adamw, muon, or fused_muon")
         if self.wandb.mode not in {"online", "offline", "disabled"}:
@@ -310,23 +315,16 @@ class ExperimentConfig:
             raise ValueError("data workers must be non-negative and prefetch_factor positive")
         if self.data.max_samples is not None and self.data.max_samples < 1:
             raise ValueError("data.max_samples must be positive")
-        if not self.data.repository or not self.data.revision or not self.data.split:
-            raise ValueError("data repository, revision, and split cannot be empty")
+        if not all((self.data.repository, self.data.revision, self.data.split, self.data.validation_split)):
+            raise ValueError("dataset provenance cannot be empty")
         _positive("training counts", self.train.epochs, self.train.global_batch_size)
         if self.train.max_steps is not None and self.train.max_steps < 1:
             raise ValueError("train.max_steps must be positive")
         if not 0 < self.train.ema_decay < 1:
-            raise ValueError("train.ema_decay must be in (0, 1)")
+            raise ValueError("train.ema_decay must be in (0,1)")
         if not math.isfinite(self.train.timestep_loc):
             raise ValueError("train.timestep_loc must be finite")
-        _positive(
-            "training flow settings",
-            self.train.timestep_scale,
-            self.train.timestep_shift,
-            self.train.velocity_denominator_floor,
-        )
-        if self.train.base_loss_weight < 0:
-            raise ValueError("train.base_loss_weight cannot be negative")
+        _positive("training flow settings", self.train.timestep_scale, self.train.timestep_shift)
         for name, value in (("validation.interval", self.validation.interval), ("checkpoint.interval", self.checkpoint.interval)):
             if value < 0:
                 raise ValueError(f"{name} cannot be negative")
@@ -345,13 +343,10 @@ class ExperimentConfig:
             raise ValueError("sampling.solver must be euler or heun")
         if s.num_samples % self.model.num_classes:
             raise ValueError("sampling.num_samples must be class balanced")
-        for name, value in (("timestep_shift", s.timestep_shift), ("ig_scale", s.ig_scale), ("cfg_scale", s.cfg_scale)):
-            if not math.isfinite(value):
-                raise ValueError(f"sampling.{name} must be finite")
-        if s.timestep_shift <= 0:
-            raise ValueError("sampling.timestep_shift must be positive")
-        if not 0 <= s.ig_start < s.ig_end <= 1:
-            raise ValueError("sampling IG interval must satisfy 0 <= start < end <= 1")
+        if not math.isfinite(s.timestep_shift) or s.timestep_shift <= 0:
+            raise ValueError("sampling.timestep_shift must be finite and positive")
+        if not math.isfinite(s.cfg_scale):
+            raise ValueError("sampling.cfg_scale must be finite")
         if not 0 <= s.cfg_start < s.cfg_end <= 1:
             raise ValueError("sampling CFG interval must satisfy 0 <= start < end <= 1")
 
@@ -363,10 +358,7 @@ def _require_current_schema(values: Any, source: str | Path) -> dict[str, Any]:
     if not isinstance(values, dict):
         raise ValueError(f"{source} must contain a configuration object")
     if values.get("schema_version") != CONFIG_SCHEMA_VERSION:
-        raise ValueError(
-            f"{source} uses unsupported configuration schema {values.get('schema_version')!r}; "
-            f"schema_version: {CONFIG_SCHEMA_VERSION} is required"
-        )
+        raise ValueError(f"{source} uses unsupported configuration schema {values.get('schema_version')!r}; schema_version: {CONFIG_SCHEMA_VERSION} is required")
     return values
 
 

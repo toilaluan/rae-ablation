@@ -1,0 +1,10 @@
+schema_version: 14
+mixing:
+  mode: target_baseline
+  endpoint_probability: 1.0
+  logit_normal_loc: 0.0
+  logit_normal_scale: 1.0
+wandb:
+  name: r1-baseline
+  group: dino-token-mixing-ablation
+  tags: [dinov3, r1-baseline, repa]
