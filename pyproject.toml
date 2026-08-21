@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "jit-reg"
 version = "0.1.0"
-description = "DINOv3 token-space diffusion with token mixing and REPA"
+description = "DINOv3 token-space diffusion with a semantic waypoint and REPA"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

@@ -6,12 +6,26 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .config import MixingConfig
+from .config import WaypointConfig
+
+SEMANTIC_STAGE = 0
+TARGET_STAGE = 1
+
+
+class WaypointPath(NamedTuple):
+    noisy: Tensor
+    clean: Tensor
+    velocity: Tensor
+    timestep: Tensor
+    stage: Tensor
+    pooled_semantic: Tensor
+    waypoint: Tensor
 
 
 class DiffusionLoss(NamedTuple):
     total: Tensor
-    velocity: Tensor
+    full_velocity: Tensor
+    base_velocity: Tensor
     repa: Tensor
     cosine_similarity: Tensor
 
@@ -48,25 +62,22 @@ def sample_timesteps(
     return shift_timestep(unshifted, shift)
 
 
-def sample_mix_ratio(
+def sample_stages(
     batch_size: int,
     generator: torch.Generator,
     device: torch.device | str,
-    config: MixingConfig,
+    semantic_probability: float,
 ) -> Tensor:
-    if config.mode == "target_baseline":
-        return torch.ones(batch_size, device=device, dtype=torch.float32)
-    continuous = sample_normal(
-        batch_size,
-        generator,
-        device,
-        loc=config.logit_normal_loc,
-        scale=config.logit_normal_scale,
-    ).sigmoid()
-    endpoint = torch.rand(
+    if not 0 < semantic_probability < 1:
+        raise ValueError("semantic stage probability must be in (0,1)")
+    semantic = torch.rand(
         batch_size, generator=generator, device=device, dtype=torch.float32
-    ) < config.endpoint_probability
-    return torch.where(endpoint, torch.ones_like(continuous), continuous)
+    ) < semantic_probability
+    return torch.where(
+        semantic,
+        torch.full_like(semantic, SEMANTIC_STAGE, dtype=torch.long),
+        torch.full_like(semantic, TARGET_STAGE, dtype=torch.long),
+    )
 
 
 def _expand(value: Tensor, like: Tensor) -> Tensor:
@@ -76,24 +87,92 @@ def _expand(value: Tensor, like: Tensor) -> Tensor:
     return result
 
 
-def mix_endpoints(semantic: Tensor, target: Tensor, ratio: Tensor) -> Tensor:
-    if semantic.shape != target.shape or ratio.shape != (target.shape[0],):
-        raise ValueError("endpoint tensors or mix ratio have incompatible shapes")
-    r = _expand(ratio, target)
-    return semantic.float() * (1 - r) + target.float() * r
+def pool_semantic(semantic: Tensor, config: WaypointConfig) -> Tensor:
+    if semantic.ndim != 4 or semantic.shape[-1] != semantic.shape[-2]:
+        raise ValueError("semantic tokens must have square [B,C,H,W] shape")
+    if semantic.shape[-1] % config.pool_size:
+        raise ValueError("semantic token grid must be divisible by waypoint pool size")
+    side = semantic.shape[-1]
+    pooled_side = side // config.pool_size
+    down_kwargs: dict[str, object] = {}
+    if config.downsample_mode == "bilinear":
+        down_kwargs["align_corners"] = config.align_corners
+    pooled = F.interpolate(
+        semantic.float(),
+        size=(pooled_side, pooled_side),
+        mode=config.downsample_mode,
+        **down_kwargs,
+    )
+    up_kwargs: dict[str, object] = {}
+    if config.upsample_mode == "bilinear":
+        up_kwargs["align_corners"] = config.align_corners
+    return F.interpolate(
+        pooled,
+        size=(side, side),
+        mode=config.upsample_mode,
+        **up_kwargs,
+    )
 
 
-def noisy_interpolate(clean: Tensor, noise: Tensor, timestep: Tensor) -> Tensor:
-    if clean.shape != noise.shape:
-        raise ValueError("clean data and noise shapes must match")
-    t = _expand(timestep, clean)
-    return (1 - t) * clean.float() + t * noise.float()
+def waypoint_path(
+    target: Tensor,
+    semantic: Tensor,
+    noise: Tensor,
+    local_timestep: Tensor,
+    stage: Tensor,
+    config: WaypointConfig,
+) -> WaypointPath:
+    if target.shape != semantic.shape or target.shape != noise.shape:
+        raise ValueError("target, semantic, and noise shapes must match")
+    batch = target.shape[0]
+    if local_timestep.shape != (batch,) or stage.shape != (batch,):
+        raise ValueError("local timestep and stage must have shape [B]")
+    if torch.any((local_timestep < 0) | (local_timestep > 1)):
+        raise ValueError("local timesteps must be in [0,1]")
+
+    pooled_semantic = pool_semantic(semantic, config)
+    tau = float(config.time)
+    waypoint = (1 - tau) * pooled_semantic + tau * noise.float()
+    is_semantic = stage == SEMANTIC_STAGE
+    timestep = torch.where(
+        is_semantic,
+        tau + (1 - tau) * local_timestep.float(),
+        tau * local_timestep.float(),
+    )
+    t = _expand(timestep, target)
+    target_mix = t / tau
+    semantic_noisy = (1 - t) * pooled_semantic + t * noise.float()
+    target_noisy = (1 - target_mix) * target.float() + target_mix * waypoint
+    mask = _expand(is_semantic, target).bool()
+    noisy = torch.where(mask, semantic_noisy, target_noisy)
+    clean = torch.where(mask, pooled_semantic, target.float())
+    semantic_velocity = noise.float() - pooled_semantic
+    target_velocity = (waypoint - target.float()) / tau
+    velocity = torch.where(mask, semantic_velocity, target_velocity)
+    return WaypointPath(
+        noisy,
+        clean,
+        velocity,
+        timestep,
+        stage.to(torch.long),
+        pooled_semantic,
+        waypoint,
+    )
 
 
-def target_velocity(clean: Tensor, noise: Tensor) -> Tensor:
-    if clean.shape != noise.shape:
-        raise ValueError("clean data and noise shapes must match")
-    return noise.float() - clean.float()
+def x_to_velocity(
+    noisy: Tensor,
+    x_prediction: Tensor,
+    timestep: Tensor,
+    floor: float = 0.05,
+) -> Tensor:
+    if noisy.shape != x_prediction.shape:
+        raise ValueError("noisy data and x-prediction shapes must match")
+    if floor <= 0:
+        raise ValueError("velocity denominator floor must be positive")
+    return (noisy.float() - x_prediction.float()) / _expand(
+        timestep.float().clamp_min(floor), noisy
+    )
 
 
 def repa_cosine_loss(projection: Tensor, semantic: Tensor) -> tuple[Tensor, Tensor]:
@@ -109,18 +188,30 @@ def repa_cosine_loss(projection: Tensor, semantic: Tensor) -> tuple[Tensor, Tens
 
 
 def diffusion_losses(
-    clean: Tensor,
-    noise: Tensor,
-    prediction: Tensor,
+    noisy: Tensor,
+    velocity_target: Tensor,
+    timestep: Tensor,
+    full_prediction: Tensor,
+    base_prediction: Tensor,
     projection: Tensor,
     semantic: Tensor,
     *,
+    base_loss_weight: float = 1.0,
     repa_coefficient: float = 0.5,
+    velocity_denominator_floor: float = 0.05,
 ) -> DiffusionLoss:
-    if prediction.shape != clean.shape:
-        raise ValueError("velocity prediction and clean data shapes must match")
-    if repa_coefficient < 0:
-        raise ValueError("REPA coefficient cannot be negative")
-    velocity = F.mse_loss(prediction.float(), target_velocity(clean, noise))
+    if velocity_target.shape != noisy.shape:
+        raise ValueError("velocity target and noisy data shapes must match")
+    if base_loss_weight < 0 or repa_coefficient < 0:
+        raise ValueError("loss coefficients cannot be negative")
+    full = F.mse_loss(
+        x_to_velocity(noisy, full_prediction, timestep, velocity_denominator_floor),
+        velocity_target.float(),
+    )
+    base = F.mse_loss(
+        x_to_velocity(noisy, base_prediction, timestep, velocity_denominator_floor),
+        velocity_target.float(),
+    )
     repa, similarity = repa_cosine_loss(projection, semantic)
-    return DiffusionLoss(velocity + repa_coefficient * repa, velocity, repa, similarity)
+    total = full + base_loss_weight * base + repa_coefficient * repa
+    return DiffusionLoss(total, full, base, repa, similarity)

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from typing import Any
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from jit_reg.config import (
     CONFIG_SCHEMA_VERSION,
@@ -24,65 +26,113 @@ def tiny_config() -> DDTConfig:
         depth=[3, 1],
         num_heads=[4, 4],
         mlp_ratio=2,
+        base_model_depth=1,
         num_classes=3,
         num_timestep_tokens=2,
-        num_mix_tokens=2,
+        num_stage_tokens=2,
         num_class_tokens=2,
         variant="DDT-Tiny",
     )
 
 
-def test_schema_v14_defaults_and_matched_presets() -> None:
+def _paths(value: Any, prefix: str = "") -> set[str]:
+    if isinstance(value, dict):
+        result: set[str] = set()
+        for key, child in value.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            result |= _paths(child, path)
+        return result
+    return {prefix}
+
+
+def test_schema_v15_defaults_and_single_complete_preset() -> None:
     config = ExperimentConfig()
     config.validate()
-    assert config.schema_version == CONFIG_SCHEMA_VERSION == 14
+    assert config.schema_version == CONFIG_SCHEMA_VERSION == 15
     assert config.vision.token_shape == (768, 8, 8)
     assert config.model.input_shape == config.vision.token_shape
-    assert config.vision.target_layer == 2
-    assert config.vision.semantic_layer == 12
-    assert config.vision.statistics_path == "data/dino-shared-statistics.safetensors"
-    assert config.model.hidden_size == [384, 1536]
-    assert config.model.num_heads == [6, 16]
-    assert config.train.optimizer.kind == "adamw"
-    assert config.sampling.timestep_shift == 1.0
+    assert config.model.base_model_depth == 4
+    assert config.model.num_stage_tokens == 4
+    assert config.waypoint.time == 0.5
+    assert config.waypoint.pool_size == 2
+    assert config.sampling.semantic_steps == 10
+    assert config.sampling.target_steps == 40
+    assert config.sampling.ig_scale == 1.78
     assert config.repa == RepaConfig(layer_depth=8, projector_width=2048, coefficient=0.5)
-    token_mix = load_config("configs/dino-tokenmix.yaml")
-    baseline = load_config("configs/dino-r1-baseline.yaml")
-    assert token_mix.mixing.mode == "token_mix"
-    assert baseline.mixing.mode == "target_baseline"
-    assert baseline.vision == token_mix.vision
-    assert baseline.decoder == token_mix.decoder
-    assert baseline.model == token_mix.model
-    assert baseline.train == token_mix.train
-    assert baseline.sampling == token_mix.sampling
+
+    preset = load_config("configs/dino-waypoint.yaml")
+    raw = OmegaConf.to_container(
+        OmegaConf.load("configs/dino-waypoint.yaml"), resolve=True
+    )
+    assert isinstance(raw, dict)
+    assert _paths(raw) == _paths(preset.as_dict())
 
 
 def test_old_and_unknown_configuration_are_rejected(tmp_path) -> None:
     old = tmp_path / "old.yaml"
-    old.write_text("schema_version: 13\n")
-    with pytest.raises(ValueError, match="schema_version: 14"):
+    old.write_text("schema_version: 14\n")
+    with pytest.raises(ValueError, match="schema_version: 15"):
         load_config(old)
     current = tmp_path / "current.yaml"
-    current.write_text("schema_version: 14\nunknown: true\n")
-    with pytest.raises(ValueError, match="schema-v14"):
+    current.write_text("schema_version: 15\nunknown: true\n")
+    with pytest.raises(ValueError, match="schema-v15"):
         load_config(current)
 
 
-def test_ddt_direct_velocity_repa_shapes_and_zero_head() -> None:
+def test_waypoint_and_base_depth_validation() -> None:
+    config = ExperimentConfig()
+    config.waypoint.pool_size = 3
+    with pytest.raises(ValueError, match="divide"):
+        config.validate()
+    config = tiny_config()
+    config.base_model_depth = 4
+    with pytest.raises(ValueError, match="encoder depth"):
+        config.validate()
+
+
+def test_ddt_dual_prediction_repa_shapes_and_zero_heads() -> None:
     model = DDT(tiny_config(), RepaConfig(layer_depth=2, projector_width=24))
     x = torch.randn(2, 4, 2, 2)
     timestep = torch.tensor([0.2, 0.7])
-    ratio = torch.tensor([0.4, 1.0])
+    stage = torch.tensor([0, 1])
     labels = torch.tensor([1, 2])
-    output = model(x, timestep, ratio, labels)
-    assert output.velocity.shape == x.shape
+    output = model(x, timestep, stage, labels)
+    assert output.full_prediction.shape == x.shape
+    assert output.base_prediction.shape == x.shape
     assert output.repa_projection.shape == (2, 4, 4)
-    assert torch.count_nonzero(output.velocity) == 0
-    assert torch.equal(output.velocity, model.forward_velocity(x, timestep, ratio, labels))
-    assert all(
-        torch.count_nonzero(block.modulation[-1].weight) == 0
-        for block in model.decoder_blocks
+    assert torch.count_nonzero(output.full_prediction) == 0
+    assert torch.count_nonzero(output.base_prediction) == 0
+    assert torch.equal(
+        output.full_prediction,
+        model.forward_full_prediction(x, timestep, stage, labels),
     )
+    assert torch.equal(
+        output.base_prediction,
+        model.forward_base_prediction(x, timestep, stage, labels),
+    )
+    predictions = model.forward_predictions(x, timestep, stage, labels)
+    assert torch.equal(output.full_prediction, predictions.full_prediction)
+    assert torch.equal(output.base_prediction, predictions.base_prediction)
+
+
+def test_base_prediction_isolated_after_configured_depth() -> None:
+    model = DDT(tiny_config(), RepaConfig(layer_depth=2, projector_width=24))
+    with torch.no_grad():
+        model.base_head.projection.weight.normal_()
+    args = (
+        torch.randn(2, 4, 2, 2),
+        torch.rand(2),
+        torch.tensor([0, 1]),
+        torch.tensor([1, 2]),
+    )
+    before = model.forward_base_prediction(*args)
+    with torch.no_grad():
+        for block in model.encoder_blocks[model.config.base_model_depth :]:
+            for parameter in block.parameters():
+                parameter.add_(torch.randn_like(parameter))
+        for parameter in model.decoder_blocks.parameters():
+            parameter.add_(torch.randn_like(parameter))
+    assert torch.equal(before, model.forward_base_prediction(*args))
 
 
 def test_repa_loss_backpropagates_to_selected_encoder_depth() -> None:
@@ -90,7 +140,7 @@ def test_repa_loss_backpropagates_to_selected_encoder_depth() -> None:
     projection = model(
         torch.randn(2, 4, 2, 2),
         torch.rand(2),
-        torch.rand(2),
+        torch.tensor([0, 1]),
         torch.tensor([1, 2]),
     ).repa_projection
     projection.square().mean().backward()
@@ -107,13 +157,14 @@ def test_gradient_checkpointing_matches_uncheckpointed_execution() -> None:
     first = DDT(tiny_config(), RepaConfig(layer_depth=2, projector_width=24))
     with torch.no_grad():
         first.full_head.projection.weight.normal_()
+        first.base_head.projection.weight.normal_()
     second = DDT(deepcopy(tiny_config()), RepaConfig(layer_depth=2, projector_width=24))
     second.load_state_dict(first.state_dict())
     second.set_gradient_checkpointing(True)
     args = (
         torch.randn(2, 4, 2, 2),
         torch.rand(2),
-        torch.rand(2),
+        torch.tensor([0, 1]),
         torch.tensor([1, 2]),
     )
     first_loss = sum(value.sum() for value in first(*args))
@@ -128,15 +179,14 @@ def test_gradient_checkpointing_matches_uncheckpointed_execution() -> None:
 
 
 def test_ddt_supports_fullgraph_compilation() -> None:
-    model = DDT(
-        tiny_config(), RepaConfig(layer_depth=2, projector_width=24)
-    ).eval()
+    model = DDT(tiny_config(), RepaConfig(layer_depth=2, projector_width=24)).eval()
     compiled = torch.compile(model, backend="eager", fullgraph=True)
     output = compiled(
         torch.randn(1, 4, 2, 2),
         torch.rand(1),
-        torch.rand(1),
+        torch.tensor([0]),
         torch.tensor([1]),
     )
-    assert output.velocity.shape == (1, 4, 2, 2)
+    assert output.full_prediction.shape == (1, 4, 2, 2)
+    assert output.base_prediction.shape == (1, 4, 2, 2)
     assert output.repa_projection.shape == (1, 4, 4)

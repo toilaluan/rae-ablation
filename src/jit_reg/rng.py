@@ -15,7 +15,7 @@ class RNGStreams:
     initialization: torch.Generator
     timesteps: torch.Generator
     noise: torch.Generator
-    mixing: torch.Generator
+    stage: torch.Generator
     label_dropout: torch.Generator
 
     @classmethod
@@ -25,14 +25,14 @@ class RNGStreams:
         initialization = torch.Generator(device="cpu").manual_seed(seed + offsets[1])
         timesteps = torch.Generator(device=device).manual_seed(seed + offsets[2])
         noise = torch.Generator(device=device).manual_seed(seed + offsets[3])
-        mixing = torch.Generator(device=device).manual_seed(seed + offsets[4])
+        stage = torch.Generator(device=device).manual_seed(seed + offsets[4])
         label_dropout = torch.Generator(device=device).manual_seed(seed + offsets[5])
         return cls(
             shuffle,
             initialization,
             timesteps,
             noise,
-            mixing,
+            stage,
             label_dropout,
         )
 
@@ -42,7 +42,7 @@ class RNGStreams:
             "initialization": self.initialization.get_state(),
             "timesteps": self.timesteps.get_state(),
             "noise": self.noise.get_state(),
-            "mixing": self.mixing.get_state(),
+            "stage": self.stage.get_state(),
             "label_dropout": self.label_dropout.get_state(),
         }
 
@@ -50,7 +50,7 @@ class RNGStreams:
         expected = set(self.state_dict())
         if set(state) != expected:
             raise ValueError(
-                "checkpoint RNG streams are incompatible with schema v14; "
+                "checkpoint RNG streams are incompatible with schema v15; "
                 f"expected {sorted(expected)}"
             )
         for name, value in state.items():

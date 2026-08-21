@@ -1,105 +1,104 @@
-# DINOv3 token-mixing diffusion
+# DINOv3 semantic-waypoint diffusion
 
-This repository trains an ImageNet-128 diffusion transformer directly in a frozen
-DINOv3-B/16 feature space. The previous RAE, checkpoint prior, internal-guidance
-head, K-exploration, and persistent token cache have been removed.
+This repository trains an ImageNet-128 diffusion transformer in frozen DINOv3-B/16
+feature space. It uses one schema-v15 configuration, `configs/dino-waypoint.yaml`.
 
-The default pipeline extracts two endpoints in one online DINO traversal:
+The frozen encoder extracts two independently normalized 768x8x8 endpoints in one traversal:
 
-- target: block 2 patch tokens;
-- semantic: final block 12 patch tokens;
-- normalization: the same frozen DINO final LayerNorm and shared dataset-wide
-  per-channel affine transform are applied to both endpoints;
-- token layout: CLS and four register tokens are removed, leaving `768x8x8`.
+- target `T`: block-2 patch tokens, decoded to RGB by the trained pixel decoder;
+- semantic: final block-12 patch tokens, also used unpooled by REPA;
+- waypoint `S`: block-12 tokens area-pooled to 4x4 and bilinearly restored to 8x8.
 
-## Stages
+## Piecewise flow
 
-Install the environment, then generate the shared latent statistics once. The command
-pools block-2 and block-12 patch tokens over the configured training split and writes
-the file configured by `vision.statistics_path`:
+With waypoint time `tau=0.5` and full-resolution Gaussian noise `epsilon`:
+
+```text
+M = (1 - tau) * S + tau * epsilon
+epsilon -> M -> T
+```
+
+Training samples semantic and target legs equally. A shifted logit-normal local time
+`u` is mapped to the active global interval:
+
+```text
+semantic: t = tau + (1 - tau) * u
+          xt = (1 - t) * S + t * epsilon
+          clean prediction target = S
+
+target:   t = tau * u
+          xt = (1 - t/tau) * T + (t/tau) * M
+          clean prediction target = T
+```
+
+The shallow base head exits after encoder block 4; the full head uses the complete
+DDT. Both predict the active clean endpoint. Their predictions are converted to
+velocity with `(xt - prediction) / max(t, 0.05)`. REPA aligns encoder block 8 with
+the original unpooled block-12 features.
+
+Sampling applies internal guidance in clean-prediction space, then CFG, then velocity
+conversion. The default trajectory uses 10 semantic steps from `1 -> 0.5` and 40
+target steps from `0.5 -> 0`. Euler therefore uses 50 NFE; Heun uses 99 NFE.
+
+## Setup and latent statistics
 
 ```bash
 uv sync --extra dev
 torchrun --standalone --nproc-per-node=8 scripts/generate_latent_statistics.py \
-  --config configs/dino-tokenmix.yaml
+  --config configs/dino-waypoint.yaml
 ```
 
-The statistics file records its dataset and DINO fingerprints. Training rejects a
-file generated with different source data, preprocessing, or encoder weights.
-For channel `c`, both endpoints use `z'[c] = (z[c] - mean[c]) / std[c]`; the mean
-and population standard deviation are pooled across both endpoints, all training
-images, and all patch positions.
+Statistics contain separate per-channel mean/std vectors for block-2 target tokens and
+block-12 semantic tokens. Shared-normalization statistics and decoders trained against
+them are incompatible; regenerate the statistics and retrain the pixel decoder.
 
-Then train the transformer pixel decoder:
+Train a decoder if one is not already available:
 
 ```bash
 torchrun --standalone --nproc-per-node=8 scripts/train_decoder.py \
-  --config configs/dino-tokenmix.yaml \
+  --config configs/dino-waypoint.yaml \
   --output runs/pixel-decoder
 ```
 
-The decoder maps normalized block-2 tokens to RGB using an eight-block transformer.
-Its objective is L1 + LPIPS, with an optional spectral-normalized PatchGAN that starts
-after `decoder.loss.gan_start_fraction` of training. Checkpoints contain raw and EMA
-decoder weights, discriminator state, optimizer state, provenance, and previews.
+## Optional paired endpoint cache
 
-Point `decoder.checkpoint` at the decoder run (or a specific checkpoint), then train
-diffusion:
+The cache stores normalized BF16 target and original unpooled semantic tensors. A
+full ImageNet cache requires about 235 GiB before filesystem overhead. Build it after
+the latent statistics:
+
+```bash
+torchrun --standalone --nproc-per-node=8 scripts/cache_endpoints.py \
+  --config configs/dino-waypoint.yaml
+```
+
+Enable cache-backed training with `vision.cache.enabled=true`. Training then loads
+labels and stable indices only; it does not read RGB or instantiate DINO. Missing,
+incomplete, or fingerprint-mismatched caches are rejected rather than falling back
+online.
+
+## Diffusion training and sampling
 
 ```bash
 torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/dino-tokenmix.yaml \
+  --config configs/dino-waypoint.yaml \
   --override decoder.checkpoint=runs/pixel-decoder/checkpoints/last \
-  --output runs/tokenmix-seed0
-```
+  --override vision.cache.enabled=true \
+  --output runs/semantic-waypoint-seed0
 
-For each image, training samples `r` from a logit-normal distribution, with a 0.2
-atom at `r=1`, and constructs:
-
-```text
-x0 = (1 - r) * final_tokens + r * block2_tokens
-xt = (1 - t) * x0 + t * noise
-velocity target = noise - x0
-```
-
-The model is explicitly conditioned on `t`, `r`, and the class label. REPA aligns
-diffusion encoder block 8 with final DINO tokens through a
-`768 -> 2048 -> 2048 -> 768` projector at coefficient 0.5. Sampling fixes `r=1`
-and supports ordinary classifier-free guidance.
-
-## Matched baseline
-
-Run the baseline with the same decoder checkpoint, seed, data, model, optimizer,
-REPA loss, validation plan, and sampling settings:
-
-```bash
-torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/dino-r1-baseline.yaml \
-  --override decoder.checkpoint=runs/pixel-decoder/checkpoints/last \
-  --output runs/r1-baseline-seed0
-```
-
-The only intended experimental difference is `mixing.mode=target_baseline`, which
-sets every training example to `r=1`.
-
-## Sampling and evaluation
-
-```bash
 torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --checkpoint-dir runs/tokenmix-seed0/checkpoints/last \
+  --checkpoint-dir runs/semantic-waypoint-seed0/checkpoints/last \
+  --semantic-steps 10 \
+  --target-steps 40 \
   --evaluate
 ```
 
-Sampling is deterministic from the saved class-balanced validation plan, resumable,
-and emits an ADM-compatible NPZ, preview grid, manifest, and optional FID result.
-Training and decoder training retain console logs, W&B metrics and image grids,
-EMA weights, resumable optimizer/RNG state, provenance validation, and optional W&B
-checkpoint artifacts.
+The single YAML explicitly lists every supported option, including online/cache
+selection, pooling, waypoint timing, dual-head loss, IG, CFG, compilation, validation,
+evaluation, checkpointing, and W&B settings.
 
-## Efficiency ablation
+## Verification
 
-Measure convergence against the matched DINO `r=1` baseline first. A FLUX.2 VAE
-experiment is useful as phase two: it tests whether token mixing helps beyond a
-semantic foundation-model space, but VAE latents do not naturally provide the two
-semantically ordered endpoints used here. Define a comparable second endpoint and
-hold decoder/model compute fixed before interpreting it as an efficiency result.
+```bash
+uv run --extra dev pytest -q
+uv run --extra dev ruff check .
+```

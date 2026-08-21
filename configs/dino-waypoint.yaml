@@ -1,4 +1,4 @@
-schema_version: 14
+schema_version: 15
 
 data:
   repository: benjamin-paine/imagenet-1k-256x256
@@ -7,6 +7,7 @@ data:
   validation_split: validation
   workers: 16
   prefetch_factor: 4
+  max_samples: null
 
 vision:
   repository: facebook/dinov3-vitb16-pretrain-lvd1689m
@@ -17,13 +18,18 @@ vision:
   patch_size: 16
   hidden_size: 768
   num_register_tokens: 4
-  statistics_path: data/dino-shared-statistics.safetensors
+  statistics_path: data/dino-endpoint-statistics.safetensors
   compile:
     enabled: true
     backend: inductor
     mode: default
     fullgraph: true
     dynamic: false
+  cache:
+    enabled: false
+    directory: data/dino-endpoints
+    batch_size: 128
+    log_interval: 10
 
 decoder:
   checkpoint: null
@@ -42,6 +48,7 @@ decoder:
   train:
     epochs: 40
     global_batch_size: 1024
+    max_steps: null
     lr: 0.0002
     min_lr: 0.00002
     grad_clip: 1.0
@@ -59,34 +66,47 @@ model:
   depth: [12, 2]
   num_heads: [6, 16]
   mlp_ratio: 4.0
+  base_model_depth: 4
   num_classes: 1000
   cfg_dropout_prob: 0.1
   num_timestep_tokens: 4
-  num_mix_tokens: 4
+  num_stage_tokens: 4
   num_class_tokens: 8
   gradient_checkpointing: false
-  variant: DDT-B/1-DINOv3B-8x8-REPA
+  variant: DDT-B/1-DINOv3B-8x8-Waypoint-IG-REPA
 
-mixing:
-  mode: token_mix
-  endpoint_probability: 0.2
-  logit_normal_loc: 0.0
-  logit_normal_scale: 1.0
+waypoint:
+  time: 0.5
+  pool_size: 2
+  downsample_mode: area
+  upsample_mode: bilinear
+  align_corners: false
+  semantic_stage_probability: 0.5
 
 repa:
   layer_depth: 8
   projector_width: 2048
   coefficient: 0.5
 
+compile:
+  enabled: true
+  backend: inductor
+  mode: default
+  fullgraph: true
+  dynamic: false
+
 train:
   epochs: 80
   global_batch_size: 1024
+  max_steps: null
   grad_clip: 1.0
   ema_decay: 0.9995
   seed: 0
   timestep_loc: 0.0
   timestep_scale: 1.0
   timestep_shift: 4.0
+  velocity_denominator_floor: 0.05
+  base_loss_weight: 1.0
   optimizer:
     kind: adamw
     lr: 0.0002
@@ -98,12 +118,22 @@ train:
 sampling:
   num_samples: 50000
   batch_size: 32
-  sampling_steps: 50
+  semantic_steps: 10
+  target_steps: 40
   solver: euler
   timestep_shift: 1.0
+  ig_scale: 1.78
+  ig_start: 0.1
+  ig_end: 1.0
   cfg_scale: 1.0
   cfg_start: 0.0
   cfg_end: 1.0
+  log_interval: 10
+
+evaluation:
+  reference_npz: data/VIRTUAL_imagenet128_labeled.npz
+  batch_size: 32
+  device: auto
   log_interval: 10
 
 validation:
@@ -121,7 +151,10 @@ checkpoint:
 
 wandb:
   enabled: false
-  project: dino-token-mixing-repa
-  tags: [dinov3, token-mixing, repa]
+  entity: null
+  project: dino-semantic-waypoint-repa
+  name: semantic-waypoint
+  group: null
+  tags: [dinov3, semantic-waypoint, repa, internal-guidance]
   mode: online
   checkpoint_artifacts: false

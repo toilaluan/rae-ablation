@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from jit_reg.config import IMAGE_SIZE, VisionConfig
-from jit_reg.latent_statistics import LatentStatistics, SharedLatentNormalizer
+from jit_reg.latent_statistics import EndpointLatentNormalizer, LatentStatistics
 from jit_reg.vision import DINOEndpointEncoder
 
 
@@ -65,10 +65,12 @@ def test_target_only_encoder_stops_at_target_layer() -> None:
     assert torch.all(target == sum(range(1, 3)))
 
 
-def test_dino_applies_one_shared_normalizer_to_both_endpoints() -> None:
+def test_dino_applies_separate_normalizers_to_endpoints() -> None:
     statistics = LatentStatistics(
-        mean=torch.ones(768),
-        std=torch.full((768,), 2.0),
+        target_mean=torch.ones(768),
+        target_std=torch.full((768,), 2.0),
+        semantic_mean=torch.full((768,), 10.0),
+        semantic_std=torch.full((768,), 4.0),
         count=2,
         vision_fingerprint="vision",
         data_fingerprint="data",
@@ -76,8 +78,29 @@ def test_dino_applies_one_shared_normalizer_to_both_endpoints() -> None:
     encoder = DINOEndpointEncoder(
         FakeDINO(),
         VisionConfig(),
-        normalizer=SharedLatentNormalizer(statistics),
+        normalizer=EndpointLatentNormalizer(statistics),
     )
     target, semantic = encoder.encode_pair(torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE))
     assert torch.all(target == (sum(range(1, 3)) - 1) / 2)
-    assert torch.all(semantic == (sum(range(1, 13)) - 1) / 2)
+    assert torch.all(semantic == (sum(range(1, 13)) - 10) / 4)
+
+
+def test_target_only_encoder_uses_target_normalization_for_both_outputs() -> None:
+    statistics = LatentStatistics(
+        target_mean=torch.ones(768),
+        target_std=torch.full((768,), 2.0),
+        semantic_mean=torch.full((768,), 10.0),
+        semantic_std=torch.full((768,), 4.0),
+        count=2,
+        vision_fingerprint="vision",
+        data_fingerprint="data",
+    )
+    encoder = DINOEndpointEncoder(
+        FakeDINO(),
+        VisionConfig(),
+        include_semantic=False,
+        normalizer=EndpointLatentNormalizer(statistics),
+    )
+    target, duplicate = encoder(torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE))
+    assert torch.equal(target, duplicate)
+    assert torch.all(target == (sum(range(1, 3)) - 1) / 2)

@@ -16,7 +16,7 @@ from jit_reg.decoder_training import (
 )
 from jit_reg.distributed import initialize_distributed
 from jit_reg.latent_statistics import (
-    SharedLatentNormalizer,
+    EndpointLatentNormalizer,
     latent_statistics_sha256,
     load_latent_statistics,
 )
@@ -32,7 +32,7 @@ from jit_reg.wandb_utils import RunLogger
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the DINO target-token pixel decoder")
-    parser.add_argument("--config", type=Path, default=Path("configs/dino-tokenmix.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/dino-waypoint.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path, default=Path("decoder-runs/default"))
     parser.add_argument("--resume", type=Path)
@@ -61,7 +61,7 @@ def main() -> None:
         config.vision,
         device,
         include_semantic=False,
-        normalizer=SharedLatentNormalizer(statistics),
+        normalizer=EndpointLatentNormalizer(statistics),
     )
     objective = ReconstructionObjective(config.decoder).to(device)
     generator_optimizer = torch.optim.AdamW(

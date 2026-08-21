@@ -20,9 +20,9 @@ from jit_reg.vision import load_dino_encoder, vision_fingerprint
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Compute shared per-channel statistics over target and semantic DINO tokens"
+        description="Compute separate per-channel target and semantic DINO statistics"
     )
-    parser.add_argument("--config", type=Path, default=Path("configs/dino-tokenmix.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/dino-waypoint.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--batch-size", type=int, default=32, help="batch size per process")
@@ -73,11 +73,12 @@ def main() -> None:
             )
     accumulator.all_reduce()
 
-    expected_count = len(dataset) * 2 * config.vision.grid_size**2
-    if int(accumulator.count.item()) != expected_count:
+    expected_count = len(dataset) * config.vision.grid_size**2
+    if not torch.all(accumulator.count == expected_count):
         raise RuntimeError(
-            f"statistics observation count mismatch: {int(accumulator.count.item())} "
-            f"!= {expected_count}"
+            "statistics observation count mismatch: "
+            f"target={int(accumulator.count[0].item())}, "
+            f"semantic={int(accumulator.count[1].item())}, expected={expected_count}"
         )
     if rank == 0:
         statistics = accumulator.finalize(
@@ -86,7 +87,7 @@ def main() -> None:
         )
         save_latent_statistics(statistics, output)
         print(
-            f"saved {output}: observations={statistics.count}, "
+            f"saved {output}: observations_per_endpoint={statistics.count}, "
             f"channels={statistics.channels}, sha256={latent_statistics_sha256(output)}",
             flush=True,
         )

@@ -3,73 +3,99 @@ from __future__ import annotations
 import pytest
 import torch
 
-from jit_reg.config import MixingConfig
+from jit_reg.config import WaypointConfig
 from jit_reg.objective import (
+    SEMANTIC_STAGE,
+    TARGET_STAGE,
     diffusion_losses,
-    mix_endpoints,
-    noisy_interpolate,
-    sample_mix_ratio,
+    pool_semantic,
+    sample_stages,
     sample_timesteps,
     shift_timestep,
-    target_velocity,
+    waypoint_path,
+    x_to_velocity,
 )
 
 
-def test_flow_math_and_direct_velocity_loss() -> None:
+def test_semantic_pooling_is_four_by_four_then_restored() -> None:
+    semantic = torch.arange(64, dtype=torch.float32).reshape(1, 1, 8, 8)
+    restored = pool_semantic(semantic, WaypointConfig())
+    pooled = torch.nn.functional.interpolate(semantic, size=(4, 4), mode="area")
+    expected = torch.nn.functional.interpolate(
+        pooled, size=(8, 8), mode="bilinear", align_corners=False
+    )
+    assert restored.shape == semantic.shape
+    assert torch.equal(restored, expected)
+
+
+def test_piecewise_path_endpoints_continuity_and_velocities() -> None:
+    config = WaypointConfig(time=0.5, pool_size=2)
+    target = torch.full((2, 1, 2, 2), 10.0)
+    semantic = torch.tensor(
+        [[[[0.0, 2.0], [4.0, 6.0]]], [[[2.0, 4.0], [6.0, 8.0]]]]
+    )
+    noise = torch.full_like(target, -2.0)
+    stages = torch.tensor([SEMANTIC_STAGE, TARGET_STAGE])
+    path = waypoint_path(
+        target,
+        semantic,
+        noise,
+        torch.tensor([0.0, 1.0]),
+        stages,
+        config,
+    )
+    # Both examples are exactly at the shared noisy semantic waypoint.
+    assert torch.equal(path.noisy, path.waypoint)
+    assert path.timestep.tolist() == [0.5, 0.5]
+    assert torch.equal(path.clean[0], path.pooled_semantic[0])
+    assert torch.equal(path.clean[1], target[1])
+    assert torch.equal(path.velocity[0], noise[0] - path.pooled_semantic[0])
+    assert torch.equal(path.velocity[1], (path.waypoint[1] - target[1]) / 0.5)
+
+    endpoints = waypoint_path(
+        target,
+        semantic,
+        noise,
+        torch.tensor([1.0, 0.0]),
+        stages,
+        config,
+    )
+    assert torch.equal(endpoints.noisy[0], noise[0])
+    assert torch.equal(endpoints.noisy[1], target[1])
+
+
+def test_x_prediction_velocity_and_weighted_losses() -> None:
+    noisy = torch.tensor([[[[1.25]]]])
     clean = torch.tensor([[[[2.0]]]])
-    noise = torch.tensor([[[[-1.0]]]])
+    target_velocity = torch.tensor([[[[-3.0]]]])
     timestep = torch.tensor([0.25])
-    assert noisy_interpolate(clean, noise, timestep).item() == pytest.approx(1.25)
-    assert target_velocity(clean, noise).item() == pytest.approx(-3.0)
-    semantic = torch.ones_like(clean)
+    assert x_to_velocity(noisy, clean, timestep).item() == pytest.approx(-3.0)
+    semantic = torch.ones_like(noisy)
     projection = semantic.flatten(2).transpose(1, 2)
     losses = diffusion_losses(
+        noisy,
+        target_velocity,
+        timestep,
         clean,
-        noise,
-        target_velocity(clean, noise),
+        torch.zeros_like(clean),
         projection,
         semantic,
+        base_loss_weight=0.5,
         repa_coefficient=0.5,
     )
-    assert losses.velocity.item() == 0
+    assert losses.full_velocity.item() == 0
     assert losses.repa.item() == pytest.approx(-1.0)
-    assert losses.total.item() == pytest.approx(-0.5)
-
-
-def test_token_mixing_broadcasts_r_and_baseline_is_exact() -> None:
-    semantic = torch.zeros(2, 3, 2, 2)
-    target = torch.full_like(semantic, 10)
-    ratio = torch.tensor([0.25, 1.0])
-    mixed = mix_endpoints(semantic, target, ratio)
-    assert torch.all(mixed[0] == 2.5)
-    assert torch.equal(mixed[1], target[1])
-    baseline = sample_mix_ratio(
-        16,
-        torch.Generator().manual_seed(4),
-        "cpu",
-        MixingConfig(mode="target_baseline"),
+    assert losses.total.item() == pytest.approx(
+        0.5 * losses.base_velocity.item() - 0.5
     )
-    assert torch.equal(baseline, torch.ones(16))
 
 
-def test_logit_normal_has_configurable_endpoint_atom() -> None:
-    endpoint = sample_mix_ratio(
-        32,
-        torch.Generator().manual_seed(7),
-        "cpu",
-        MixingConfig(endpoint_probability=1.0),
+def test_stage_sampling_and_logit_normal_timestep_shift() -> None:
+    stages = sample_stages(
+        128, torch.Generator().manual_seed(7), "cpu", semantic_probability=0.5
     )
-    assert torch.equal(endpoint, torch.ones(32))
-    continuous = sample_mix_ratio(
-        32,
-        torch.Generator().manual_seed(7),
-        "cpu",
-        MixingConfig(endpoint_probability=0.0),
-    )
-    assert torch.all((continuous > 0) & (continuous < 1))
-
-
-def test_logit_normal_timestep_shift() -> None:
+    assert set(stages.tolist()) == {SEMANTIC_STAGE, TARGET_STAGE}
+    assert stages.dtype == torch.long
     assert shift_timestep(torch.tensor(0.5), 4).item() == pytest.approx(0.8)
     values = sample_timesteps(32, torch.Generator().manual_seed(7), "cpu")
     assert torch.all((values > 0) & (values < 1))

@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 14
+CONFIG_SCHEMA_VERSION = 15
 IMAGE_SIZE = 128
 DINO_CHANNELS = 768
 DINO_PATCH_SIZE = 16
@@ -42,6 +42,19 @@ class DataConfig:
 
 
 @dataclass
+class EndpointCacheConfig:
+    enabled: bool = False
+    directory: str = "data/dino-endpoints"
+    batch_size: int = 128
+    log_interval: int = 10
+
+    def validate(self) -> None:
+        if not self.directory:
+            raise ValueError("vision.cache.directory cannot be empty")
+        _positive("vision cache settings", self.batch_size, self.log_interval)
+
+
+@dataclass
 class VisionConfig:
     repository: str = DINO_REPOSITORY
     revision: str = DINO_REVISION
@@ -51,8 +64,9 @@ class VisionConfig:
     patch_size: int = DINO_PATCH_SIZE
     hidden_size: int = DINO_CHANNELS
     num_register_tokens: int = 4
-    statistics_path: str = "data/dino-shared-statistics.safetensors"
+    statistics_path: str = "data/dino-endpoint-statistics.safetensors"
     compile: CompileConfig = field(default_factory=CompileConfig)
+    cache: EndpointCacheConfig = field(default_factory=EndpointCacheConfig)
 
     @property
     def grid_size(self) -> int:
@@ -69,7 +83,7 @@ class VisionConfig:
             raise ValueError("vision.revision must pin an immutable model revision")
         if (self.image_size, self.patch_size, self.hidden_size) != (IMAGE_SIZE, DINO_PATCH_SIZE, DINO_CHANNELS):
             raise ValueError(
-                f"v14 requires DINOv3-B/16 at {IMAGE_SIZE}px with width {DINO_CHANNELS}"
+                f"v15 requires DINOv3-B/16 at {IMAGE_SIZE}px with width {DINO_CHANNELS}"
             )
         if not 1 <= self.target_layer < self.semantic_layer <= 12:
             raise ValueError("vision layers must satisfy 1 <= target < semantic <= 12")
@@ -77,8 +91,7 @@ class VisionConfig:
             raise ValueError("the pinned DINOv3-B/16 checkpoint must have four registers")
         if not self.statistics_path:
             raise ValueError("vision.statistics_path cannot be empty")
-
-
+        self.cache.validate()
 @dataclass
 class DecoderLossConfig:
     l1_weight: float = 1.0
@@ -143,13 +156,14 @@ class DDTConfig:
     depth: list[int] = field(default_factory=lambda: [12, 2])
     num_heads: list[int] = field(default_factory=lambda: [6, 16])
     mlp_ratio: float = 4.0
+    base_model_depth: int = 4
     num_classes: int = 1000
     cfg_dropout_prob: float = 0.1
     num_timestep_tokens: int = 4
-    num_mix_tokens: int = 4
+    num_stage_tokens: int = 4
     num_class_tokens: int = 8
     gradient_checkpointing: bool = False
-    variant: str = "DDT-B/1-DINOv3B-8x8-REPA"
+    variant: str = "DDT-B/1-DINOv3B-8x8-Waypoint-IG-REPA"
 
     @property
     def grid_size(self) -> int:
@@ -166,7 +180,7 @@ class DDTConfig:
     def validate(self) -> None:
         if any(len(value) != 2 for value in (self.patch_size, self.hidden_size, self.depth, self.num_heads)):
             raise ValueError("model paired dimensions must contain two values")
-        _positive("DDT dimensions", self.input_size, *self.patch_size, self.in_channels, *self.hidden_size, *self.depth, *self.num_heads, self.mlp_ratio, self.num_classes, self.num_timestep_tokens, self.num_mix_tokens, self.num_class_tokens)
+        _positive("DDT dimensions", self.input_size, *self.patch_size, self.in_channels, *self.hidden_size, *self.depth, *self.num_heads, self.mlp_ratio, self.base_model_depth, self.num_classes, self.num_timestep_tokens, self.num_stage_tokens, self.num_class_tokens)
         if any(self.input_size % patch for patch in self.patch_size):
             raise ValueError("model input size must be divisible by both patch sizes")
         if self.patch_size[0] != self.patch_size[1]:
@@ -174,6 +188,8 @@ class DDTConfig:
         for width, heads in zip(self.hidden_size, self.num_heads, strict=True):
             if width % heads or (width // heads) % 4:
                 raise ValueError("attention head dimensions must be divisible by four")
+        if self.base_model_depth > self.depth[0]:
+            raise ValueError("model.base_model_depth must be within encoder depth")
         if not 0 <= self.cfg_dropout_prob < 1:
             raise ValueError("model.cfg_dropout_prob must be in [0,1)")
         if not self.variant:
@@ -184,19 +200,26 @@ ModelConfig = DDTConfig
 
 
 @dataclass
-class MixingConfig:
-    mode: str = "token_mix"
-    endpoint_probability: float = 0.2
-    logit_normal_loc: float = 0.0
-    logit_normal_scale: float = 1.0
+class WaypointConfig:
+    time: float = 0.5
+    pool_size: int = 2
+    downsample_mode: str = "area"
+    upsample_mode: str = "bilinear"
+    align_corners: bool = False
+    semantic_stage_probability: float = 0.5
 
     def validate(self) -> None:
-        if self.mode not in {"token_mix", "target_baseline"}:
-            raise ValueError("mixing.mode must be token_mix or target_baseline")
-        if not 0 <= self.endpoint_probability <= 1:
-            raise ValueError("mixing.endpoint_probability must be in [0,1]")
-        if not math.isfinite(self.logit_normal_loc) or self.logit_normal_scale <= 0:
-            raise ValueError("mixing logit-normal parameters are invalid")
+        if not 0 < self.time < 1:
+            raise ValueError("waypoint.time must be in (0,1)")
+        _positive("waypoint.pool_size", self.pool_size)
+        if DINO_GRID_SIZE % self.pool_size:
+            raise ValueError("waypoint.pool_size must divide the DINO token grid")
+        if self.downsample_mode not in {"area", "bilinear"}:
+            raise ValueError("waypoint.downsample_mode must be area or bilinear")
+        if self.upsample_mode not in {"nearest", "bilinear"}:
+            raise ValueError("waypoint.upsample_mode must be nearest or bilinear")
+        if not 0 < self.semantic_stage_probability < 1:
+            raise ValueError("waypoint.semantic_stage_probability must be in (0,1)")
 
 
 @dataclass
@@ -232,6 +255,8 @@ class TrainConfig:
     timestep_loc: float = 0.0
     timestep_scale: float = 1.0
     timestep_shift: float = 4.0
+    velocity_denominator_floor: float = 0.05
+    base_loss_weight: float = 1.0
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
 
@@ -239,9 +264,13 @@ class TrainConfig:
 class SamplingConfig:
     num_samples: int = 50_000
     batch_size: int = 32
-    sampling_steps: int = 50
+    semantic_steps: int = 10
+    target_steps: int = 40
     solver: str = "euler"
     timestep_shift: float = 1.0
+    ig_scale: float = 1.78
+    ig_start: float = 0.1
+    ig_end: float = 1.0
     cfg_scale: float = 1.0
     cfg_start: float = 0.0
     cfg_end: float = 1.0
@@ -277,7 +306,7 @@ class CheckpointConfig:
 class WandbConfig:
     enabled: bool = False
     entity: str | None = None
-    project: str = "dino-token-mixing-repa"
+    project: str = "dino-semantic-waypoint-repa"
     name: str | None = None
     group: str | None = None
     tags: list[str] = field(default_factory=list)
@@ -292,7 +321,7 @@ class ExperimentConfig:
     vision: VisionConfig = field(default_factory=VisionConfig)
     decoder: PixelDecoderConfig = field(default_factory=PixelDecoderConfig)
     model: DDTConfig = field(default_factory=DDTConfig)
-    mixing: MixingConfig = field(default_factory=MixingConfig)
+    waypoint: WaypointConfig = field(default_factory=WaypointConfig)
     repa: RepaConfig = field(default_factory=RepaConfig)
     compile: CompileConfig = field(default_factory=CompileConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
@@ -308,7 +337,7 @@ class ExperimentConfig:
         self.vision.validate()
         self.decoder.validate()
         self.model.validate()
-        self.mixing.validate()
+        self.waypoint.validate()
         self.repa.validate(self.model.depth[0])
         if self.model.input_shape != self.vision.token_shape:
             raise ValueError("vision and diffusion token shapes must match")
@@ -329,7 +358,9 @@ class ExperimentConfig:
             raise ValueError("train.ema_decay must be in (0,1)")
         if not math.isfinite(self.train.timestep_loc):
             raise ValueError("train.timestep_loc must be finite")
-        _positive("training flow settings", self.train.timestep_scale, self.train.timestep_shift)
+        _positive("training flow settings", self.train.timestep_scale, self.train.timestep_shift, self.train.velocity_denominator_floor)
+        if self.train.base_loss_weight < 0:
+            raise ValueError("train.base_loss_weight cannot be negative")
         for name, value in (("validation.interval", self.validation.interval), ("checkpoint.interval", self.checkpoint.interval)):
             if value < 0:
                 raise ValueError(f"{name} cannot be negative")
@@ -343,15 +374,17 @@ class ExperimentConfig:
 
     def _validate_sampling(self) -> None:
         s = self.sampling
-        _positive("sampling counts", s.num_samples, s.batch_size, s.sampling_steps, s.log_interval)
+        _positive("sampling counts", s.num_samples, s.batch_size, s.semantic_steps, s.target_steps, s.log_interval)
         if s.solver not in {"euler", "heun"}:
             raise ValueError("sampling.solver must be euler or heun")
         if s.num_samples % self.model.num_classes:
             raise ValueError("sampling.num_samples must be class balanced")
         if not math.isfinite(s.timestep_shift) or s.timestep_shift <= 0:
             raise ValueError("sampling.timestep_shift must be finite and positive")
-        if not math.isfinite(s.cfg_scale):
-            raise ValueError("sampling.cfg_scale must be finite")
+        if not math.isfinite(s.ig_scale) or not math.isfinite(s.cfg_scale):
+            raise ValueError("sampling guidance scales must be finite")
+        if not 0 <= s.ig_start < s.ig_end <= 1:
+            raise ValueError("sampling IG interval must satisfy 0 <= start < end <= 1")
         if not 0 <= s.cfg_start < s.cfg_end <= 1:
             raise ValueError("sampling CFG interval must satisfy 0 <= start < end <= 1")
 

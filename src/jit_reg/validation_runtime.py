@@ -44,6 +44,7 @@ def validate_ema(
     final: bool,
     output_root: str | Path,
     sampling: SamplingParameters | Sequence[SamplingParameters],
+    endpoint_source: str = "online",
 ) -> tuple[dict[str, float], Path]:
     rank, _world_size = _distributed()
     device = torch.device(
@@ -78,9 +79,15 @@ def validate_ema(
         "vision_fingerprint": vision_fingerprint(config.vision),
         "decoder_sha256": decoder_digest,
         "latent_statistics_sha256": statistics_digest,
-        "conditioning": "timestep-mix-ratio-class",
-        "prediction": "direct-velocity-noise-minus-clean",
-        "sample_mix_ratio": 1.0,
+        "training_endpoint_source": endpoint_source,
+        "conditioning": "timestep-waypoint-stage-class",
+        "prediction": "clean-x-full-and-base-with-repa",
+        "waypoint": {
+            "time": config.waypoint.time,
+            "pool_size": config.waypoint.pool_size,
+            "downsample_mode": config.waypoint.downsample_mode,
+            "upsample_mode": config.waypoint.upsample_mode,
+        },
     }
     model = DDT(config.model, config.repa).to(device)
     model.load_state_dict(ema.state_dict())
@@ -101,12 +108,17 @@ def validate_ema(
             execution_model,
             noise,
             labels.to(device),
-            steps=parameters.sampling_steps,
+            semantic_steps=parameters.semantic_steps,
+            target_steps=parameters.target_steps,
+            waypoint_time=parameters.waypoint_time,
             timestep_shift=parameters.timestep_shift,
+            ig_scale=parameters.ig_scale,
+            ig_interval=(parameters.ig_start, parameters.ig_end),
             cfg_scale=parameters.cfg_scale,
             cfg_interval=(parameters.cfg_start, parameters.cfg_end),
             solver=parameters.solver,
             num_classes=config.model.num_classes,
+            velocity_denominator_floor=config.train.velocity_denominator_floor,
         )
         return decoder(generated.to(next(decoder.parameters()).dtype)).float().clamp(0, 1)
 

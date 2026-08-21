@@ -10,9 +10,10 @@ from jit_reg.checkpoint import EMA, CheckpointManager
 from jit_reg.config import ExperimentConfig, load_config
 from jit_reg.data import data_fingerprint, load_imagenet, preprocessing_metadata
 from jit_reg.distributed import initialize_distributed
+from jit_reg.endpoint_cache import EndpointCache
 from jit_reg.flops import model_flops_per_step
 from jit_reg.latent_statistics import (
-    SharedLatentNormalizer,
+    EndpointLatentNormalizer,
     latent_statistics_sha256,
     load_latent_statistics,
 )
@@ -32,8 +33,10 @@ torch._dynamo.config.cache_size_limit = 1000
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train DDT on online DINOv3 endpoints")
-    parser.add_argument("--config", type=Path, default=Path("configs/dino-tokenmix.yaml"))
+    parser = argparse.ArgumentParser(
+        description="Train semantic-waypoint DDT on online or cached DINOv3 endpoints"
+    )
+    parser.add_argument("--config", type=Path, default=Path("configs/dino-waypoint.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", type=Path)
@@ -45,9 +48,14 @@ def _sampling_parameters(config: ExperimentConfig) -> SamplingParameters:
     s = config.sampling
     return SamplingParameters(
         batch_size=s.batch_size,
-        sampling_steps=s.sampling_steps,
+        semantic_steps=s.semantic_steps,
+        target_steps=s.target_steps,
+        waypoint_time=config.waypoint.time,
         solver=s.solver,
         timestep_shift=s.timestep_shift,
+        ig_scale=s.ig_scale,
+        ig_start=s.ig_start,
+        ig_end=s.ig_end,
         cfg_scale=s.cfg_scale,
         cfg_start=s.cfg_start,
         cfg_end=s.cfg_end,
@@ -87,13 +95,27 @@ def main() -> None:
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(streams.initialization.initial_seed())
         model = DDT(config.model, config.repa).to(device)
-    feature_encoder = load_dino_encoder(
-        config.vision,
-        device,
-        include_semantic=True,
-        normalizer=SharedLatentNormalizer(statistics),
+    dataset = load_imagenet(
+        config.data,
+        config.vision.image_size,
+        load_pixels=not config.vision.cache.enabled,
     )
-    dataset = load_imagenet(config.data, config.vision.image_size, load_pixels=True)
+    endpoint_cache = (
+        EndpointCache(config, len(dataset), statistics_digest)
+        if config.vision.cache.enabled
+        else None
+    )
+    endpoint_source = endpoint_cache.fingerprint if endpoint_cache is not None else "online"
+    feature_encoder = (
+        None
+        if endpoint_cache is not None
+        else load_dino_encoder(
+            config.vision,
+            device,
+            include_semantic=True,
+            normalizer=EndpointLatentNormalizer(statistics),
+        )
+    )
     fingerprint = data_fingerprint(config.data, config.vision.image_size)
     feature_id = vision_fingerprint(config.vision)
     plan_path = Path(config.validation.plan_path)
@@ -123,6 +145,7 @@ def main() -> None:
             feature_id,
             decoder_digest,
             statistics_digest,
+            endpoint_source,
         )
         optimizer.load_state_dict(resumed.optimizer)
         streams.load_state_dict(resumed.rng_streams)
@@ -139,7 +162,7 @@ def main() -> None:
             execution_model,
             device_ids=[device.index] if device.type == "cuda" else None,
         )
-    loader, sampler = make_train_loader(dataset, config, streams)
+    loader, sampler = make_train_loader(dataset, config, streams, endpoint_cache)
     logged_config = config.as_dict()
     logged_config["provenance"] = {
         "dataset_and_preprocessing": preprocessing_metadata(
@@ -151,6 +174,7 @@ def main() -> None:
         "latent_statistics_sha256": statistics_digest,
         "decoder_sha256": decoder_digest,
         "diffusion_input_shape": list(config.model.input_shape),
+        "endpoint_source": endpoint_source,
     }
     logged_config["model_parameters"] = {
         "total": sum(parameter.numel() for parameter in model.parameters()),
@@ -163,7 +187,8 @@ def main() -> None:
     )
     logger.event(
         f"training initialized: variant={config.model.model_variant}, "
-        f"mixing={config.mixing.mode}, input_shape={config.model.input_shape}, "
+        f"waypoint={config.waypoint.time}, endpoint_source={endpoint_source}, "
+        f"input_shape={config.model.input_shape}, "
         f"parameters={logged_config['model_parameters']['total']:,}"
     )
     output_root = Path(config.checkpoint.directory).parent / "validation"
@@ -177,6 +202,7 @@ def main() -> None:
             final=final,
             output_root=output_root,
             sampling=sampling_parameters,
+            endpoint_source=endpoint_source,
         )
         metrics["compute/cumulative_model_flops"] = float(
             state.global_step * model_flops_per_step(config)
@@ -210,6 +236,7 @@ def main() -> None:
             data_fingerprint=fingerprint,
             decoder_sha256=decoder_digest,
             latent_statistics_sha256=statistics_digest,
+            endpoint_cache_fingerprint=endpoint_source,
             validation_plan_hash=plan.plan_hash,
             validation_plan_path=plan_path,
             logger=logger,

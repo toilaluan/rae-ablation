@@ -9,7 +9,7 @@ import torch
 from torch import Tensor, nn
 
 from .config import IMAGE_SIZE, CompileConfig, VisionConfig
-from .latent_statistics import SharedLatentNormalizer
+from .latent_statistics import EndpointLatentNormalizer
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -18,6 +18,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 def vision_fingerprint(config: VisionConfig) -> str:
     vision_config = asdict(config)
     vision_config.pop("statistics_path", None)
+    vision_config.pop("cache", None)
     payload = {
         **vision_config,
         "compile": None,
@@ -38,7 +39,7 @@ class DINOEndpointEncoder(nn.Module):
         config: VisionConfig,
         *,
         include_semantic: bool = True,
-        normalizer: SharedLatentNormalizer | None = None,
+        normalizer: EndpointLatentNormalizer | None = None,
     ) -> None:
         super().__init__()
         config.validate()
@@ -115,8 +116,12 @@ class DINOEndpointEncoder(nn.Module):
         target_patches = self._patch_tokens(target)
         semantic_patches = self._patch_tokens(semantic)
         if self.normalizer is not None:
-            target_patches = self.normalizer(target_patches)
-            semantic_patches = self.normalizer(semantic_patches)
+            target_patches = self.normalizer.normalize_target(target_patches)
+            semantic_patches = (
+                self.normalizer.normalize_semantic(semantic_patches)
+                if self.include_semantic
+                else target_patches
+            )
         return target_patches, semantic_patches
 
     @torch.no_grad()
@@ -138,7 +143,7 @@ def load_dino_encoder(
     device: torch.device | str,
     *,
     include_semantic: bool = True,
-    normalizer: SharedLatentNormalizer | None = None,
+    normalizer: EndpointLatentNormalizer | None = None,
 ) -> DINOEndpointEncoder:
     from transformers import DINOv3ViTModel
 
