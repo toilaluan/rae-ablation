@@ -139,6 +139,35 @@ def test_base_loss_is_safe_when_batch_has_no_semantic_examples() -> None:
     assert torch.count_nonzero(base_prediction.grad) == 0
 
 
+def test_disabled_repa_returns_zero_metrics_without_projection() -> None:
+    noisy = torch.ones(1, 1, 1, 1)
+    losses = diffusion_losses(
+        noisy,
+        torch.zeros_like(noisy),
+        torch.ones(1),
+        torch.tensor([SEMANTIC_STAGE]),
+        noisy,
+        noisy,
+        None,
+        noisy,
+        repa_coefficient=0,
+    )
+    assert losses.repa.item() == 0
+    assert losses.cosine_similarity.item() == 0
+    with pytest.raises(ValueError, match="projector is disabled"):
+        diffusion_losses(
+            noisy,
+            torch.zeros_like(noisy),
+            torch.ones(1),
+            torch.tensor([SEMANTIC_STAGE]),
+            noisy,
+            noisy,
+            None,
+            noisy,
+            repa_coefficient=0.5,
+        )
+
+
 def test_stage_sampling_and_logit_normal_timestep_shift() -> None:
     stages = sample_stages(
         128, torch.Generator().manual_seed(7), "cpu", semantic_probability=0.5

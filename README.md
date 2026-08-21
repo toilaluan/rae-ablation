@@ -34,12 +34,14 @@ target:   t = tau * u
 The shallow base head exits after encoder block 4; the full head uses the complete
 DDT. The full head is supervised on both trajectory legs, while the base-head loss is
 applied only to semantic-leg examples. Predictions are converted to velocity with
-`(xt - prediction) / max(t, 0.05)`. REPA aligns encoder block 8 with the original
-unpooled block-12 features.
+`(xt - prediction) / max(t, 0.05)`. REPA is disabled for the waypoint preset. Setting
+`repa.enabled=true` enables the baseline REPA projector and aligns encoder block 8
+with the original unpooled block-12 features.
 
-Sampling applies internal guidance in clean-prediction space, then CFG, then velocity
-conversion. The default trajectory uses 10 semantic steps from `1 -> 0.5` and 40
-target steps from `0.5 -> 0`. Euler therefore uses 50 NFE; Heun uses 99 NFE.
+Sampling applies internal guidance in clean-prediction space only on the semantic leg.
+The target leg bypasses the base head and applies ordinary CFG to the full prediction.
+The default trajectory uses 10 semantic steps from `1 -> 0.5` and 40 target steps from
+`0.5 -> 0`. Euler therefore uses 50 NFE; Heun uses 99 NFE.
 
 ## Setup and latent statistics
 

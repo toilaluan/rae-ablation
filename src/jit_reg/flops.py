@@ -16,7 +16,9 @@ def _mlp_flops(tokens: int, width: int, ratio: float) -> int:
     return 6 * tokens * width * hidden
 
 
-def ddt_forward_flops(config: ExperimentConfig, *, include_repa: bool = True) -> int:
+def ddt_forward_flops(
+    config: ExperimentConfig, *, include_repa: bool | None = None
+) -> int:
     """Approximate FLOPs for one v15 diffusion forward pass."""
     model = config.model
     spatial = model.grid_size**2
@@ -40,6 +42,8 @@ def ddt_forward_flops(config: ExperimentConfig, *, include_repa: bool = True) ->
     )
     total += 2 * spatial * dec_width * dec_patch + 4 * spatial * dec_width * dec_width
     total += 2 * spatial * enc_width * enc_patch + 4 * spatial * enc_width * enc_width
+    if include_repa is None:
+        include_repa = config.repa.enabled
     if include_repa:
         repa_width = config.repa.projector_width
         total += 2 * spatial * (

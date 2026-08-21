@@ -138,7 +138,11 @@ def main() -> None:
             "latent_statistics_sha256": statistics_digest,
             "training_endpoint_source": metadata.get("endpoint_cache_fingerprint"),
             "conditioning": "timestep-waypoint-stage-class",
-            "prediction": "clean-x-full-and-base-with-repa",
+            "prediction": (
+                "clean-x-full-and-base-with-repa"
+                if config.repa.enabled
+                else "clean-x-full-and-base"
+            ),
             "waypoint": {
                 "time": config.waypoint.time,
                 "pool_size": config.waypoint.pool_size,

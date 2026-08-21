@@ -224,6 +224,7 @@ class WaypointConfig:
 
 @dataclass
 class RepaConfig:
+    enabled: bool = True
     layer_depth: int = 8
     projector_width: int = 2048
     coefficient: float = 0.5

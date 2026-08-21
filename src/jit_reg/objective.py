@@ -194,7 +194,7 @@ def diffusion_losses(
     stage: Tensor,
     full_prediction: Tensor,
     base_prediction: Tensor,
-    projection: Tensor,
+    projection: Tensor | None,
     semantic: Tensor,
     *,
     base_loss_weight: float = 1.0,
@@ -222,6 +222,12 @@ def diffusion_losses(
     )
     semantic_mask = (stage == SEMANTIC_STAGE).to(base_error.dtype)
     base = (base_error * semantic_mask).sum() / semantic_mask.sum().clamp_min(1)
-    repa, similarity = repa_cosine_loss(projection, semantic)
+    if projection is None:
+        if repa_coefficient:
+            raise ValueError("REPA coefficient must be zero when its projector is disabled")
+        repa = noisy.new_zeros((), dtype=torch.float32)
+        similarity = noisy.new_zeros((), dtype=torch.float32)
+    else:
+        repa, similarity = repa_cosine_loss(projection, semantic)
     total = full + base_loss_weight * base + repa_coefficient * repa
     return DiffusionLoss(total, full, base, repa, similarity)

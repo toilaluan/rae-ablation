@@ -84,6 +84,7 @@ waypoint:
   semantic_stage_probability: 0.5
 
 repa:
+  enabled: false
   layer_depth: 8
   projector_width: 2048
   coefficient: 0.5
@@ -152,9 +153,9 @@ checkpoint:
 wandb:
   enabled: false
   entity: null
-  project: dino-semantic-waypoint-repa
+  project: dino-semantic-waypoint
   name: semantic-waypoint
   group: null
-  tags: [dinov3, semantic-waypoint, repa, internal-guidance]
+  tags: [dinov3, semantic-waypoint, internal-guidance]
   mode: online
   checkpoint_artifacts: false

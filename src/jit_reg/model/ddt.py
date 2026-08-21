@@ -15,7 +15,7 @@ from .rope import apply_rope_cos_sin, precompute_rope_tables
 class DDTOutput(NamedTuple):
     full_prediction: Tensor
     base_prediction: Tensor
-    repa_projection: Tensor
+    repa_projection: Tensor | None
 
     @property
     def x_prediction(self) -> Tensor:
@@ -199,7 +199,7 @@ class StageEmbedder(nn.Module):
 
 
 class DDT(nn.Module):
-    """Waypoint-conditioned DDT with base prediction and a training-only REPA head."""
+    """Waypoint-conditioned DDT with base prediction and optional training-only REPA."""
 
     def __init__(
         self,
@@ -259,12 +259,19 @@ class DDT(nn.Module):
         )
         self.full_head = DDTFinalLayer(dec_width, x_patch, self.in_channels)
         self.base_head = DDTFinalLayer(enc_width, s_patch, self.in_channels)
-        self.repa_projector = nn.Sequential(
-            nn.Linear(enc_width, self.repa_config.projector_width),
-            nn.SiLU(),
-            nn.Linear(self.repa_config.projector_width, self.repa_config.projector_width),
-            nn.SiLU(),
-            nn.Linear(self.repa_config.projector_width, self.config.in_channels),
+        self.repa_projector = (
+            nn.Sequential(
+                nn.Linear(enc_width, self.repa_config.projector_width),
+                nn.SiLU(),
+                nn.Linear(
+                    self.repa_config.projector_width,
+                    self.repa_config.projector_width,
+                ),
+                nn.SiLU(),
+                nn.Linear(self.repa_config.projector_width, self.config.in_channels),
+            )
+            if self.repa_config.enabled
+            else None
         )
         self.gradient_checkpointing = self.config.gradient_checkpointing
         self._initialize_weights()
@@ -432,10 +439,13 @@ class DDT(nn.Module):
                 states = self._encoder_block(block, states)
                 if index == self.config.base_model_depth:
                     base_states = states
-                if index == self.repa_config.layer_depth:
+                if self.repa_config.enabled and index == self.repa_config.layer_depth:
                     repa_states = states[:, : self.spatial_tokens]
-            assert base_states is not None and repa_states is not None
+            assert base_states is not None
             full = self._full_from_states(x, states, timestep_base)
             base = self._base_from_states(base_states, timestep_base)
-            projection = self.repa_projector(repa_states)
+            projection: Tensor | None = None
+            if self.repa_config.enabled:
+                assert repa_states is not None and self.repa_projector is not None
+                projection = self.repa_projector(repa_states)
             return DDTOutput(full, base, projection)

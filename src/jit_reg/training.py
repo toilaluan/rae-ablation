@@ -316,7 +316,9 @@ def train(
                 output.repa_projection,
                 semantic_tokens,
                 base_loss_weight=config.train.base_loss_weight,
-                repa_coefficient=config.repa.coefficient,
+                repa_coefficient=(
+                    config.repa.coefficient if config.repa.enabled else 0.0
+                ),
                 velocity_denominator_floor=config.train.velocity_denominator_floor,
             )
             losses.total.backward()

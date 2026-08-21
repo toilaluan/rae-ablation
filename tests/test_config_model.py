@@ -58,9 +58,12 @@ def test_schema_v15_defaults_and_single_complete_preset() -> None:
     assert config.sampling.semantic_steps == 10
     assert config.sampling.target_steps == 40
     assert config.sampling.ig_scale == 1.78
-    assert config.repa == RepaConfig(layer_depth=8, projector_width=2048, coefficient=0.5)
+    assert config.repa == RepaConfig(
+        enabled=True, layer_depth=8, projector_width=2048, coefficient=0.5
+    )
 
     preset = load_config("configs/dino-waypoint.yaml")
+    assert preset.repa.enabled is False
     raw = OmegaConf.to_container(
         OmegaConf.load("configs/dino-waypoint.yaml"), resolve=True
     )
@@ -113,6 +116,22 @@ def test_ddt_dual_prediction_repa_shapes_and_zero_heads() -> None:
     predictions = model.forward_predictions(x, timestep, stage, labels)
     assert torch.equal(output.full_prediction, predictions.full_prediction)
     assert torch.equal(output.base_prediction, predictions.base_prediction)
+
+
+def test_disabled_repa_removes_projector_and_projection() -> None:
+    model = DDT(
+        tiny_config(),
+        RepaConfig(enabled=False, layer_depth=2, projector_width=24),
+    )
+    output = model(
+        torch.randn(2, 4, 2, 2),
+        torch.rand(2),
+        torch.tensor([0, 1]),
+        torch.tensor([1, 2]),
+    )
+    assert model.repa_projector is None
+    assert output.repa_projection is None
+    assert not any(name.startswith("repa_projector") for name, _ in model.named_parameters())
 
 
 def test_base_prediction_isolated_after_configured_depth() -> None:
@@ -190,3 +209,20 @@ def test_ddt_supports_fullgraph_compilation() -> None:
     assert output.full_prediction.shape == (1, 4, 2, 2)
     assert output.base_prediction.shape == (1, 4, 2, 2)
     assert output.repa_projection.shape == (1, 4, 4)
+
+
+def test_repa_disabled_ddt_supports_fullgraph_compilation() -> None:
+    model = DDT(
+        tiny_config(),
+        RepaConfig(enabled=False, layer_depth=2, projector_width=24),
+    ).eval()
+    compiled = torch.compile(model, backend="eager", fullgraph=True)
+    output = compiled(
+        torch.randn(1, 4, 2, 2),
+        torch.rand(1),
+        torch.tensor([0]),
+        torch.tensor([1]),
+    )
+    assert output.full_prediction.shape == (1, 4, 2, 2)
+    assert output.base_prediction.shape == (1, 4, 2, 2)
+    assert output.repa_projection is None

@@ -18,6 +18,7 @@ class GuidanceModel(nn.Module):
         self.config = SimpleNamespace(num_classes=2)
         self.stages: list[torch.Tensor] = []
         self.timesteps: list[torch.Tensor] = []
+        self.label_batches: list[torch.Tensor] = []
 
     def forward(
         self,
@@ -28,6 +29,7 @@ class GuidanceModel(nn.Module):
     ) -> DDTOutput:
         self.stages.append(stage.detach().clone())
         self.timesteps.append(timestep.detach().clone())
+        self.label_batches.append(labels.detach().clone())
         shape = (labels.shape[0], *((1,) * (noisy.ndim - 1)))
         label = labels.reshape(shape).to(noisy.dtype)
         full = torch.ones_like(noisy) * (2 + label)
@@ -103,10 +105,11 @@ def test_heun_reports_two_n_minus_one_model_calls_without_crossing_stage() -> No
     assert values[4:] == [TARGET_STAGE] * 5
 
 
-def test_internal_guidance_precedes_cfg_across_both_legs() -> None:
+def test_semantic_uses_internal_guidance_and_target_uses_only_cfg() -> None:
     noise = torch.zeros(1, 1, 1, 1)
+    pure_model = GuidanceModel()
     pure = ode_sample(
-        GuidanceModel(),
+        pure_model,
         noise,
         torch.tensor([1]),
         semantic_steps=1,
@@ -115,9 +118,12 @@ def test_internal_guidance_precedes_cfg_across_both_legs() -> None:
         ig_scale=2,
         num_classes=2,
     )
-    assert pure.item() == pytest.approx(5.0)
+    # Semantic IG predicts 5 at the waypoint; target uses the conditional full=3.
+    assert pure.item() == pytest.approx(3.0)
+    assert [batch.numel() for batch in pure_model.label_batches] == [1, 1]
+    cfg_model = GuidanceModel()
     combined = ode_sample(
-        GuidanceModel(),
+        cfg_model,
         noise,
         torch.tensor([1]),
         semantic_steps=1,
@@ -127,5 +133,6 @@ def test_internal_guidance_precedes_cfg_across_both_legs() -> None:
         cfg_scale=2,
         num_classes=2,
     )
-    # IG(cond)=5 and IG(uncond)=6, then CFG=6+2*(5-6)=4.
-    assert combined.item() == pytest.approx(4.0)
+    # Semantic remains IG=5 without duplication. Target CFG is 4+2*(3-4)=2.
+    assert combined.item() == pytest.approx(2.0)
+    assert [batch.numel() for batch in cfg_model.label_batches] == [1, 2]

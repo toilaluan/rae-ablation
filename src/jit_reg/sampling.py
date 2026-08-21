@@ -35,6 +35,25 @@ def _model_predictions(
     return output.full_prediction, output.base_prediction
 
 
+def _model_full_prediction(
+    model: nn.Module,
+    x: Tensor,
+    timestep: Tensor,
+    stage: Tensor,
+    labels: Tensor,
+) -> Tensor:
+    owners = (model, getattr(model, "module", None))
+    for owner in owners:
+        method = getattr(owner, "forward_full_prediction", None)
+        if callable(method):
+            return method(x, timestep, stage, labels)
+    for owner in owners:
+        method = getattr(owner, "forward_predictions", None)
+        if callable(method):
+            return method(x, timestep, stage, labels).full_prediction
+    return model(x, timestep, stage, labels).full_prediction
+
+
 def _guided_x(
     full: Tensor,
     base: Tensor,
@@ -110,34 +129,48 @@ def ode_sample(
     completed_steps = 0
 
     def predict_x(x: Tensor, timestep: Tensor, stage_value: int) -> Tensor:
+        if stage_value == SEMANTIC_STAGE:
+            model_t = timestep.expand(x.shape[0])
+            model_stage = torch.full(
+                (x.shape[0],),
+                SEMANTIC_STAGE,
+                device=x.device,
+                dtype=torch.long,
+            )
+            full, base = _model_predictions(
+                model,
+                x.to(noise.dtype),
+                model_t,
+                model_stage,
+                labels,
+            )
+            return _guided_x(
+                full.float(), base.float(), model_t, ig_scale, ig_interval
+            )
+
         use_cfg = cfg_scale != 1.0
         copies = 2 if use_cfg else 1
         model_x = torch.cat((x, x)).to(noise.dtype) if use_cfg else x.to(noise.dtype)
         model_t = timestep.expand(copies * x.shape[0])
         model_stage = torch.full(
             (copies * x.shape[0],),
-            stage_value,
+            TARGET_STAGE,
             device=x.device,
             dtype=torch.long,
         )
         model_labels = torch.cat((labels, null_labels)) if use_cfg else labels
-        full, base = _model_predictions(
+        full = _model_full_prediction(
             model, model_x, model_t, model_stage, model_labels
-        )
-        full = full.float()
-        base = base.float()
+        ).float()
         if not use_cfg:
-            return _guided_x(full, base, model_t, ig_scale, ig_interval)
+            return full
         full_c, full_u = full.chunk(2)
-        base_c, base_u = base.chunk(2)
         t = model_t[: x.shape[0]]
-        conditional = _guided_x(full_c, base_c, t, ig_scale, ig_interval)
-        unconditional = _guided_x(full_u, base_u, t, ig_scale, ig_interval)
         active = ((t >= cfg_interval[0]) & (t <= cfg_interval[1])).reshape(
-            -1, *((1,) * (conditional.ndim - 1))
+            -1, *((1,) * (full_c.ndim - 1))
         )
-        guided = unconditional + cfg_scale * (conditional - unconditional)
-        return torch.where(active, guided, conditional)
+        guided = full_u + cfg_scale * (full_c - full_u)
+        return torch.where(active, guided, full_c)
 
     segments = (
         (
