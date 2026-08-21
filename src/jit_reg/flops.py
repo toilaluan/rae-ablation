@@ -19,7 +19,7 @@ def _mlp_flops(tokens: int, width: int, ratio: float) -> int:
 def ddt_forward_flops(
     config: ExperimentConfig, *, include_repa: bool | None = None
 ) -> int:
-    """Approximate FLOPs for one v15 diffusion forward pass."""
+    """Approximate FLOPs for one v16 diffusion forward pass."""
     model = config.model
     spatial = model.grid_size**2
     condition = model.num_timestep_tokens + model.num_stage_tokens + model.num_class_tokens

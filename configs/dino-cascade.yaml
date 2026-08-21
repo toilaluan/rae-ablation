@@ -1,4 +1,4 @@
-schema_version: 15
+schema_version: 16
 
 data:
   repository: benjamin-paine/imagenet-1k-256x256
@@ -73,10 +73,9 @@ model:
   num_stage_tokens: 4
   num_class_tokens: 8
   gradient_checkpointing: false
-  variant: DDT-B/1-DINOv3B-8x8-Waypoint-IG-REPA
+  variant: DDT-B/1-DINOv3B-8x8-Semantic-Cascade-IG
 
-waypoint:
-  time: 0.5
+cascade:
   pool_size: 2
   downsample_mode: area
   upsample_mode: bilinear
@@ -153,9 +152,9 @@ checkpoint:
 wandb:
   enabled: false
   entity: null
-  project: dino-semantic-waypoint
-  name: semantic-waypoint
+  project: dino-semantic-cascade
+  name: semantic-cascade
   group: null
-  tags: [dinov3, semantic-waypoint, internal-guidance]
+  tags: [dinov3, semantic-cascade, internal-guidance]
   mode: online
   checkpoint_artifacts: false

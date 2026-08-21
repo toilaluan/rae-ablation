@@ -25,7 +25,6 @@ class SamplingParameters:
     batch_size: int = 32
     semantic_steps: int = 10
     target_steps: int = 40
-    waypoint_time: float = 0.5
     solver: str = "euler"
     timestep_shift: float = 1.0
     ig_scale: float = 1.78
@@ -42,7 +41,7 @@ class SamplingParameters:
         if self.solver == "euler":
             return steps
         if self.solver == "heun":
-            return 2 * steps - 1
+            return 2 * steps - 2
         raise ValueError("sampling solver must be euler or heun")
 
     def validate(self) -> None:
@@ -50,8 +49,6 @@ class SamplingParameters:
             raise ValueError("sampling batch size, per-stage steps, and log interval must be positive")
         if self.solver not in {"euler", "heun"}:
             raise ValueError("sampling solver must be euler or heun")
-        if not 0 < self.waypoint_time < 1:
-            raise ValueError("sampling waypoint time must be in (0,1)")
         if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
             raise ValueError("timestep shift must be finite and positive")
         if not math.isfinite(self.ig_scale) or not math.isfinite(self.cfg_scale):
@@ -63,8 +60,8 @@ class SamplingParameters:
 
 
 GenerateBatch = Callable[[Tensor, Tensor, Tensor], Tensor]
-SAMPLING_MANIFEST_SCHEMA_VERSION = 19
-FEATURE_SCHEMA_VERSION = 15
+SAMPLING_MANIFEST_SCHEMA_VERSION = 20
+FEATURE_SCHEMA_VERSION = 16
 
 
 def _float_slug(value: float) -> str:
@@ -78,7 +75,6 @@ def sampling_output_name(sample_count: int, parameters: SamplingParameters) -> s
     return (
         f"samples-{parameters.solver}-n{sample_count}"
         f"-semantic{parameters.semantic_steps}-target{parameters.target_steps}"
-        f"-waypoint{_float_slug(parameters.waypoint_time)}"
         f"-ig{_float_slug(parameters.ig_scale)}"
         f"-cfg{_float_slug(parameters.cfg_scale)}"
         f"-shift{_float_slug(parameters.timestep_shift)}"
@@ -197,7 +193,6 @@ def _manifest_base(
             "target_steps": parameters.target_steps,
             "sampling_steps": parameters.semantic_steps + parameters.target_steps,
             "sampling_nfe": parameters.sampling_nfe,
-            "waypoint_time": parameters.waypoint_time,
             "ig_scale": parameters.ig_scale,
             "ig_interval": [parameters.ig_start, parameters.ig_end],
             "cfg_scale": parameters.cfg_scale,
@@ -412,7 +407,6 @@ def sample_to_archive(
             f"batch_size={parameters.batch_size} solver={parameters.solver} "
             f"semantic_steps={parameters.semantic_steps} "
             f"target_steps={parameters.target_steps} nfe={parameters.sampling_nfe} "
-            f"waypoint={parameters.waypoint_time:g} "
             f"ig={parameters.ig_scale:g} cfg={parameters.cfg_scale:g} "
             f"timestep_shift={parameters.timestep_shift:g} "
             f"ig_interval=[{parameters.ig_start:g}, {parameters.ig_end:g}] "

@@ -3,23 +3,23 @@ from __future__ import annotations
 import pytest
 import torch
 
-from jit_reg.config import WaypointConfig
+from jit_reg.config import CascadeConfig
 from jit_reg.objective import (
     SEMANTIC_STAGE,
     TARGET_STAGE,
+    cascade_path,
     diffusion_losses,
     pool_semantic,
     sample_stages,
     sample_timesteps,
     shift_timestep,
-    waypoint_path,
     x_to_velocity,
 )
 
 
 def test_semantic_pooling_is_four_by_four_then_restored() -> None:
     semantic = torch.arange(64, dtype=torch.float32).reshape(1, 1, 8, 8)
-    restored = pool_semantic(semantic, WaypointConfig())
+    restored = pool_semantic(semantic, CascadeConfig())
     pooled = torch.nn.functional.interpolate(semantic, size=(4, 4), mode="area")
     expected = torch.nn.functional.interpolate(
         pooled, size=(8, 8), mode="bilinear", align_corners=False
@@ -28,15 +28,15 @@ def test_semantic_pooling_is_four_by_four_then_restored() -> None:
     assert torch.equal(restored, expected)
 
 
-def test_piecewise_path_endpoints_continuity_and_velocities() -> None:
-    config = WaypointConfig(time=0.5, pool_size=2)
+def test_cascade_path_has_clean_semantic_interface_and_local_velocities() -> None:
+    config = CascadeConfig(pool_size=2)
     target = torch.full((2, 1, 2, 2), 10.0)
     semantic = torch.tensor(
         [[[[0.0, 2.0], [4.0, 6.0]]], [[[2.0, 4.0], [6.0, 8.0]]]]
     )
     noise = torch.full_like(target, -2.0)
     stages = torch.tensor([SEMANTIC_STAGE, TARGET_STAGE])
-    path = waypoint_path(
+    path = cascade_path(
         target,
         semantic,
         noise,
@@ -44,15 +44,15 @@ def test_piecewise_path_endpoints_continuity_and_velocities() -> None:
         stages,
         config,
     )
-    # Both examples are exactly at the shared noisy semantic waypoint.
-    assert torch.equal(path.noisy, path.waypoint)
-    assert path.timestep.tolist() == [0.5, 0.5]
-    assert torch.equal(path.clean[0], path.pooled_semantic[0])
+    # Semantic t=0 and target t=1 meet at the same clean semantic endpoint.
+    assert torch.equal(path.noisy, path.semantic_endpoint)
+    assert path.timestep.tolist() == [0.0, 1.0]
+    assert torch.equal(path.clean[0], path.semantic_endpoint[0])
     assert torch.equal(path.clean[1], target[1])
-    assert torch.equal(path.velocity[0], noise[0] - path.pooled_semantic[0])
-    assert torch.equal(path.velocity[1], (path.waypoint[1] - target[1]) / 0.5)
+    assert torch.equal(path.velocity[0], noise[0] - path.semantic_endpoint[0])
+    assert torch.equal(path.velocity[1], path.semantic_endpoint[1] - target[1])
 
-    endpoints = waypoint_path(
+    endpoints = cascade_path(
         target,
         semantic,
         noise,

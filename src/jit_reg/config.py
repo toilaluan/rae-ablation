@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 15
+CONFIG_SCHEMA_VERSION = 16
 IMAGE_SIZE = 128
 DINO_CHANNELS = 768
 DINO_PATCH_SIZE = 16
@@ -83,7 +83,7 @@ class VisionConfig:
             raise ValueError("vision.revision must pin an immutable model revision")
         if (self.image_size, self.patch_size, self.hidden_size) != (IMAGE_SIZE, DINO_PATCH_SIZE, DINO_CHANNELS):
             raise ValueError(
-                f"v15 requires DINOv3-B/16 at {IMAGE_SIZE}px with width {DINO_CHANNELS}"
+                f"v16 requires DINOv3-B/16 at {IMAGE_SIZE}px with width {DINO_CHANNELS}"
             )
         if not 1 <= self.target_layer < self.semantic_layer <= 12:
             raise ValueError("vision layers must satisfy 1 <= target < semantic <= 12")
@@ -163,7 +163,7 @@ class DDTConfig:
     num_stage_tokens: int = 4
     num_class_tokens: int = 8
     gradient_checkpointing: bool = False
-    variant: str = "DDT-B/1-DINOv3B-8x8-Waypoint-IG-REPA"
+    variant: str = "DDT-B/1-DINOv3B-8x8-Semantic-Cascade-IG"
 
     @property
     def grid_size(self) -> int:
@@ -200,8 +200,7 @@ ModelConfig = DDTConfig
 
 
 @dataclass
-class WaypointConfig:
-    time: float = 0.5
+class CascadeConfig:
     pool_size: int = 2
     downsample_mode: str = "area"
     upsample_mode: str = "bilinear"
@@ -209,17 +208,15 @@ class WaypointConfig:
     semantic_stage_probability: float = 0.5
 
     def validate(self) -> None:
-        if not 0 < self.time < 1:
-            raise ValueError("waypoint.time must be in (0,1)")
-        _positive("waypoint.pool_size", self.pool_size)
+        _positive("cascade.pool_size", self.pool_size)
         if DINO_GRID_SIZE % self.pool_size:
-            raise ValueError("waypoint.pool_size must divide the DINO token grid")
+            raise ValueError("cascade.pool_size must divide the DINO token grid")
         if self.downsample_mode not in {"area", "bilinear"}:
-            raise ValueError("waypoint.downsample_mode must be area or bilinear")
+            raise ValueError("cascade.downsample_mode must be area or bilinear")
         if self.upsample_mode not in {"nearest", "bilinear"}:
-            raise ValueError("waypoint.upsample_mode must be nearest or bilinear")
+            raise ValueError("cascade.upsample_mode must be nearest or bilinear")
         if not 0 < self.semantic_stage_probability < 1:
-            raise ValueError("waypoint.semantic_stage_probability must be in (0,1)")
+            raise ValueError("cascade.semantic_stage_probability must be in (0,1)")
 
 
 @dataclass
@@ -307,7 +304,7 @@ class CheckpointConfig:
 class WandbConfig:
     enabled: bool = False
     entity: str | None = None
-    project: str = "dino-semantic-waypoint-repa"
+    project: str = "dino-semantic-cascade"
     name: str | None = None
     group: str | None = None
     tags: list[str] = field(default_factory=list)
@@ -322,7 +319,7 @@ class ExperimentConfig:
     vision: VisionConfig = field(default_factory=VisionConfig)
     decoder: PixelDecoderConfig = field(default_factory=PixelDecoderConfig)
     model: DDTConfig = field(default_factory=DDTConfig)
-    waypoint: WaypointConfig = field(default_factory=WaypointConfig)
+    cascade: CascadeConfig = field(default_factory=CascadeConfig)
     repa: RepaConfig = field(default_factory=RepaConfig)
     compile: CompileConfig = field(default_factory=CompileConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
@@ -338,7 +335,7 @@ class ExperimentConfig:
         self.vision.validate()
         self.decoder.validate()
         self.model.validate()
-        self.waypoint.validate()
+        self.cascade.validate()
         self.repa.validate(self.model.depth[0])
         if self.model.input_shape != self.vision.token_shape:
             raise ValueError("vision and diffusion token shapes must match")

@@ -47,12 +47,11 @@ def test_paired_endpoint_cache_roundtrip_resume_and_size(tmp_path) -> None:
     assert manifest["complete"] is True
 
 
-def test_endpoint_cache_fingerprint_tracks_sources_not_waypoint(tmp_path) -> None:
+def test_endpoint_cache_fingerprint_tracks_sources_not_cascade(tmp_path) -> None:
     config = ExperimentConfig()
     config.vision.cache.directory = str(tmp_path)
     first = endpoint_cache_spec(config, 2, "statistics")
-    config.waypoint.time = 0.7
-    config.waypoint.pool_size = 4
+    config.cascade.pool_size = 4
     second = endpoint_cache_spec(config, 2, "statistics")
     assert endpoint_cache_fingerprint(first) == endpoint_cache_fingerprint(second)
     config.data.revision = "different"

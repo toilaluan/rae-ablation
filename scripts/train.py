@@ -34,9 +34,9 @@ torch._dynamo.config.cache_size_limit = 1000
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train semantic-waypoint DDT on online or cached DINOv3 endpoints"
+        description="Train clean semantic-cascade DDT on online or cached DINOv3 endpoints"
     )
-    parser.add_argument("--config", type=Path, default=Path("configs/dino-waypoint.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/dino-cascade.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", type=Path)
@@ -50,7 +50,6 @@ def _sampling_parameters(config: ExperimentConfig) -> SamplingParameters:
         batch_size=s.batch_size,
         semantic_steps=s.semantic_steps,
         target_steps=s.target_steps,
-        waypoint_time=config.waypoint.time,
         solver=s.solver,
         timestep_shift=s.timestep_shift,
         ig_scale=s.ig_scale,
@@ -187,7 +186,7 @@ def main() -> None:
     )
     logger.event(
         f"training initialized: variant={config.model.model_variant}, "
-        f"waypoint={config.waypoint.time}, endpoint_source={endpoint_source}, "
+        f"cascade_pool={config.cascade.pool_size}, endpoint_source={endpoint_source}, "
         f"input_shape={config.model.input_shape}, "
         f"parameters={logged_config['model_parameters']['total']:,}"
     )

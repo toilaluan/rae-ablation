@@ -58,7 +58,7 @@ class SamplingOnlyModel(GuidanceModel):
 
 def test_default_step_allocation_has_explicit_solver_nfe() -> None:
     assert SamplingParameters().sampling_nfe == 50
-    assert SamplingParameters(solver="heun").sampling_nfe == 99
+    assert SamplingParameters(solver="heun").sampling_nfe == 98
 
 
 def test_euler_uses_exact_per_stage_step_allocation_and_boundary() -> None:
@@ -69,7 +69,6 @@ def test_euler_uses_exact_per_stage_step_allocation_and_boundary() -> None:
         torch.tensor([1]),
         semantic_steps=2,
         target_steps=3,
-        waypoint_time=0.5,
         timestep_shift=1,
         ig_scale=1,
         num_classes=2,
@@ -82,11 +81,11 @@ def test_euler_uses_exact_per_stage_step_allocation_and_boundary() -> None:
         TARGET_STAGE,
     ]
     assert [float(timestep[0]) for timestep in model.timesteps] == pytest.approx(
-        [1.0, 0.75, 0.5, 1 / 3, 1 / 6]
+        [1.0, 0.5, 1.0, 2 / 3, 1 / 3]
     )
 
 
-def test_heun_reports_two_n_minus_one_model_calls_without_crossing_stage() -> None:
+def test_heun_skips_singular_endpoint_correction_on_each_stage() -> None:
     model = GuidanceModel()
     ode_sample(
         model,
@@ -99,10 +98,10 @@ def test_heun_reports_two_n_minus_one_model_calls_without_crossing_stage() -> No
         solver="heun",
         num_classes=2,
     )
-    assert len(model.stages) == 2 * 5 - 1
+    assert len(model.stages) == 2 * 5 - 2
     values = [int(stage[0]) for stage in model.stages]
-    assert values[:4] == [SEMANTIC_STAGE] * 4
-    assert values[4:] == [TARGET_STAGE] * 5
+    assert values[:3] == [SEMANTIC_STAGE] * 3
+    assert values[3:] == [TARGET_STAGE] * 5
 
 
 def test_semantic_uses_internal_guidance_and_target_uses_only_cfg() -> None:
@@ -118,7 +117,7 @@ def test_semantic_uses_internal_guidance_and_target_uses_only_cfg() -> None:
         ig_scale=2,
         num_classes=2,
     )
-    # Semantic IG predicts 5 at the waypoint; target uses the conditional full=3.
+    # Semantic IG produces clean S=5; target then produces conditional T=3.
     assert pure.item() == pytest.approx(3.0)
     assert [batch.numel() for batch in pure_model.label_batches] == [1, 1]
     cfg_model = GuidanceModel()

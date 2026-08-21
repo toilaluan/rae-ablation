@@ -22,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Compute separate per-channel target and semantic DINO statistics"
     )
-    parser.add_argument("--config", type=Path, default=Path("configs/dino-waypoint.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/dino-cascade.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--batch-size", type=int, default=32, help="batch size per process")

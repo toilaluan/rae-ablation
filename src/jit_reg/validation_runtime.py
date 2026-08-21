@@ -80,17 +80,17 @@ def validate_ema(
         "decoder_sha256": decoder_digest,
         "latent_statistics_sha256": statistics_digest,
         "training_endpoint_source": endpoint_source,
-        "conditioning": "timestep-waypoint-stage-class",
+        "conditioning": "local-timestep-cascade-stage-class",
         "prediction": (
             "clean-x-full-and-base-with-repa"
             if config.repa.enabled
             else "clean-x-full-and-base"
         ),
-        "waypoint": {
-            "time": config.waypoint.time,
-            "pool_size": config.waypoint.pool_size,
-            "downsample_mode": config.waypoint.downsample_mode,
-            "upsample_mode": config.waypoint.upsample_mode,
+        "cascade": {
+            "semantic_prior": "clean-pooled-restored-block12",
+            "pool_size": config.cascade.pool_size,
+            "downsample_mode": config.cascade.downsample_mode,
+            "upsample_mode": config.cascade.upsample_mode,
         },
     }
     model = DDT(config.model, config.repa).to(device)
@@ -114,7 +114,6 @@ def validate_ema(
             labels.to(device),
             semantic_steps=parameters.semantic_steps,
             target_steps=parameters.target_steps,
-            waypoint_time=parameters.waypoint_time,
             timestep_shift=parameters.timestep_shift,
             ig_scale=parameters.ig_scale,
             ig_interval=(parameters.ig_start, parameters.ig_end),

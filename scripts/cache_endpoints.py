@@ -31,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Cache normalized block-2 and block-12 DINO endpoints"
     )
-    parser.add_argument("--config", type=Path, default=Path("configs/dino-waypoint.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/dino-cascade.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     return parser
 

@@ -6,20 +6,19 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .config import WaypointConfig
+from .config import CascadeConfig
 
 SEMANTIC_STAGE = 0
 TARGET_STAGE = 1
 
 
-class WaypointPath(NamedTuple):
+class CascadePath(NamedTuple):
     noisy: Tensor
     clean: Tensor
     velocity: Tensor
     timestep: Tensor
     stage: Tensor
-    pooled_semantic: Tensor
-    waypoint: Tensor
+    semantic_endpoint: Tensor
 
 
 class DiffusionLoss(NamedTuple):
@@ -87,11 +86,11 @@ def _expand(value: Tensor, like: Tensor) -> Tensor:
     return result
 
 
-def pool_semantic(semantic: Tensor, config: WaypointConfig) -> Tensor:
+def pool_semantic(semantic: Tensor, config: CascadeConfig) -> Tensor:
     if semantic.ndim != 4 or semantic.shape[-1] != semantic.shape[-2]:
         raise ValueError("semantic tokens must have square [B,C,H,W] shape")
     if semantic.shape[-1] % config.pool_size:
-        raise ValueError("semantic token grid must be divisible by waypoint pool size")
+        raise ValueError("semantic token grid must be divisible by cascade pool size")
     side = semantic.shape[-1]
     pooled_side = side // config.pool_size
     down_kwargs: dict[str, object] = {}
@@ -114,14 +113,14 @@ def pool_semantic(semantic: Tensor, config: WaypointConfig) -> Tensor:
     )
 
 
-def waypoint_path(
+def cascade_path(
     target: Tensor,
     semantic: Tensor,
     noise: Tensor,
     local_timestep: Tensor,
     stage: Tensor,
-    config: WaypointConfig,
-) -> WaypointPath:
+    config: CascadeConfig,
+) -> CascadePath:
     if target.shape != semantic.shape or target.shape != noise.shape:
         raise ValueError("target, semantic, and noise shapes must match")
     batch = target.shape[0]
@@ -130,33 +129,25 @@ def waypoint_path(
     if torch.any((local_timestep < 0) | (local_timestep > 1)):
         raise ValueError("local timesteps must be in [0,1]")
 
-    pooled_semantic = pool_semantic(semantic, config)
-    tau = float(config.time)
-    waypoint = (1 - tau) * pooled_semantic + tau * noise.float()
+    semantic_endpoint = pool_semantic(semantic, config)
     is_semantic = stage == SEMANTIC_STAGE
-    timestep = torch.where(
-        is_semantic,
-        tau + (1 - tau) * local_timestep.float(),
-        tau * local_timestep.float(),
-    )
+    timestep = local_timestep.float()
     t = _expand(timestep, target)
-    target_mix = t / tau
-    semantic_noisy = (1 - t) * pooled_semantic + t * noise.float()
-    target_noisy = (1 - target_mix) * target.float() + target_mix * waypoint
+    semantic_noisy = (1 - t) * semantic_endpoint + t * noise.float()
+    target_noisy = (1 - t) * target.float() + t * semantic_endpoint
     mask = _expand(is_semantic, target).bool()
     noisy = torch.where(mask, semantic_noisy, target_noisy)
-    clean = torch.where(mask, pooled_semantic, target.float())
-    semantic_velocity = noise.float() - pooled_semantic
-    target_velocity = (waypoint - target.float()) / tau
+    clean = torch.where(mask, semantic_endpoint, target.float())
+    semantic_velocity = noise.float() - semantic_endpoint
+    target_velocity = semantic_endpoint - target.float()
     velocity = torch.where(mask, semantic_velocity, target_velocity)
-    return WaypointPath(
+    return CascadePath(
         noisy,
         clean,
         velocity,
         timestep,
         stage.to(torch.long),
-        pooled_semantic,
-        waypoint,
+        semantic_endpoint,
     )
 
 
@@ -206,7 +197,7 @@ def diffusion_losses(
     if stage.shape != (noisy.shape[0],):
         raise ValueError("loss stage must have shape [B]")
     if torch.any((stage != SEMANTIC_STAGE) & (stage != TARGET_STAGE)):
-        raise ValueError("loss stage contains an unknown waypoint stage")
+        raise ValueError("loss stage contains an unknown cascade stage")
     if base_loss_weight < 0 or repa_coefficient < 0:
         raise ValueError("loss coefficients cannot be negative")
     full = F.mse_loss(

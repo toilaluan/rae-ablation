@@ -26,7 +26,7 @@ from jit_reg.vision import vision_fingerprint
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Sample a schema-v15 DINO waypoint checkpoint")
+    parser = argparse.ArgumentParser(description="Sample a schema-v16 DINO cascade checkpoint")
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--num-samples", type=int)
     parser.add_argument("--batch-size", type=int)
@@ -59,7 +59,6 @@ def main() -> None:
         batch_size=int(_value(args.batch_size, defaults.batch_size)),
         semantic_steps=int(_value(args.semantic_steps, defaults.semantic_steps)),
         target_steps=int(_value(args.target_steps, defaults.target_steps)),
-        waypoint_time=config.waypoint.time,
         solver=str(_value(args.solver, defaults.solver)),
         timestep_shift=float(_value(args.timestep_shift, defaults.timestep_shift)),
         ig_scale=float(_value(args.ig_scale, defaults.ig_scale)),
@@ -105,7 +104,6 @@ def main() -> None:
             batch_labels,
             semantic_steps=parameters.semantic_steps,
             target_steps=parameters.target_steps,
-            waypoint_time=parameters.waypoint_time,
             timestep_shift=parameters.timestep_shift,
             ig_scale=parameters.ig_scale,
             ig_interval=(parameters.ig_start, parameters.ig_end),
@@ -137,17 +135,17 @@ def main() -> None:
             "decoder_sha256": decoder_digest,
             "latent_statistics_sha256": statistics_digest,
             "training_endpoint_source": metadata.get("endpoint_cache_fingerprint"),
-            "conditioning": "timestep-waypoint-stage-class",
+            "conditioning": "local-timestep-cascade-stage-class",
             "prediction": (
                 "clean-x-full-and-base-with-repa"
                 if config.repa.enabled
                 else "clean-x-full-and-base"
             ),
-            "waypoint": {
-                "time": config.waypoint.time,
-                "pool_size": config.waypoint.pool_size,
-                "downsample_mode": config.waypoint.downsample_mode,
-                "upsample_mode": config.waypoint.upsample_mode,
+            "cascade": {
+                "semantic_prior": "clean-pooled-restored-block12",
+                "pool_size": config.cascade.pool_size,
+                "downsample_mode": config.cascade.downsample_mode,
+                "upsample_mode": config.cascade.upsample_mode,
             },
         },
         checkpoint_hash=digest,

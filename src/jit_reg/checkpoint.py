@@ -13,8 +13,8 @@ from torch import Tensor, nn
 
 from .model.compile import clean_state_dict
 
-CHECKPOINT_SCHEMA_VERSION = 15
-TRAINING_STATE_SCHEMA_VERSION = 15
+CHECKPOINT_SCHEMA_VERSION = 16
+TRAINING_STATE_SCHEMA_VERSION = 16
 
 
 def _contiguous(state: dict[str, object]) -> dict[str, Tensor]:
@@ -102,7 +102,7 @@ class CheckpointManager:
     ) -> Path:
         if not all((feature_fingerprint, decoder_sha256, latent_statistics_sha256, endpoint_cache_fingerprint)):
             raise ValueError(
-                "schema-v15 checkpoints require vision, endpoint-source, statistics, and decoder provenance"
+                "schema-v16 checkpoints require vision, endpoint-source, statistics, and decoder provenance"
             )
         name = f"epoch-{completed_epoch:04d}"
         target = self.directory / name
@@ -226,7 +226,7 @@ class CheckpointManager:
         metadata_path = path / "metadata.json"
         if not metadata_path.is_file():
             raise ValueError(
-                "checkpoint predates schema v15; old checkpoints are not supported"
+                "checkpoint predates schema v16; old checkpoints are not supported"
             )
         metadata = json.loads(metadata_path.read_text())
         if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:

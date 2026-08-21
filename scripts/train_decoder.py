@@ -32,7 +32,7 @@ from jit_reg.wandb_utils import RunLogger
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the DINO target-token pixel decoder")
-    parser.add_argument("--config", type=Path, default=Path("configs/dino-waypoint.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/dino-cascade.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path, default=Path("decoder-runs/default"))
     parser.add_argument("--resume", type=Path)

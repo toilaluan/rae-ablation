@@ -68,21 +68,10 @@ def _guided_x(
     return torch.where(active, guided, full)
 
 
-def _leg_schedule(
-    stage: int,
-    steps: int,
-    waypoint_time: float,
-    timestep_shift: float,
-    device: torch.device,
-) -> Tensor:
-    local = shift_timestep(
+def _leg_schedule(steps: int, timestep_shift: float, device: torch.device) -> Tensor:
+    return shift_timestep(
         torch.linspace(1, 0, steps + 1, device=device), timestep_shift
     )
-    if stage == SEMANTIC_STAGE:
-        return waypoint_time + (1 - waypoint_time) * local
-    if stage == TARGET_STAGE:
-        return waypoint_time * local
-    raise ValueError("unknown waypoint stage")
 
 
 @torch.inference_mode()
@@ -93,7 +82,6 @@ def ode_sample(
     *,
     semantic_steps: int = 10,
     target_steps: int = 40,
-    waypoint_time: float = 0.5,
     timestep_shift: float = 1.0,
     ig_scale: float = 1.78,
     ig_interval: tuple[float, float] = (0.1, 1.0),
@@ -103,11 +91,9 @@ def ode_sample(
     num_classes: int | None = None,
     velocity_denominator_floor: float = 0.05,
 ) -> Tensor:
-    """Integrate noise through a noisy semantic waypoint to target tokens."""
+    """Integrate noise to a clean semantic endpoint, then semantic to target."""
     if semantic_steps < 1 or target_steps < 1 or solver not in {"euler", "heun"}:
         raise ValueError("sampling requires positive per-stage steps and euler or heun")
-    if not 0 < waypoint_time < 1:
-        raise ValueError("waypoint time must be in (0,1)")
     if not math.isfinite(timestep_shift) or timestep_shift <= 0:
         raise ValueError("timestep shift must be finite and positive")
     for name, scale in (("IG", ig_scale), ("CFG", cfg_scale)):
@@ -125,8 +111,6 @@ def ode_sample(
 
     state = noise.float()
     null_labels = torch.full_like(labels, num_classes)
-    total_steps = semantic_steps + target_steps
-    completed_steps = 0
 
     def predict_x(x: Tensor, timestep: Tensor, stage_value: int) -> Tensor:
         if stage_value == SEMANTIC_STAGE:
@@ -175,27 +159,15 @@ def ode_sample(
     segments = (
         (
             SEMANTIC_STAGE,
-            _leg_schedule(
-                SEMANTIC_STAGE,
-                semantic_steps,
-                waypoint_time,
-                timestep_shift,
-                noise.device,
-            ),
+            _leg_schedule(semantic_steps, timestep_shift, noise.device),
         ),
         (
             TARGET_STAGE,
-            _leg_schedule(
-                TARGET_STAGE,
-                target_steps,
-                waypoint_time,
-                timestep_shift,
-                noise.device,
-            ),
+            _leg_schedule(target_steps, timestep_shift, noise.device),
         ),
     )
     for stage_value, schedule in segments:
-        for current, following in pairwise(schedule):
+        for step_index, (current, following) in enumerate(pairwise(schedule), start=1):
             prediction = predict_x(state, current, stage_value)
             velocity = x_to_velocity(
                 state,
@@ -205,8 +177,7 @@ def ode_sample(
             )
             step_size = following - current
             proposed = state + step_size * velocity
-            completed_steps += 1
-            if solver == "heun" and completed_steps < total_steps:
+            if solver == "heun" and step_index < schedule.numel() - 1:
                 corrected_x = predict_x(proposed, following, stage_value)
                 corrected_velocity = x_to_velocity(
                     proposed,

@@ -18,10 +18,10 @@ from .flops import model_flops_per_step
 from .model.tokens import classifier_free_labels
 from .objective import (
     SEMANTIC_STAGE,
+    cascade_path,
     diffusion_losses,
     sample_stages,
     sample_timesteps,
-    waypoint_path,
 )
 from .optim import CompositeOptimizer, learning_rate_at_epoch, set_learning_rate
 from .rng import RNGStreams
@@ -283,7 +283,7 @@ def train(
                 target_tokens.shape[0],
                 streams.stage,
                 device,
-                config.waypoint.semantic_stage_probability,
+                config.cascade.semantic_stage_probability,
             )
             noise = torch.randn(
                 target_tokens.shape,
@@ -291,13 +291,13 @@ def train(
                 dtype=torch.float32,
                 generator=streams.noise,
             )
-            path = waypoint_path(
+            path = cascade_path(
                 target_tokens,
                 semantic_tokens,
                 noise,
                 local_timesteps,
                 stages,
-                config.waypoint,
+                config.cascade,
             )
             model_labels = classifier_free_labels(
                 labels,
@@ -355,8 +355,7 @@ def train(
                 "train/base_semantic_velocity_loss": losses.base_semantic_velocity.item(),
                 "train/repa_loss": losses.repa.item(),
                 "train/repa_cosine_similarity": losses.cosine_similarity.item(),
-                "train/local_timestep_mean": local_timesteps.mean().item(),
-                "train/global_timestep_mean": path.timestep.mean().item(),
+                "train/timestep_mean": path.timestep.mean().item(),
                 "train/semantic_stage_fraction": semantic_fraction.item(),
                 "train/target_stage_fraction": (1 - semantic_fraction).item(),
                 "train/lr": lr,

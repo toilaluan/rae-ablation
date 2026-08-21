@@ -199,7 +199,7 @@ class StageEmbedder(nn.Module):
 
 
 class DDT(nn.Module):
-    """Waypoint-conditioned DDT with base prediction and optional training-only REPA."""
+    """Stage-conditioned semantic-cascade DDT with optional training-only REPA."""
 
     def __init__(
         self,

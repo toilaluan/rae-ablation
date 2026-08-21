@@ -45,16 +45,15 @@ def _paths(value: Any, prefix: str = "") -> set[str]:
     return {prefix}
 
 
-def test_schema_v15_defaults_and_single_complete_preset() -> None:
+def test_schema_v16_defaults_and_single_complete_preset() -> None:
     config = ExperimentConfig()
     config.validate()
-    assert config.schema_version == CONFIG_SCHEMA_VERSION == 15
+    assert config.schema_version == CONFIG_SCHEMA_VERSION == 16
     assert config.vision.token_shape == (768, 8, 8)
     assert config.model.input_shape == config.vision.token_shape
     assert config.model.base_model_depth == 4
     assert config.model.num_stage_tokens == 4
-    assert config.waypoint.time == 0.5
-    assert config.waypoint.pool_size == 2
+    assert config.cascade.pool_size == 2
     assert config.sampling.semantic_steps == 10
     assert config.sampling.target_steps == 40
     assert config.sampling.ig_scale == 1.78
@@ -62,10 +61,10 @@ def test_schema_v15_defaults_and_single_complete_preset() -> None:
         enabled=True, layer_depth=8, projector_width=2048, coefficient=0.5
     )
 
-    preset = load_config("configs/dino-waypoint.yaml")
+    preset = load_config("configs/dino-cascade.yaml")
     assert preset.repa.enabled is False
     raw = OmegaConf.to_container(
-        OmegaConf.load("configs/dino-waypoint.yaml"), resolve=True
+        OmegaConf.load("configs/dino-cascade.yaml"), resolve=True
     )
     assert isinstance(raw, dict)
     assert _paths(raw) == _paths(preset.as_dict())
@@ -73,18 +72,18 @@ def test_schema_v15_defaults_and_single_complete_preset() -> None:
 
 def test_old_and_unknown_configuration_are_rejected(tmp_path) -> None:
     old = tmp_path / "old.yaml"
-    old.write_text("schema_version: 14\n")
-    with pytest.raises(ValueError, match="schema_version: 15"):
+    old.write_text("schema_version: 15\n")
+    with pytest.raises(ValueError, match="schema_version: 16"):
         load_config(old)
     current = tmp_path / "current.yaml"
-    current.write_text("schema_version: 15\nunknown: true\n")
-    with pytest.raises(ValueError, match="schema-v15"):
+    current.write_text("schema_version: 16\nunknown: true\n")
+    with pytest.raises(ValueError, match="schema-v16"):
         load_config(current)
 
 
-def test_waypoint_and_base_depth_validation() -> None:
+def test_cascade_and_base_depth_validation() -> None:
     config = ExperimentConfig()
-    config.waypoint.pool_size = 3
+    config.cascade.pool_size = 3
     with pytest.raises(ValueError, match="divide"):
         config.validate()
     config = tiny_config()
