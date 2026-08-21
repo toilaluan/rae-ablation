@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from jit_reg.config import WandbConfig
 from jit_reg.wandb_utils import RunLogger
 
@@ -57,3 +59,21 @@ def test_decoder_console_logging_uses_current_metric_keys(capsys) -> None:
     output = capsys.readouterr().out
     assert "loss=1.000000" in output
     assert "gan=1" in output
+
+
+def test_wandb_training_logs_only_at_interval_or_forced_step() -> None:
+    class FakeRun:
+        def __init__(self) -> None:
+            self.calls: list[tuple[dict[str, Any], int | None]] = []
+
+        def log(self, metrics: dict[str, Any], step: int | None = None) -> None:
+            self.calls.append((metrics, step))
+
+    logger = RunLogger(WandbConfig(enabled=False), {}, False, log_interval=3)
+    run = FakeRun()
+    logger.run = run
+    logger.log_training({"value": 1}, step=1)
+    logger.log_training({"value": 2}, step=2)
+    logger.log_training({"value": 3}, step=3)
+    logger.log_training({"value": 4}, step=4, force=True)
+    assert run.calls == [({"value": 3}, 3), ({"value": 4}, 4)]

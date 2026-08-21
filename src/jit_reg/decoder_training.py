@@ -327,8 +327,9 @@ def train_decoder(
         canonical_decoder.train()
         canonical_discriminator.train()
         feature_encoder.eval()
-        for pixels, _indices in train_loader:
-            started = time.perf_counter()
+        window_started = time.perf_counter()
+        window_start_step = state.global_step
+        for batch_index, (pixels, _indices) in enumerate(train_loader):
             progress = min((state.global_step + 1) / max(total_steps, 1), 1.0)
             learning_rate = _lr(progress, config)
             _set_lr(generator_optimizer, learning_rate)
@@ -372,28 +373,46 @@ def train_decoder(
             _set_requires_grad(canonical_discriminator, True)
             ema.update(canonical_decoder)
             state.global_step += 1
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            elapsed = max(time.perf_counter() - started, 1e-9)
-            metrics = {
-                "decoder/epoch": epoch_index + state.global_step / max(total_steps, 1),
-                "decoder/global_step": state.global_step,
-                "decoder/loss": losses.total.item(),
-                "decoder/l1": losses.l1.item(),
-                "decoder/lpips": losses.lpips.item(),
-                "decoder/generator_adversarial": losses.adversarial.item(),
-                "decoder/discriminator": discriminator_loss.item(),
-                "decoder/gan_active": float(gan_active),
-                "decoder/lr": learning_rate,
-                "decoder/gradient_norm": float(grad_norm),
-                "throughput/images_per_second": target.shape[0] / elapsed,
-                "throughput/step_seconds": elapsed,
-                "throughput/data_wait_seconds": 0.0,
-                "system/peak_memory_gib": torch.cuda.max_memory_allocated(device) / 2**30
-                if device.type == "cuda"
-                else 0.0,
-            }
-            logger.log_decoder_training(metrics, state.global_step)
+            reached_limit = (
+                train.max_steps is not None and state.global_step >= train.max_steps
+            )
+            final_training_step = (
+                epoch_index + 1 == train.epochs
+                and batch_index + 1 == len(train_loader)
+            )
+            force_log = reached_limit or final_training_step
+            if logger.should_log_training(state.global_step, force=force_log):
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                window_steps = state.global_step - window_start_step
+                elapsed = max(time.perf_counter() - window_started, 1e-9)
+                metrics = {
+                    "decoder/epoch": epoch_index
+                    + state.global_step / max(total_steps, 1),
+                    "decoder/global_step": state.global_step,
+                    "decoder/loss": losses.total.item(),
+                    "decoder/l1": losses.l1.item(),
+                    "decoder/lpips": losses.lpips.item(),
+                    "decoder/generator_adversarial": losses.adversarial.item(),
+                    "decoder/discriminator": discriminator_loss.item(),
+                    "decoder/gan_active": float(gan_active),
+                    "decoder/lr": learning_rate,
+                    "decoder/gradient_norm": float(grad_norm),
+                    "throughput/images_per_second": (
+                        target.shape[0] * window_steps / elapsed
+                    ),
+                    "throughput/step_seconds": elapsed / window_steps,
+                    "throughput/data_wait_seconds": 0.0,
+                    "system/peak_memory_gib": torch.cuda.max_memory_allocated(device)
+                    / 2**30
+                    if device.type == "cuda"
+                    else 0.0,
+                }
+                window_started = time.perf_counter()
+                window_start_step = state.global_step
+                logger.log_decoder_training(
+                    metrics, state.global_step, force=force_log
+                )
             if rank == 0 and state.global_step % train.sample_interval == 0:
                 preview = output / "previews" / f"step-{state.global_step:08d}.png"
                 _save_grid(target, reconstructed, preview)
@@ -403,7 +422,7 @@ def train_decoder(
                     state.global_step,
                     key="decoder/train_preview",
                 )
-            if train.max_steps is not None and state.global_step >= train.max_steps:
+            if reached_limit:
                 break
         state.epoch = epoch_index + 1
         final = state.epoch == train.epochs or (

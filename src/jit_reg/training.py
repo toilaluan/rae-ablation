@@ -247,10 +247,13 @@ def train(
             feature_encoder.eval()
         epoch_started = time.perf_counter()
         iterator = _PreparedBatchIterator(iter(loader), device)
-        previous_wait = 0.0
+        window_started = time.perf_counter()
+        window_start_step = state.global_step
+        previous_wait = iterator.data_wait_seconds
+        feature_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        feature_seconds_cpu = 0.0
         validation_metrics: dict[str, float] = {}
         for batch_index in range(len(loader)):
-            step_started = epoch_started if batch_index == 0 else time.perf_counter()
             pixels, cached_target, cached_semantic, labels, _indices = iterator.consume()
             if batch_index + 1 < len(loader):
                 iterator.preload()
@@ -268,9 +271,11 @@ def train(
             else:
                 target_tokens = cached_target
                 semantic_tokens = cached_semantic
-            feature_seconds_cpu = time.perf_counter() - feature_started
+            feature_seconds_cpu += time.perf_counter() - feature_started
             if feature_end_event is not None:
                 feature_end_event.record()
+                if feature_start_event is not None:
+                    feature_events.append((feature_start_event, feature_end_event))
             local_timesteps = sample_timesteps(
                 target_tokens.shape[0],
                 streams.timesteps,
@@ -338,43 +343,69 @@ def train(
                 config.train.max_steps is not None
                 and state.global_step >= config.train.max_steps
             )
-            data_wait = iterator.data_wait_seconds - previous_wait
-            previous_wait = iterator.data_wait_seconds
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            feature_seconds = (
-                feature_start_event.elapsed_time(feature_end_event) / 1000
-                if feature_start_event is not None and feature_end_event is not None
-                else feature_seconds_cpu
+            final_training_step = (
+                epoch_index + 1 == config.train.epochs
+                and batch_index + 1 == len(loader)
             )
-            elapsed = max(time.perf_counter() - step_started, 1e-9)
-            semantic_fraction = (stages == SEMANTIC_STAGE).float().mean()
-            metrics = {
-                "train/loss": losses.total.item(),
-                "train/full_velocity_loss": losses.full_velocity.item(),
-                "train/base_semantic_velocity_loss": losses.base_semantic_velocity.item(),
-                "train/repa_loss": losses.repa.item(),
-                "train/repa_cosine_similarity": losses.cosine_similarity.item(),
-                "train/timestep_mean": path.timestep.mean().item(),
-                "train/semantic_stage_fraction": semantic_fraction.item(),
-                "train/target_stage_fraction": (1 - semantic_fraction).item(),
-                "train/lr": lr,
-                "train/gradient_norm": float(grad_norm),
-                "train/epoch": progress,
-                "train/global_step": state.global_step,
-                "progress/images_seen": state.global_step * config.train.global_batch_size,
-                "compute/model_flops_per_step": step_flops,
-                "compute/cumulative_model_flops": state.global_step * step_flops,
-                "throughput/images_per_second": config.train.global_batch_size / elapsed,
-                "throughput/tokens_per_second": (
-                    config.train.global_batch_size * config.vision.grid_size**2 / elapsed
-                ),
-                "throughput/step_seconds": elapsed,
-                "throughput/feature_encoder_seconds": feature_seconds,
-                "throughput/data_wait_seconds": data_wait,
-                "system/peak_memory_gib": torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0.0,
-            }
-            logger.log_training(metrics, step=state.global_step)
+            force_log = reached_limit or final_training_step
+            if logger.should_log_training(state.global_step, force=force_log):
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                window_steps = state.global_step - window_start_step
+                elapsed = max(time.perf_counter() - window_started, 1e-9)
+                feature_seconds = (
+                    sum(start.elapsed_time(end) for start, end in feature_events)
+                    / 1000
+                    / window_steps
+                    if feature_events
+                    else feature_seconds_cpu / window_steps
+                )
+                data_wait = (
+                    iterator.data_wait_seconds - previous_wait
+                ) / window_steps
+                semantic_fraction = (stages == SEMANTIC_STAGE).float().mean()
+                metrics = {
+                    "train/loss": losses.total.item(),
+                    "train/full_velocity_loss": losses.full_velocity.item(),
+                    "train/base_semantic_velocity_loss": losses.base_semantic_velocity.item(),
+                    "train/repa_loss": losses.repa.item(),
+                    "train/repa_cosine_similarity": losses.cosine_similarity.item(),
+                    "train/timestep_mean": path.timestep.mean().item(),
+                    "train/semantic_stage_fraction": semantic_fraction.item(),
+                    "train/target_stage_fraction": (1 - semantic_fraction).item(),
+                    "train/lr": lr,
+                    "train/gradient_norm": float(grad_norm),
+                    "train/epoch": progress,
+                    "train/global_step": state.global_step,
+                    "progress/images_seen": state.global_step
+                    * config.train.global_batch_size,
+                    "compute/model_flops_per_step": step_flops,
+                    "compute/cumulative_model_flops": state.global_step * step_flops,
+                    "throughput/images_per_second": (
+                        config.train.global_batch_size * window_steps / elapsed
+                    ),
+                    "throughput/tokens_per_second": (
+                        config.train.global_batch_size
+                        * config.vision.grid_size**2
+                        * window_steps
+                        / elapsed
+                    ),
+                    "throughput/step_seconds": elapsed / window_steps,
+                    "throughput/feature_encoder_seconds": feature_seconds,
+                    "throughput/data_wait_seconds": data_wait,
+                    "system/peak_memory_gib": torch.cuda.max_memory_allocated(device)
+                    / 2**30
+                    if device.type == "cuda"
+                    else 0.0,
+                }
+                window_started = time.perf_counter()
+                window_start_step = state.global_step
+                previous_wait = iterator.data_wait_seconds
+                feature_events.clear()
+                feature_seconds_cpu = 0.0
+                logger.log_training(
+                    metrics, step=state.global_step, force=force_log
+                )
             if reached_limit:
                 break
         iterator.close()

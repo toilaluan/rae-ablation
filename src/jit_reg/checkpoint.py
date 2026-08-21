@@ -50,15 +50,31 @@ class EMA:
     def __init__(self, model: nn.Module, decay: float = 0.9995) -> None:
         self.decay = decay
         self.shadow = {key: value.detach().clone() for key, value in model.state_dict().items()}
+        self._floating_keys = tuple(
+            key for key, value in self.shadow.items() if value.is_floating_point()
+        )
+        self._nonfloating_keys = tuple(
+            key for key, value in self.shadow.items() if not value.is_floating_point()
+        )
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        for key, value in model.state_dict().items():
+        state = model.state_dict()
+        if state.keys() != self.shadow.keys():
+            raise ValueError("EMA state keys do not match model")
+        groups: dict[tuple[torch.device, torch.dtype], tuple[list[Tensor], list[Tensor]]] = {}
+        for key in self._floating_keys:
             target = self.shadow[key]
-            if target.is_floating_point():
-                target.lerp_(value.detach().to(target.device), 1 - self.decay)
-            else:
-                target.copy_(value)
+            source = state[key].detach()
+            if source.device != target.device or source.dtype != target.dtype:
+                raise ValueError("EMA model device or dtype changed after initialization")
+            targets, sources = groups.setdefault((target.device, target.dtype), ([], []))
+            targets.append(target)
+            sources.append(source)
+        for targets, sources in groups.values():
+            torch._foreach_lerp_(targets, sources, 1 - self.decay)
+        for key in self._nonfloating_keys:
+            self.shadow[key].copy_(state[key])
 
     def state_dict(self) -> dict[str, Tensor]:
         return self.shadow

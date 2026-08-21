@@ -55,9 +55,16 @@ class RunLogger:
         except (KeyError, TypeError, ValueError):
             return "n/a"
 
-    def log_training(self, metrics: dict[str, Any], step: int) -> None:
+    def should_log_training(self, step: int, *, force: bool = False) -> bool:
+        return force or step % self.log_interval == 0
+
+    def log_training(
+        self, metrics: dict[str, Any], step: int, *, force: bool = False
+    ) -> None:
+        if not self.should_log_training(step, force=force):
+            return
         self.log(metrics, step=step)
-        if not self.is_main_process or step % self.log_interval:
+        if not self.is_main_process:
             return
         self.event(
             "train: "
@@ -77,9 +84,13 @@ class RunLogger:
             f"peak_memory={self._metric(metrics, 'system/peak_memory_gib', '.2f')} GiB"
         )
 
-    def log_decoder_training(self, metrics: dict[str, Any], step: int) -> None:
+    def log_decoder_training(
+        self, metrics: dict[str, Any], step: int, *, force: bool = False
+    ) -> None:
+        if not self.should_log_training(step, force=force):
+            return
         self.log(metrics, step=step)
-        if not self.is_main_process or step % self.log_interval:
+        if not self.is_main_process:
             return
         self.event(
             "decoder: "
