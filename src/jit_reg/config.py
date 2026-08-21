@@ -215,8 +215,8 @@ class CascadeConfig:
             raise ValueError("cascade.downsample_mode must be area or bilinear")
         if self.upsample_mode not in {"nearest", "bilinear"}:
             raise ValueError("cascade.upsample_mode must be nearest or bilinear")
-        if not 0 < self.semantic_stage_probability < 1:
-            raise ValueError("cascade.semantic_stage_probability must be in (0,1)")
+        # if not 0 < self.semantic_stage_probability < 1:
+        #     raise ValueError("cascade.semantic_stage_probability must be in (0,1)")
 
 
 @dataclass

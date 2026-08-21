@@ -67,8 +67,8 @@ def sample_stages(
     device: torch.device | str,
     semantic_probability: float,
 ) -> Tensor:
-    if not 0 < semantic_probability < 1:
-        raise ValueError("semantic stage probability must be in (0,1)")
+    # if not 0 < semantic_probability < 1:
+    #     raise ValueError("semantic stage probability must be in (0,1)")
     semantic = torch.rand(
         batch_size, generator=generator, device=device, dtype=torch.float32
     ) < semantic_probability
