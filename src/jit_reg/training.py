@@ -310,6 +310,7 @@ def train(
                 path.noisy,
                 path.velocity,
                 path.timestep,
+                path.stage,
                 output.full_prediction,
                 output.base_prediction,
                 output.repa_projection,
@@ -349,7 +350,7 @@ def train(
             metrics = {
                 "train/loss": losses.total.item(),
                 "train/full_velocity_loss": losses.full_velocity.item(),
-                "train/base_velocity_loss": losses.base_velocity.item(),
+                "train/base_semantic_velocity_loss": losses.base_semantic_velocity.item(),
                 "train/repa_loss": losses.repa.item(),
                 "train/repa_cosine_similarity": losses.cosine_similarity.item(),
                 "train/local_timestep_mean": local_timesteps.mean().item(),

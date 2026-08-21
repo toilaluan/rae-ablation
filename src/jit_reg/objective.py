@@ -25,7 +25,7 @@ class WaypointPath(NamedTuple):
 class DiffusionLoss(NamedTuple):
     total: Tensor
     full_velocity: Tensor
-    base_velocity: Tensor
+    base_semantic_velocity: Tensor
     repa: Tensor
     cosine_similarity: Tensor
 
@@ -191,6 +191,7 @@ def diffusion_losses(
     noisy: Tensor,
     velocity_target: Tensor,
     timestep: Tensor,
+    stage: Tensor,
     full_prediction: Tensor,
     base_prediction: Tensor,
     projection: Tensor,
@@ -202,16 +203,25 @@ def diffusion_losses(
 ) -> DiffusionLoss:
     if velocity_target.shape != noisy.shape:
         raise ValueError("velocity target and noisy data shapes must match")
+    if stage.shape != (noisy.shape[0],):
+        raise ValueError("loss stage must have shape [B]")
+    if torch.any((stage != SEMANTIC_STAGE) & (stage != TARGET_STAGE)):
+        raise ValueError("loss stage contains an unknown waypoint stage")
     if base_loss_weight < 0 or repa_coefficient < 0:
         raise ValueError("loss coefficients cannot be negative")
     full = F.mse_loss(
         x_to_velocity(noisy, full_prediction, timestep, velocity_denominator_floor),
         velocity_target.float(),
     )
-    base = F.mse_loss(
-        x_to_velocity(noisy, base_prediction, timestep, velocity_denominator_floor),
-        velocity_target.float(),
+    base_error = (
+        x_to_velocity(noisy, base_prediction, timestep, velocity_denominator_floor)
+        .sub(velocity_target.float())
+        .square()
+        .flatten(1)
+        .mean(1)
     )
+    semantic_mask = (stage == SEMANTIC_STAGE).to(base_error.dtype)
+    base = (base_error * semantic_mask).sum() / semantic_mask.sum().clamp_min(1)
     repa, similarity = repa_cosine_loss(projection, semantic)
     total = full + base_loss_weight * base + repa_coefficient * repa
     return DiffusionLoss(total, full, base, repa, similarity)

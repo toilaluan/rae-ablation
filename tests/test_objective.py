@@ -76,6 +76,7 @@ def test_x_prediction_velocity_and_weighted_losses() -> None:
         noisy,
         target_velocity,
         timestep,
+        torch.tensor([SEMANTIC_STAGE]),
         clean,
         torch.zeros_like(clean),
         projection,
@@ -86,8 +87,56 @@ def test_x_prediction_velocity_and_weighted_losses() -> None:
     assert losses.full_velocity.item() == 0
     assert losses.repa.item() == pytest.approx(-1.0)
     assert losses.total.item() == pytest.approx(
-        0.5 * losses.base_velocity.item() - 0.5
+        0.5 * losses.base_semantic_velocity.item() - 0.5
     )
+
+
+def test_base_loss_uses_only_semantic_stage_examples() -> None:
+    noisy = torch.ones(2, 1, 1, 1)
+    velocity_target = torch.zeros_like(noisy)
+    timestep = torch.ones(2)
+    stages = torch.tensor([SEMANTIC_STAGE, TARGET_STAGE])
+    full_prediction = noisy.clone()
+    base_prediction = torch.zeros_like(noisy, requires_grad=True)
+    semantic = torch.ones_like(noisy)
+    projection = semantic.flatten(2).transpose(1, 2)
+    losses = diffusion_losses(
+        noisy,
+        velocity_target,
+        timestep,
+        stages,
+        full_prediction,
+        base_prediction,
+        projection,
+        semantic,
+        repa_coefficient=0,
+    )
+    assert losses.base_semantic_velocity.item() == pytest.approx(1.0)
+    losses.total.backward()
+    assert base_prediction.grad is not None
+    assert base_prediction.grad[0].abs().sum() > 0
+    assert base_prediction.grad[1].abs().sum() == 0
+
+
+def test_base_loss_is_safe_when_batch_has_no_semantic_examples() -> None:
+    noisy = torch.ones(2, 1, 1, 1)
+    base_prediction = torch.zeros_like(noisy, requires_grad=True)
+    semantic = torch.ones_like(noisy)
+    losses = diffusion_losses(
+        noisy,
+        torch.zeros_like(noisy),
+        torch.ones(2),
+        torch.full((2,), TARGET_STAGE),
+        noisy.clone(),
+        base_prediction,
+        semantic.flatten(2).transpose(1, 2),
+        semantic,
+        repa_coefficient=0,
+    )
+    assert losses.base_semantic_velocity.item() == 0
+    losses.total.backward()
+    assert base_prediction.grad is not None
+    assert torch.count_nonzero(base_prediction.grad) == 0
 
 
 def test_stage_sampling_and_logit_normal_timestep_shift() -> None:

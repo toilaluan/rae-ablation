@@ -64,7 +64,7 @@ class RunLogger:
             f"step={step} epoch={self._metric(metrics, 'train/epoch', '.3f')} "
             f"loss={self._metric(metrics, 'train/loss', '.6f')} "
             f"full_velocity={self._metric(metrics, 'train/full_velocity_loss', '.6f')} "
-            f"base_velocity={self._metric(metrics, 'train/base_velocity_loss', '.6f')} "
+            f"base_semantic_velocity={self._metric(metrics, 'train/base_semantic_velocity_loss', '.6f')} "
             f"repa={self._metric(metrics, 'train/repa_loss', '.6f')} "
             f"repa_cos={self._metric(metrics, 'train/repa_cosine_similarity', '.3f')} "
             f"local_t={self._metric(metrics, 'train/local_timestep_mean', '.3f')} "

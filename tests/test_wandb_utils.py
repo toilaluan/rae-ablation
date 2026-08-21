@@ -13,7 +13,7 @@ def test_training_console_metrics_match_waypoint_training(capsys) -> None:
         "train/epoch": 0.25,
         "train/loss": 1.0,
         "train/full_velocity_loss": 0.2,
-        "train/base_velocity_loss": 0.3,
+        "train/base_semantic_velocity_loss": 0.3,
         "train/repa_loss": 0.4,
         "train/repa_cosine_similarity": 0.5,
         "train/local_timestep_mean": 0.6,
@@ -29,11 +29,11 @@ def test_training_console_metrics_match_waypoint_training(capsys) -> None:
     _logger().log_training(metrics, step=1)
     output = capsys.readouterr().out
     assert "full_velocity=0.200000" in output
-    assert "base_velocity=0.300000" in output
+    assert "base_semantic_velocity=0.300000" in output
     assert "local_t=0.600" in output
     assert "semantic=0.500" in output
     assert "velocity=" not in output.replace("full_velocity=", "").replace(
-        "base_velocity=", ""
+        "base_semantic_velocity=", ""
     )
 
 

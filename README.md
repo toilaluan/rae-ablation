@@ -32,9 +32,10 @@ target:   t = tau * u
 ```
 
 The shallow base head exits after encoder block 4; the full head uses the complete
-DDT. Both predict the active clean endpoint. Their predictions are converted to
-velocity with `(xt - prediction) / max(t, 0.05)`. REPA aligns encoder block 8 with
-the original unpooled block-12 features.
+DDT. The full head is supervised on both trajectory legs, while the base-head loss is
+applied only to semantic-leg examples. Predictions are converted to velocity with
+`(xt - prediction) / max(t, 0.05)`. REPA aligns encoder block 8 with the original
+unpooled block-12 features.
 
 Sampling applies internal guidance in clean-prediction space, then CFG, then velocity
 conversion. The default trajectory uses 10 semantic steps from `1 -> 0.5` and 40
