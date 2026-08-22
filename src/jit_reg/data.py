@@ -11,7 +11,7 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from .config import DataConfig
+from .config import DINO_CHANNELS, DINO_GRID_SIZE, DINO_PATCH_SIZE, IMAGE_SIZE, DataConfig
 
 
 def prepare_pixels(
@@ -32,6 +32,45 @@ def prepare_pixels(
     return prepared
 
 
+def patchify_rgb(pixels: Tensor) -> Tensor:
+    """Convert 128px RGB images into the 768x8x8 flow endpoint layout."""
+    if pixels.ndim != 4 or tuple(pixels.shape[1:]) != (3, IMAGE_SIZE, IMAGE_SIZE):
+        raise ValueError(
+            f"RGB patchification expects [B,3,{IMAGE_SIZE},{IMAGE_SIZE}], "
+            f"received {tuple(pixels.shape)}"
+        )
+    batch = pixels.shape[0]
+    patch = DINO_PATCH_SIZE
+    grid = DINO_GRID_SIZE
+    return (
+        pixels.reshape(batch, 3, grid, patch, grid, patch)
+        .permute(0, 2, 4, 3, 5, 1)
+        .reshape(batch, grid, grid, DINO_CHANNELS)
+        .permute(0, 3, 1, 2)
+        .contiguous()
+    )
+
+
+def unpatchify_rgb(patches: Tensor) -> Tensor:
+    """Invert :func:`patchify_rgb` without changing values."""
+    expected = (DINO_CHANNELS, DINO_GRID_SIZE, DINO_GRID_SIZE)
+    if patches.ndim != 4 or tuple(patches.shape[1:]) != expected:
+        raise ValueError(
+            f"RGB unpatchification expects [B,{expected[0]},{expected[1]},{expected[2]}], "
+            f"received {tuple(patches.shape)}"
+        )
+    batch = patches.shape[0]
+    patch = DINO_PATCH_SIZE
+    grid = DINO_GRID_SIZE
+    return (
+        patches.permute(0, 2, 3, 1)
+        .reshape(batch, grid, grid, patch, patch, 3)
+        .permute(0, 5, 1, 3, 2, 4)
+        .reshape(batch, 3, IMAGE_SIZE, IMAGE_SIZE)
+        .contiguous()
+    )
+
+
 def preprocessing_metadata(config: DataConfig, image_size: int) -> dict[str, Any]:
     return {
         "repository": config.repository,
@@ -44,8 +83,9 @@ def preprocessing_metadata(config: DataConfig, image_size: int) -> dict[str, Any
             f"PIL.resize({image_size}x{image_size}, bicubic) when needed",
             "uint8_to_float32_[0,1]",
             "online_frozen_dinov3_b16_imagenet_normalization",
-            "shared_final_layernorm_target_and_semantic_patch_tokens",
-            "shared_dataset_per_channel_latent_normalization",
+            "raw_block2_patch_states_before_final_layernorm",
+            "final_layernorm_block12_semantic_patch_tokens",
+            "separate_target-semantic-rgb-patch_normalization",
         ],
     }
 

@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import asdict
+from typing import NamedTuple
 
 import torch
 from torch import Tensor, nn
@@ -23,15 +24,20 @@ def vision_fingerprint(config: VisionConfig) -> str:
         **vision_config,
         "compile": None,
         "normalization": {"mean": IMAGENET_MEAN, "std": IMAGENET_STD},
-        "tokens": "patch-only-after-shared-final-layernorm",
+        "tokens": "raw-block2-and-finalnorm-block12-patches",
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
 
+class VisionEndpoints(NamedTuple):
+    target: Tensor
+    semantic: Tensor
+
+
 class DINOEndpointEncoder(nn.Module):
-    """Frozen DINOv3-B/16 that captures normalized patch endpoints in one traversal."""
+    """Frozen DINOv3-B/16 exposing a suffix-composable raw block-2 state."""
 
     def __init__(
         self,
@@ -59,7 +65,7 @@ class DINOEndpointEncoder(nn.Module):
         )
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
-        self._execution: Callable[[Tensor], tuple[Tensor, Tensor]] = self._forward_impl
+        self._execution: Callable[[Tensor], VisionEndpoints] = self._forward_impl
 
     def train(self, mode: bool = True) -> DINOEndpointEncoder:
         del mode
@@ -98,7 +104,7 @@ class DINOEndpointEncoder(nn.Module):
             values = values / 255
         return (values - self.pixel_mean) / self.pixel_std
 
-    def _forward_impl(self, pixels: Tensor) -> tuple[Tensor, Tensor]:
+    def _forward_impl(self, pixels: Tensor) -> VisionEndpoints:
         values = self._prepare(pixels)
         weight = self.model.embeddings.patch_embeddings.weight
         values = values.to(dtype=weight.dtype)
@@ -109,7 +115,7 @@ class DINOEndpointEncoder(nn.Module):
         for index, block in enumerate(self.model.layer[:stop], start=1):
             states = block(states, position_embeddings=positions)
             if index == self.config.target_layer:
-                target = self.model.norm(states)
+                target = states
         if target is None:
             raise RuntimeError("DINO target layer was not reached")
         semantic = self.model.norm(states) if self.include_semantic else target
@@ -122,21 +128,19 @@ class DINOEndpointEncoder(nn.Module):
                 if self.include_semantic
                 else target_patches
             )
-        return target_patches, semantic_patches
+        return VisionEndpoints(target_patches, semantic_patches)
 
     @torch.no_grad()
-    def forward(self, pixels: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, pixels: Tensor) -> VisionEndpoints:
         return self._execution(pixels)
 
     def encode_target(self, pixels: Tensor) -> Tensor:
-        target, _semantic = self(pixels)
-        return target
+        return self(pixels).target
 
-    def encode_pair(self, pixels: Tensor) -> tuple[Tensor, Tensor]:
+    def encode_pair(self, pixels: Tensor) -> VisionEndpoints:
         if not self.include_semantic:
             raise RuntimeError("this DINO encoder was configured for target-only extraction")
         return self(pixels)
-
 
 def load_dino_encoder(
     config: VisionConfig,

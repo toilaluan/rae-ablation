@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jit-reg"
-version = "0.1.0"
-description = "DINOv3 token-space diffusion with a clean semantic cascade"
+version = "0.6.0"
+description = "Matched Gaussian DINOv3 semantic-conditioned endpoint flows"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

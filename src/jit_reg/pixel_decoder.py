@@ -12,7 +12,7 @@ from safetensors.torch import load_file
 from torch import Tensor, nn
 
 from .config import DINO_CHANNELS, DINO_GRID_SIZE, IMAGE_SIZE, PixelDecoderConfig
-from .model.ddt import DDTEncoderBlock, RMSNorm
+from .model.layers import RMSNorm, UnconditionedTransformerBlock
 
 
 class TransformerPixelDecoder(nn.Module):
@@ -24,12 +24,11 @@ class TransformerPixelDecoder(nn.Module):
         self.config.validate()
         self.input_projection = nn.Linear(DINO_CHANNELS, self.config.width)
         self.blocks = nn.ModuleList(
-            DDTEncoderBlock(
+            UnconditionedTransformerBlock(
                 self.config.width,
                 self.config.num_heads,
                 self.config.mlp_ratio,
                 DINO_GRID_SIZE,
-                0,
             )
             for _ in range(self.config.depth)
         )

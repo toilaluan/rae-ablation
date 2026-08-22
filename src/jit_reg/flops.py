@@ -16,44 +16,24 @@ def _mlp_flops(tokens: int, width: int, ratio: float) -> int:
     return 6 * tokens * width * hidden
 
 
-def ddt_forward_flops(
-    config: ExperimentConfig, *, include_repa: bool | None = None
-) -> int:
-    """Approximate FLOPs for one v16 diffusion forward pass."""
+def semantic_dit_forward_flops(config: ExperimentConfig) -> int:
+    """Approximate FLOPs for one semantic-conditioned DiT forward pass."""
     model = config.model
     spatial = model.grid_size**2
-    condition = model.num_timestep_tokens + model.num_stage_tokens + model.num_class_tokens
-    enc_tokens = spatial + condition
-    enc_width, dec_width = model.hidden_size
-    enc_heads, dec_heads = model.num_heads
-    enc_patch = model.patch_size[0] ** 2 * model.in_channels
-    dec_patch = model.patch_size[1] ** 2 * model.in_channels
-    total = 2 * spatial * enc_patch * enc_width
-    total += model.depth[0] * (
-        _attention_flops(enc_tokens, enc_width, enc_heads)
-        + _mlp_flops(enc_tokens, enc_width, model.mlp_ratio)
+    width = model.hidden_size
+    patch_width = model.patch_size**2 * model.in_channels
+    total = 4 * spatial * patch_width * width
+    total += 2 * 256 * width + 2 * width * width
+    total += model.depth * (
+        _attention_flops(spatial, width, model.num_heads)
+        + _mlp_flops(spatial, width, model.mlp_ratio)
+        + 12 * spatial * width * width
     )
-    total += 2 * spatial * enc_width * dec_width
-    total += 2 * spatial * dec_patch * dec_width
-    total += model.depth[1] * (
-        _attention_flops(spatial, dec_width, dec_heads)
-        + _mlp_flops(spatial, dec_width, model.mlp_ratio)
-        + 12 * spatial * dec_width * dec_width
-    )
-    total += 2 * spatial * dec_width * dec_patch + 4 * spatial * dec_width * dec_width
-    total += 2 * spatial * enc_width * enc_patch + 4 * spatial * enc_width * enc_width
-    if include_repa is None:
-        include_repa = config.repa.enabled
-    if include_repa:
-        repa_width = config.repa.projector_width
-        total += 2 * spatial * (
-            enc_width * repa_width
-            + repa_width * repa_width
-            + repa_width * model.in_channels
-        )
+    total += 4 * spatial * width * width
+    total += 2 * spatial * width * patch_width
     return total
 
 
 def model_flops_per_step(config: ExperimentConfig) -> int:
-    """Approximate global forward/backward DDT FLOPs, excluding frozen DINO."""
-    return config.train.global_batch_size * 3 * ddt_forward_flops(config)
+    """Approximate global DiT forward/backward FLOPs, excluding frozen DINO."""
+    return config.flow.train.global_batch_size * 3 * semantic_dit_forward_flops(config)

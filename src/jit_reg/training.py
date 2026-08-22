@@ -13,16 +13,10 @@ from torch.utils.data._utils.collate import default_collate
 
 from .checkpoint import EMA, CheckpointManager, should_checkpoint
 from .config import ExperimentConfig
+from .data import patchify_rgb, prepare_pixels
 from .endpoint_cache import EndpointCache
-from .flops import model_flops_per_step
-from .model.tokens import classifier_free_labels
-from .objective import (
-    SEMANTIC_STAGE,
-    cascade_path,
-    diffusion_losses,
-    sample_stages,
-    sample_timesteps,
-)
+from .latent_statistics import EndpointLatentNormalizer
+from .objective import flow_losses, flow_path, sample_timesteps
 from .optim import CompositeOptimizer, learning_rate_at_epoch, set_learning_rate
 from .rng import RNGStreams
 from .validation import should_validate
@@ -34,7 +28,6 @@ class TrainBatch(NamedTuple):
     pixels: Tensor | None
     target: Tensor | None
     semantic: Tensor | None
-    labels: Tensor
     indices: Tensor
 
 
@@ -45,23 +38,15 @@ def prepare_train_batch(
     non_blocking: bool = False,
 ) -> TrainBatch:
     return TrainBatch(
-        batch.pixels.to(device, non_blocking=non_blocking)
-        if batch.pixels is not None
-        else None,
-        batch.target.to(device, non_blocking=non_blocking)
-        if batch.target is not None
-        else None,
-        batch.semantic.to(device, non_blocking=non_blocking)
-        if batch.semantic is not None
-        else None,
-        batch.labels.to(device, dtype=torch.long, non_blocking=non_blocking),
+        *(
+            value.to(device, non_blocking=non_blocking) if value is not None else None
+            for value in batch[:-1]
+        ),
         batch.indices.to(device, dtype=torch.long, non_blocking=non_blocking),
     )
 
 
 class _PreparedBatchIterator(Iterator[TrainBatch]):
-    """Double-buffer the single uint8 image transfer used by online DINO extraction."""
-
     def __init__(self, source: Iterator[TrainBatch], device: torch.device) -> None:
         self.source = source
         self.device = device
@@ -120,14 +105,13 @@ class _PreparedBatchIterator(Iterator[TrainBatch]):
 
 
 def _collate(samples: list[Any]) -> TrainBatch:
-    pixels, labels, indices = zip(*samples, strict=True)
+    pixels, _labels, indices = zip(*samples, strict=True)
     if any(value is None for value in pixels):
-        raise ValueError("online feature training requires RGB pixels")
+        raise ValueError("online endpoint training requires RGB pixels")
     return TrainBatch(
         default_collate(pixels),  # type: ignore[arg-type]
         None,
         None,
-        default_collate(labels),
         default_collate(indices),
     )
 
@@ -137,11 +121,15 @@ class _EndpointCacheCollator:
         self.cache = cache
 
     def __call__(self, samples: list[Any]) -> TrainBatch:
-        _pixels, label_values, index_values = zip(*samples, strict=True)
-        labels = default_collate(label_values)
+        pixel_values, _labels, index_values = zip(*samples, strict=True)
         indices = default_collate(index_values)
         target, semantic = self.cache.lookup(indices)
-        return TrainBatch(None, target, semantic, labels, indices)
+        pixels = (
+            None
+            if all(value is None for value in pixel_values)
+            else default_collate(pixel_values)
+        )
+        return TrainBatch(pixels, target, semantic, indices)
 
 
 def distributed_info() -> tuple[int, int]:
@@ -163,14 +151,15 @@ def make_train_loader(
     endpoint_cache: EndpointCache | None = None,
 ) -> tuple[DataLoader[Any], DistributedSampler[Any] | None]:
     rank, world_size = distributed_info()
-    batch_size = local_batch_size(config.train.global_batch_size, world_size)
+    train = config.flow.train
+    batch_size = local_batch_size(train.global_batch_size, world_size)
     sampler = (
         DistributedSampler(
             dataset,
             num_replicas=world_size,
             rank=rank,
             shuffle=True,
-            seed=config.train.seed,
+            seed=train.seed,
             drop_last=True,
         )
         if world_size > 1
@@ -186,7 +175,9 @@ def make_train_loader(
             num_workers=config.data.workers,
             pin_memory=torch.cuda.is_available(),
             persistent_workers=config.data.workers > 0,
-            prefetch_factor=config.data.prefetch_factor if config.data.workers > 0 else None,
+            prefetch_factor=(
+                config.data.prefetch_factor if config.data.workers > 0 else None
+            ),
             collate_fn=(
                 _EndpointCacheCollator(endpoint_cache)
                 if endpoint_cache is not None
@@ -213,6 +204,7 @@ def train(
     canonical_model: nn.Module,
     execution_model: nn.Module,
     feature_encoder: DINOEndpointEncoder | None,
+    normalizer: EndpointLatentNormalizer,
     loader: DataLoader[Any],
     sampler: DistributedSampler[Any] | None,
     optimizer: CompositeOptimizer,
@@ -233,13 +225,15 @@ def train(
     state = state or TrainState()
     rank, world_size = distributed_info()
     device = next(canonical_model.parameters()).device
-    if loader.batch_size != local_batch_size(config.train.global_batch_size, world_size):
+    flow = config.flow
+    train_config = flow.train
+    if loader.batch_size != local_batch_size(train_config.global_batch_size, world_size):
         raise ValueError("train loader batch size does not match configured global batch")
-    step_flops = model_flops_per_step(config)
-    feature_id = vision_fingerprint(config.vision)
     optimizer.zero_grad()
-    for epoch_index in range(state.epoch, config.train.epochs):
-        logger.event(f"epoch {epoch_index + 1}/{config.train.epochs} started")
+    for epoch_index in range(state.epoch, train_config.epochs):
+        logger.event(
+            f"{flow.endpoint} flow epoch {epoch_index + 1}/{train_config.epochs} started"
+        )
         if sampler is not None:
             sampler.set_epoch(epoch_index)
         execution_model.train()
@@ -247,92 +241,57 @@ def train(
             feature_encoder.eval()
         epoch_started = time.perf_counter()
         iterator = _PreparedBatchIterator(iter(loader), device)
-        window_started = time.perf_counter()
-        window_start_step = state.global_step
-        previous_wait = iterator.data_wait_seconds
-        feature_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
-        feature_seconds_cpu = 0.0
         validation_metrics: dict[str, float] = {}
         for batch_index in range(len(loader)):
-            pixels, cached_target, cached_semantic, labels, _indices = iterator.consume()
+            pixels, cached_target, cached_semantic, _indices = iterator.consume()
             if batch_index + 1 < len(loader):
                 iterator.preload()
-            feature_started = time.perf_counter()
-            feature_start_event: torch.cuda.Event | None = None
-            feature_end_event: torch.cuda.Event | None = None
-            if device.type == "cuda":
-                feature_start_event = torch.cuda.Event(enable_timing=True)
-                feature_end_event = torch.cuda.Event(enable_timing=True)
-                feature_start_event.record()
             if cached_target is None or cached_semantic is None:
                 if pixels is None or feature_encoder is None:
                     raise RuntimeError("online endpoint extraction is unavailable")
-                target_tokens, semantic_tokens = feature_encoder.encode_pair(pixels)
+                endpoints = feature_encoder.encode_pair(pixels)
+                target_tokens = endpoints.target
+                semantic_tokens = endpoints.semantic
             else:
                 target_tokens = cached_target
                 semantic_tokens = cached_semantic
-            feature_seconds_cpu += time.perf_counter() - feature_started
-            if feature_end_event is not None:
-                feature_end_event.record()
-                if feature_start_event is not None:
-                    feature_events.append((feature_start_event, feature_end_event))
-            local_timesteps = sample_timesteps(
-                target_tokens.shape[0],
+            if flow.endpoint == "target":
+                endpoint = target_tokens
+            else:
+                if pixels is None:
+                    raise RuntimeError("pixel flow requires RGB pixels")
+                endpoint = normalizer.normalize_pixel(
+                    patchify_rgb(prepare_pixels(pixels, device))
+                )
+            timesteps = sample_timesteps(
+                endpoint.shape[0],
                 streams.timesteps,
                 device,
-                loc=config.train.timestep_loc,
-                scale=config.train.timestep_scale,
-                shift=config.train.timestep_shift,
-            )
-            stages = sample_stages(
-                target_tokens.shape[0],
-                streams.stage,
-                device,
-                config.cascade.semantic_stage_probability,
+                loc=train_config.timestep_loc,
+                scale=train_config.timestep_scale,
+                shift=train_config.timestep_shift,
             )
             noise = torch.randn(
-                target_tokens.shape,
+                endpoint.shape,
+                generator=streams.noise,
                 device=device,
                 dtype=torch.float32,
-                generator=streams.noise,
             )
-            path = cascade_path(
-                target_tokens,
-                semantic_tokens,
-                noise,
-                local_timesteps,
-                stages,
-                config.cascade,
-            )
-            model_labels = classifier_free_labels(
-                labels,
-                config.model.num_classes,
-                config.model.cfg_dropout_prob,
-                streams.label_dropout,
-            )
-            output = execution_model(path.noisy, path.timestep, path.stage, model_labels)
-            losses = diffusion_losses(
-                path.noisy,
-                path.velocity,
-                path.timestep,
-                path.stage,
-                output.full_prediction,
-                output.base_prediction,
-                output.repa_projection,
-                semantic_tokens,
-                base_loss_weight=config.train.base_loss_weight,
-                repa_coefficient=(
-                    config.repa.coefficient if config.repa.enabled else 0.0
-                ),
-                velocity_denominator_floor=config.train.velocity_denominator_floor,
+            path = flow_path(endpoint, noise, timesteps)
+            prediction = execution_model(path.noisy, path.timestep, semantic_tokens)
+            losses = flow_losses(
+                prediction,
+                path.clean,
             )
             losses.total.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                canonical_model.parameters(), config.train.grad_clip
+                canonical_model.parameters(), train_config.grad_clip
             )
             progress = epoch_index + (batch_index + 1) / len(loader)
             lr = learning_rate_at_epoch(
-                progress, config.train.optimizer.lr, config.train.optimizer.min_lr
+                progress,
+                train_config.optimizer.lr,
+                train_config.optimizer.min_lr,
             )
             set_learning_rate(optimizer, lr)
             optimizer.step()
@@ -340,82 +299,40 @@ def train(
             ema.update(canonical_model)
             state.global_step += 1
             reached_limit = (
-                config.train.max_steps is not None
-                and state.global_step >= config.train.max_steps
+                train_config.max_steps is not None
+                and state.global_step >= train_config.max_steps
             )
-            final_training_step = (
-                epoch_index + 1 == config.train.epochs
+            final_step = (
+                epoch_index + 1 == train_config.epochs
                 and batch_index + 1 == len(loader)
             )
-            force_log = reached_limit or final_training_step
-            if logger.should_log_training(state.global_step, force=force_log):
-                if device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                window_steps = state.global_step - window_start_step
-                elapsed = max(time.perf_counter() - window_started, 1e-9)
-                feature_seconds = (
-                    sum(start.elapsed_time(end) for start, end in feature_events)
-                    / 1000
-                    / window_steps
-                    if feature_events
-                    else feature_seconds_cpu / window_steps
-                )
-                data_wait = (
-                    iterator.data_wait_seconds - previous_wait
-                ) / window_steps
-                semantic_fraction = (stages == SEMANTIC_STAGE).float().mean()
-                metrics = {
-                    "train/loss": losses.total.item(),
-                    "train/full_velocity_loss": losses.full_velocity.item(),
-                    "train/base_semantic_velocity_loss": losses.base_semantic_velocity.item(),
-                    "train/repa_loss": losses.repa.item(),
-                    "train/repa_cosine_similarity": losses.cosine_similarity.item(),
-                    "train/timestep_mean": path.timestep.mean().item(),
-                    "train/semantic_stage_fraction": semantic_fraction.item(),
-                    "train/target_stage_fraction": (1 - semantic_fraction).item(),
-                    "train/lr": lr,
-                    "train/gradient_norm": float(grad_norm),
-                    "train/epoch": progress,
-                    "train/global_step": state.global_step,
-                    "progress/images_seen": state.global_step
-                    * config.train.global_batch_size,
-                    "compute/model_flops_per_step": step_flops,
-                    "compute/cumulative_model_flops": state.global_step * step_flops,
-                    "throughput/images_per_second": (
-                        config.train.global_batch_size * window_steps / elapsed
-                    ),
-                    "throughput/tokens_per_second": (
-                        config.train.global_batch_size
-                        * config.vision.grid_size**2
-                        * window_steps
-                        / elapsed
-                    ),
-                    "throughput/step_seconds": elapsed / window_steps,
-                    "throughput/feature_encoder_seconds": feature_seconds,
-                    "throughput/data_wait_seconds": data_wait,
-                    "system/peak_memory_gib": torch.cuda.max_memory_allocated(device)
-                    / 2**30
-                    if device.type == "cuda"
-                    else 0.0,
-                }
-                window_started = time.perf_counter()
-                window_start_step = state.global_step
-                previous_wait = iterator.data_wait_seconds
-                feature_events.clear()
-                feature_seconds_cpu = 0.0
+            if logger.should_log_training(state.global_step, force=reached_limit or final_step):
                 logger.log_training(
-                    metrics, step=state.global_step, force=force_log
+                    {
+                        "train/loss": losses.total.item(),
+                        "train/endpoint_loss": losses.endpoint.item(),
+                        "train/timestep_mean": path.timestep.mean().item(),
+                        "train/lr": lr,
+                        "train/gradient_norm": float(grad_norm),
+                        "train/epoch": progress,
+                        "train/global_step": state.global_step,
+                        "progress/images_seen": state.global_step
+                        * train_config.global_batch_size,
+                    },
+                    step=state.global_step,
+                    force=reached_limit or final_step,
                 )
             if reached_limit:
                 break
         iterator.close()
         state.epoch = epoch_index + 1
-        final_epoch = state.epoch == config.train.epochs or (
-            config.train.max_steps is not None and state.global_step >= config.train.max_steps
+        final_epoch = state.epoch == train_config.epochs or (
+            train_config.max_steps is not None
+            and state.global_step >= train_config.max_steps
         )
         if validation_callback is not None and should_validate(
             state.epoch,
-            config.train.epochs if not final_epoch else state.epoch,
+            train_config.epochs if not final_epoch else state.epoch,
             config.validation.interval,
             state.last_completed_validation_epoch,
             config.validation.validate_now,
@@ -424,14 +341,15 @@ def train(
             state.last_completed_validation_epoch = state.epoch
             config.validation.validate_now = False
             logger.log(validation_metrics, step=state.global_step)
-
         if rank == 0 and (
-            should_checkpoint(state.epoch, config.train.epochs, config.checkpoint.interval)
+            should_checkpoint(
+                state.epoch, train_config.epochs, config.checkpoint.interval
+            )
             or final_epoch
         ):
-            fid_values = [
-                value for key, value in validation_metrics.items() if key.startswith("validation/FID-")
-            ]
+            lpips = validation_metrics.get(
+                f"validation/lpips_{config.sampling.steps}step"
+            )
             path = checkpoint_manager.save(
                 completed_epoch=state.epoch,
                 global_step=state.global_step,
@@ -445,14 +363,17 @@ def train(
                 last_completed_validation_epoch=state.last_completed_validation_epoch,
                 wandb_run_id=logger.run_id,
                 resolved_config=config.as_dict(),
-                feature_fingerprint=feature_id,
+                feature_fingerprint=vision_fingerprint(config.vision),
                 decoder_sha256=decoder_sha256,
                 latent_statistics_sha256=latent_statistics_sha256,
                 endpoint_cache_fingerprint=endpoint_cache_fingerprint,
-                fid=fid_values[0] if fid_values and config.checkpoint.save_best_fid else None,
+                endpoint_kind=flow.endpoint,
+                lpips=(
+                    lpips if lpips is not None and config.checkpoint.save_best_lpips else None
+                ),
             )
             if config.wandb.checkpoint_artifacts:
-                logger.log_checkpoint(str(path), f"diffusion-epoch-{state.epoch:04d}")
+                logger.log_checkpoint(str(path), f"{flow.endpoint}-epoch-{state.epoch:04d}")
         logger.log(
             {"train/epoch_seconds": time.perf_counter() - epoch_started},
             step=state.global_step,

@@ -1,26 +1,22 @@
-"""DINOv3 semantic-cascade diffusion with internal guidance and optional REPA."""
+"""Gaussian DINOv3 semantic-conditioned target and pixel flow matching."""
 
 from .config import (
-    CascadeConfig,
-    DDTConfig,
+    DiTConfig,
     EndpointCacheConfig,
     ExperimentConfig,
-    RepaConfig,
+    FlowConfig,
     VisionConfig,
     load_config,
 )
-from .model import DDT, DDTOutput, classifier_free_labels
+from .model import SemanticDiT
 
 __all__ = [
-    "DDT",
-    "CascadeConfig",
-    "DDTConfig",
-    "DDTOutput",
+    "DiTConfig",
     "EndpointCacheConfig",
     "ExperimentConfig",
-    "RepaConfig",
+    "FlowConfig",
+    "SemanticDiT",
     "VisionConfig",
-    "classifier_free_labels",
     "load_config",
 ]
-__version__ = "0.4.0"
+__version__ = "0.6.0"

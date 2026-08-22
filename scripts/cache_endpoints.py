@@ -29,7 +29,7 @@ from jit_reg.vision import load_dino_encoder, vision_fingerprint
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Cache normalized block-2 and block-12 DINO endpoints"
+        description="Cache normalized raw block-2 patches and block-12 semantics"
     )
     parser.add_argument("--config", type=Path, default=Path("configs/dino-cascade.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
@@ -108,13 +108,18 @@ def main() -> None:
                 for batch_index, (pixels, _labels, indices) in enumerate(loader, start=1):
                     buffer = pipeline.acquire_buffer()
                     try:
-                        target, semantic = encoder.encode_pair(
+                        endpoints = encoder.encode_pair(
                             pixels.to(device, non_blocking=True)
                         )
                     except BaseException:
                         pipeline.release_buffer(buffer)
                         raise
-                    pipeline.submit(indices, target, semantic, buffer=buffer)
+                    pipeline.submit(
+                        indices,
+                        endpoints.target,
+                        endpoints.semantic,
+                        buffer=buffer,
+                    )
                     processed += indices.numel()
                     if rank == 0 and batch_index % config.vision.cache.log_interval == 0:
                         elapsed = max(time.perf_counter() - started, 1e-9)

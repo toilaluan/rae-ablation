@@ -1,36 +1,71 @@
 from __future__ import annotations
 
-import time
-from collections.abc import Sequence
 from pathlib import Path
 
 import torch
+from torch import Tensor
+from torch.utils.data import DataLoader, Subset
 
 from .checkpoint import EMA
 from .config import ExperimentConfig
-from .distributed import broadcast_string
-from .evaluation import evaluate_npz, save_evaluation
-from .latent_statistics import latent_statistics_sha256
-from .model import DDT
-from .model.compile import compile_model_regions
-from .pixel_decoder import load_pixel_decoder
-from .rng import preserving_global_rng
-from .sample_runtime import (
-    FEATURE_SCHEMA_VERSION,
-    SamplingParameters,
-    sample_to_archive,
-    sampling_output_name,
-    state_dict_sha256,
+from .data import load_imagenet, patchify_rgb, prepare_pixels, unpatchify_rgb
+from .decoder_training import _save_grid
+from .evaluation import (
+    FeatureMoments,
+    _default_feature_extractor,
+    inception_features,
+    reconstruction_fid,
+    save_evaluation,
 )
-from .sampling import ode_sample
-from .validation import ValidationPlan, noise_for_samples
-from .vision import vision_fingerprint
+from .latent_statistics import EndpointLatentNormalizer
+from .model import SemanticDiT
+from .pixel_decoder import load_pixel_decoder
+from .rng import indexed_standard_normal, preserving_global_rng
+from .sampling import flow_sample, one_step_sample
+from .validation import ValidationPlan
+from .vision import load_dino_encoder
 
 
 def _distributed() -> tuple[int, int]:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank(), torch.distributed.get_world_size()
     return 0, 1
+
+
+def _ssim_sum(target: Tensor, output: Tensor) -> Tensor:
+    left = target.float().flatten(1)
+    right = output.float().flatten(1)
+    mu_x, mu_y = left.mean(1), right.mean(1)
+    var_x, var_y = left.var(1, unbiased=False), right.var(1, unbiased=False)
+    covariance = ((left - mu_x[:, None]) * (right - mu_y[:, None])).mean(1)
+    return (
+        ((2 * mu_x * mu_y + 0.01**2) * (2 * covariance + 0.03**2))
+        / ((mu_x.square() + mu_y.square() + 0.01**2) * (var_x + var_y + 0.03**2))
+    ).sum()
+
+
+def _accumulate(
+    total: Tensor,
+    offset: int,
+    target: Tensor,
+    output: Tensor,
+    endpoint_prediction: Tensor,
+    endpoint_target: Tensor,
+    perceptual: torch.nn.Module | None,
+) -> None:
+    difference = output.float() - target.float()
+    batch = target.shape[0]
+    total[offset] += difference.abs().flatten(1).mean(1).sum()
+    total[offset + 1] += difference.square().flatten(1).mean(1).sum()
+    total[offset + 2] += _ssim_sum(target, output)
+    if perceptual is not None:
+        total[offset + 3] += perceptual(
+            2 * output.float() - 1, 2 * target.float() - 1
+        ).sum()
+    total[offset + 4] += (
+        endpoint_prediction.float().sub(endpoint_target.float()).square().flatten(1).mean(1).sum()
+    )
+    total[offset + 5] += batch
 
 
 @torch.inference_mode()
@@ -43,123 +78,175 @@ def validate_ema(
     completed_epoch: int,
     final: bool,
     output_root: str | Path,
-    sampling: SamplingParameters | Sequence[SamplingParameters],
-    endpoint_source: str = "online",
+    normalizer: EndpointLatentNormalizer,
 ) -> tuple[dict[str, float], Path]:
-    rank, _world_size = _distributed()
+    rank, world_size = _distributed()
     device = torch.device(
         f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
     )
-    if isinstance(sampling, SamplingParameters):
-        parameters = sampling
-    else:
-        try:
-            parameters = next(iter(sampling))
-        except StopIteration as error:
-            raise ValueError("validation requires sampling parameters") from error
-    parameters.validate()
-    sample_count = (
-        config.validation.final_samples
-        if final
-        else config.validation.periodic_samples
+    sample_count = config.validation.final_samples if final else config.validation.periodic_samples
+    selected = plan.prefix(sample_count)[rank::world_size].tolist()
+    dataset = load_imagenet(
+        config.data,
+        config.vision.image_size,
+        load_pixels=True,
+        split=config.data.validation_split,
     )
-    run_kind = "final" if final else "periodic"
-    root = Path(output_root) / f"epoch-{completed_epoch:04d}-{run_kind}"
-    root.mkdir(parents=True, exist_ok=True)
-    digest = state_dict_sha256(ema.state_dict()) if rank == 0 else None
-    digest = broadcast_string(digest, rank)
-    decoder, decoder_digest = load_pixel_decoder(config.decoder, device)
-    statistics_digest = latent_statistics_sha256(config.vision.statistics_path)
-    feature_schema = {
-        "schema_version": FEATURE_SCHEMA_VERSION,
-        "input_space": (
-            f"dinov3-b16-normalized-block{config.vision.target_layer}-patch-tokens"
-        ),
-        "input_shape": list(config.model.input_shape),
-        "vision_fingerprint": vision_fingerprint(config.vision),
-        "decoder_sha256": decoder_digest,
-        "latent_statistics_sha256": statistics_digest,
-        "training_endpoint_source": endpoint_source,
-        "conditioning": "local-timestep-cascade-stage-class",
-        "prediction": (
-            "clean-x-full-and-base-with-repa"
-            if config.repa.enabled
-            else "clean-x-full-and-base"
-        ),
-        "cascade": {
-            "semantic_prior": "clean-pooled-restored-block12",
-            "pool_size": config.cascade.pool_size,
-            "downsample_mode": config.cascade.downsample_mode,
-            "upsample_mode": config.cascade.upsample_mode,
-        },
-    }
-    model = DDT(config.model, config.repa).to(device)
-    model.load_state_dict(ema.state_dict())
+    expected_dataset_size = min(
+        config.data.validation_size,
+        config.data.max_samples or config.data.validation_size,
+    )
+    if len(dataset) != expected_dataset_size:
+        raise ValueError(
+            f"validation dataset has {len(dataset)} samples, expected "
+            f"{expected_dataset_size} from data.validation_size/max_samples"
+        )
+    loader = DataLoader(
+        Subset(dataset, selected),
+        batch_size=config.sampling.batch_size,
+        shuffle=False,
+        num_workers=config.data.workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=config.data.workers > 0,
+        prefetch_factor=config.data.prefetch_factor if config.data.workers > 0 else None,
+    )
+    model = SemanticDiT(config.model).to(device)
+    ema.copy_to(model)
     model.eval()
-    execution_model = compile_model_regions(model, config.compile)
-    output = root / sampling_output_name(sample_count, parameters)
-
-    def generate_batch(
-        _positions: torch.Tensor, labels: torch.Tensor, noise_seeds: torch.Tensor
-    ) -> torch.Tensor:
-        noise = noise_for_samples(
-            noise_seeds,
-            config.model.input_shape,
-            device,
-            dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-        )
-        generated = ode_sample(
-            execution_model,
-            noise,
-            labels.to(device),
-            semantic_steps=parameters.semantic_steps,
-            target_steps=parameters.target_steps,
-            timestep_shift=parameters.timestep_shift,
-            ig_scale=parameters.ig_scale,
-            ig_interval=(parameters.ig_start, parameters.ig_end),
-            cfg_scale=parameters.cfg_scale,
-            cfg_interval=(parameters.cfg_start, parameters.cfg_end),
-            solver=parameters.solver,
-            num_classes=config.model.num_classes,
-            velocity_denominator_floor=config.train.velocity_denominator_floor,
-        )
-        return decoder(generated.to(next(decoder.parameters()).dtype)).float().clamp(0, 1)
-
-    started = time.perf_counter()
-    archive = sample_to_archive(
-        output_dir=output,
-        plan=plan,
-        sample_count=sample_count,
-        num_classes=config.model.num_classes,
-        image_size=config.vision.image_size,
-        patch_size=config.vision.patch_size,
-        grid_size=config.model.grid_size,
-        model_variant=config.model.model_variant,
-        feature_schema=feature_schema,
-        checkpoint_hash=digest,
-        parameters=parameters,
-        generate_batch=generate_batch,
+    encoder = load_dino_encoder(
+        config.vision,
+        device,
+        include_semantic=True,
+        normalizer=normalizer,
     )
-    metrics: dict[str, float] = {
-        "throughput/validation_sampling_seconds": time.perf_counter() - started
-    }
+    decoder = None
+    if config.flow.endpoint == "target":
+        decoder, _digest = load_pixel_decoder(config.decoder, device)
+    perceptual = None
+    if config.decoder.loss.lpips_weight > 0:
+        import lpips
+
+        perceptual = lpips.LPIPS(net="alex").to(device).eval()
+    inception = (
+        _default_feature_extractor(device).to(device).eval()
+        if config.evaluation.reconstruction_fid
+        else None
+    )
+    feature_moments = (
+        tuple(FeatureMoments(2048, device) for _ in range(3))
+        if inception is not None
+        else None
+    )
+    total = torch.zeros(12, dtype=torch.float64, device=device)
+    preview: tuple[Tensor, Tensor] | None = None
+
+    def decode(endpoint: Tensor) -> Tensor:
+        if config.flow.endpoint == "target":
+            assert decoder is not None
+            return decoder(endpoint.to(next(decoder.parameters()).dtype)).float().clamp(0, 1)
+        return unpatchify_rgb(normalizer.denormalize_pixel(endpoint)).float().clamp(0, 1)
+
+    for pixels, _labels, indices in loader:
+        raw_pixels = pixels.to(device, non_blocking=True)
+        target_pixels = prepare_pixels(raw_pixels, device)
+        endpoints = encoder.encode_pair(raw_pixels)
+        endpoint_target = (
+            endpoints.target
+            if config.flow.endpoint == "target"
+            else normalizer.normalize_pixel(patchify_rgb(target_pixels))
+        )
+        noise = indexed_standard_normal(
+            indices,
+            tuple(endpoints.semantic.shape[1:]),
+            config.sampling.noise_seed,
+            device,
+            dtype=endpoints.semantic.dtype,
+        )
+        multi = flow_sample(
+            model,
+            endpoints.semantic,
+            noise,
+            steps=config.sampling.steps,
+            timestep_shift=config.sampling.timestep_shift,
+            solver=config.sampling.solver,  # type: ignore[arg-type]
+        )
+        single = one_step_sample(model, endpoints.semantic, noise)
+        multi_pixels = decode(multi.endpoint)
+        single_pixels = decode(single.endpoint)
+        if inception is not None and feature_moments is not None:
+            real_moments, multi_moments, single_moments = feature_moments
+            real_moments.update(inception_features(inception, target_pixels))
+            multi_moments.update(inception_features(inception, multi_pixels))
+            single_moments.update(inception_features(inception, single_pixels))
+        _accumulate(
+            total,
+            0,
+            target_pixels,
+            multi_pixels,
+            multi.endpoint,
+            endpoint_target,
+            perceptual,
+        )
+        _accumulate(
+            total,
+            6,
+            target_pixels,
+            single_pixels,
+            single.endpoint,
+            endpoint_target,
+            perceptual,
+        )
+        if rank == 0 and preview is None:
+            preview = target_pixels, multi_pixels
+    if world_size > 1:
+        torch.distributed.all_reduce(total)
+    if feature_moments is not None:
+        for moments in feature_moments:
+            moments.all_reduce()
+    metrics: dict[str, float] = {}
+    multi_name = f"{config.sampling.steps}step"
+    for name, offset in ((multi_name, 0), ("1step", 6)):
+        count = max(total[offset + 5].item(), 1)
+        mse = total[offset + 1].item() / count
+        metrics.update(
+            {
+                f"validation/l1_{name}": total[offset].item() / count,
+                f"validation/mse_{name}": mse,
+                f"validation/psnr_{name}": -10 * torch.log10(
+                    torch.tensor(max(mse, 1e-12))
+                ).item(),
+                f"validation/ssim_{name}": total[offset + 2].item() / count,
+                f"validation/lpips_{name}": total[offset + 3].item() / count,
+                f"validation/endpoint_mse_{name}": total[offset + 4].item() / count,
+            }
+        )
+    if feature_moments is not None:
+        real_moments, multi_moments, single_moments = feature_moments
+        metrics[f"validation/rfid_{multi_name}"] = reconstruction_fid(
+            real_moments, multi_moments
+        )
+        metrics["validation/rfid_1step"] = reconstruction_fid(
+            real_moments, single_moments
+        )
+    kind = "final" if final else "periodic"
+    output = Path(output_root) / f"epoch-{completed_epoch:04d}-{kind}"
     if rank == 0:
-        raw = evaluate_npz(
-            archive,
-            config.evaluation.reference_npz,
-            batch_size=config.evaluation.batch_size,
-            device=(
-                device
-                if config.evaluation.device == "auto"
-                else torch.device(config.evaluation.device)
-            ),
-            log_interval=config.evaluation.log_interval,
+        output.mkdir(parents=True, exist_ok=True)
+        if preview is not None:
+            _save_grid(*preview, output / "preview.png")
+        save_evaluation(
+            output / "metrics.json",
+            metrics,
+            plan.plan_hash,
+            {
+                "endpoint": config.flow.endpoint,
+                "sample_count": sample_count,
+                "steps": config.sampling.steps,
+                "one_step": True,
+                "solver": config.sampling.solver,
+                "timestep_shift": config.sampling.timestep_shift,
+                "prior": "standard_normal",
+                "noise_seed": config.sampling.noise_seed,
+            },
         )
-        save_evaluation(output / "evaluation.json", raw, plan.plan_hash)
-        suffix = (
-            f"{sample_count // 1000}K"
-            if sample_count % 1000 == 0
-            else str(sample_count)
-        )
-        metrics[f"validation/FID-{suffix}"] = float(raw["FID"])
     return metrics, output

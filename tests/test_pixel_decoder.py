@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from jit_reg.config import DINO_CHANNELS, DINO_GRID_SIZE, IMAGE_SIZE, PixelDecoderConfig
+from jit_reg.data import patchify_rgb, unpatchify_rgb
 from jit_reg.pixel_decoder import (
     PatchDiscriminator,
     TransformerPixelDecoder,
@@ -28,3 +29,12 @@ def test_patchgan_hinge_losses_are_finite() -> None:
     fake = discriminator(torch.rand(1, 3, IMAGE_SIZE, IMAGE_SIZE))
     assert torch.isfinite(discriminator_hinge_loss(real, fake))
     assert torch.isfinite(generator_hinge_loss(fake))
+
+
+def test_rgb_patchification_is_exact_and_matches_flow_shape() -> None:
+    pixels = torch.arange(
+        2 * 3 * IMAGE_SIZE * IMAGE_SIZE, dtype=torch.float32
+    ).reshape(2, 3, IMAGE_SIZE, IMAGE_SIZE)
+    patches = patchify_rgb(pixels)
+    assert patches.shape == (2, DINO_CHANNELS, DINO_GRID_SIZE, DINO_GRID_SIZE)
+    assert torch.equal(unpatchify_rgb(patches), pixels)

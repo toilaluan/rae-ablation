@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from jit_reg.config import load_config
-from jit_reg.data import data_fingerprint, load_imagenet
+from jit_reg.data import data_fingerprint, load_imagenet, patchify_rgb, prepare_pixels
 from jit_reg.distributed import initialize_distributed
 from jit_reg.latent_statistics import (
     LatentStatisticsAccumulator,
@@ -20,7 +20,7 @@ from jit_reg.vision import load_dino_encoder, vision_fingerprint
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Compute separate per-channel target and semantic DINO statistics"
+        description="Compute raw target, semantic, and RGB-patch statistics"
     )
     parser.add_argument("--config", type=Path, default=Path("configs/dino-cascade.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
@@ -60,11 +60,20 @@ def main() -> None:
         prefetch_factor=config.data.prefetch_factor if workers > 0 else None,
     )
     encoder = load_dino_encoder(config.vision, device, include_semantic=True)
-    accumulator = LatentStatisticsAccumulator(config.vision.hidden_size, device)
+    accumulator = LatentStatisticsAccumulator(
+        config.vision.hidden_size,
+        device,
+    )
     started = time.perf_counter()
     for batch_index, (pixels, _labels, _sample_indices) in enumerate(loader, start=1):
-        target, semantic = encoder.encode_pair(pixels.to(device, non_blocking=True))
-        accumulator.update(target, semantic)
+        raw_pixels = pixels.to(device, non_blocking=True)
+        endpoints = encoder.encode_pair(raw_pixels)
+        pixel_patches = patchify_rgb(prepare_pixels(raw_pixels, device))
+        accumulator.update(
+            endpoints.target,
+            endpoints.semantic,
+            pixel_patches,
+        )
         if rank == 0 and batch_index % args.log_interval == 0:
             print(
                 f"statistics batches={batch_index}/{len(loader)} "
@@ -77,8 +86,7 @@ def main() -> None:
     if not torch.all(accumulator.count == expected_count):
         raise RuntimeError(
             "statistics observation count mismatch: "
-            f"target={int(accumulator.count[0].item())}, "
-            f"semantic={int(accumulator.count[1].item())}, expected={expected_count}"
+            f"spatial={accumulator.count.tolist()}, expected={expected_count}"
         )
     if rank == 0:
         statistics = accumulator.finalize(
@@ -87,7 +95,7 @@ def main() -> None:
         )
         save_latent_statistics(statistics, output)
         print(
-            f"saved {output}: observations_per_endpoint={statistics.count}, "
+            f"saved {output}: patch_observations={statistics.patch_count}, "
             f"channels={statistics.channels}, sha256={latent_statistics_sha256(output)}",
             flush=True,
         )

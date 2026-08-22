@@ -15,6 +15,57 @@ from torch import Tensor, nn
 LogFunction = Callable[[str], None]
 
 
+class FeatureMoments:
+    """Distributed float64 moments for reconstruction-FID evaluation."""
+
+    def __init__(self, features: int, device: torch.device) -> None:
+        if features < 1:
+            raise ValueError("feature dimension must be positive")
+        self.sum = torch.zeros(features, dtype=torch.float64, device=device)
+        self.outer = torch.zeros(features, features, dtype=torch.float64, device=device)
+        self.count = torch.zeros((), dtype=torch.float64, device=device)
+
+    @torch.no_grad()
+    def update(self, features: Tensor) -> None:
+        if features.ndim != 2 or features.shape[1] != self.sum.numel():
+            raise ValueError("Inception features have an incompatible shape")
+        values = features.to(device=self.sum.device, dtype=torch.float64)
+        self.sum.add_(values.sum(0))
+        self.outer.addmm_(values.T, values)
+        self.count.add_(values.shape[0])
+
+    @torch.no_grad()
+    def all_reduce(self) -> None:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            for value in (self.sum, self.outer, self.count):
+                torch.distributed.all_reduce(value)
+
+    def statistics(self) -> dict[str, np.ndarray]:
+        count = int(self.count.item())
+        if count < 2:
+            raise ValueError("reconstruction FID requires at least two samples")
+        mean = self.sum / count
+        covariance = (self.outer - count * torch.outer(mean, mean)) / (count - 1)
+        return {
+            "mu": mean.cpu().numpy(),
+            "sigma": covariance.cpu().numpy(),
+        }
+
+
+def inception_features(extractor: nn.Module, pixels: Tensor) -> Tensor:
+    """Extract torch-fidelity compatible features from float RGB images."""
+    images = pixels.detach().float().clamp(0, 1).mul(255).round().byte()
+    output = extractor(images)
+    features = output[0] if isinstance(output, (tuple, list)) else output
+    if features.ndim != 2:
+        raise ValueError("Inception feature extractor did not return a matrix")
+    return features
+
+
+def reconstruction_fid(reference: FeatureMoments, generated: FeatureMoments) -> float:
+    return fid_from_statistics(generated.statistics(), reference.statistics())
+
+
 def _read_npy_header(handle: BinaryIO) -> tuple[tuple[int, ...], bool, np.dtype[Any]]:
     version = np.lib.format.read_magic(handle)
     if version == (1, 0):
@@ -237,13 +288,24 @@ def evaluate_npz(
     return {"FID": fid}
 
 
-def save_evaluation(path: str | Path, metrics: dict[str, Any], plan_hash: str) -> None:
+def save_evaluation(
+    path: str | Path,
+    metrics: dict[str, Any],
+    plan_hash: str,
+    protocol: dict[str, Any] | None = None,
+) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".partial")
     temporary.write_text(
         json.dumps(
-            {"validation_plan_hash": plan_hash, "metrics": metrics}, indent=2, sort_keys=True
+            {
+                "validation_plan_hash": plan_hash,
+                "protocol": protocol or {},
+                "metrics": metrics,
+            },
+            indent=2,
+            sort_keys=True,
         )
         + "\n"
     )

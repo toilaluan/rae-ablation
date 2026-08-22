@@ -1,10 +1,11 @@
-schema_version: 16
+schema_version: 18
 
 data:
   repository: benjamin-paine/imagenet-1k-256x256
   revision: 1bd0400450249a7fe90c0aece37d0d03e7ea956a
   split: train
   validation_split: validation
+  validation_size: 50000
   workers: 8
   prefetch_factor: 4
   max_samples: null
@@ -46,7 +47,7 @@ decoder:
     gan_enabled: true
     gan_start_fraction: 0.2
   train:
-    epochs: 40
+    epochs: 10
     global_batch_size: 1024
     max_steps: null
     lr: 0.0002
@@ -60,33 +61,34 @@ decoder:
 
 model:
   input_size: 8
-  patch_size: [1, 1]
+  patch_size: 1
   in_channels: 768
-  hidden_size: [384, 1536]
-  depth: [12, 2]
-  num_heads: [6, 16]
+  hidden_size: 768
+  depth: 12
+  num_heads: 12
   mlp_ratio: 4.0
-  base_model_depth: 4
-  num_classes: 1000
-  cfg_dropout_prob: 0.1
-  num_timestep_tokens: 4
-  num_stage_tokens: 4
-  num_class_tokens: 4
-  gradient_checkpointing: false
-  variant: DDT-B/1-DINOv3B-8x8-Semantic-Cascade-IG
+  gradient_checkpointing: true
+  variant: LightningDiT-B/1-DINOv3B-8x8-Semantic-AdaLN
 
-cascade:
-  pool_size: 1
-  downsample_mode: area
-  upsample_mode: bilinear
-  align_corners: false
-  semantic_stage_probability: 0.5
-
-repa:
-  enabled: false
-  layer_depth: 8
-  projector_width: 2048
-  coefficient: 0.5
+flow:
+  endpoint: target
+  train:
+    epochs: 20
+    global_batch_size: 1024
+    max_steps: null
+    grad_clip: 1.0
+    ema_decay: 0.9995
+    seed: 0
+    timestep_loc: 0.0
+    timestep_scale: 1.0
+    timestep_shift: 4.0
+    optimizer:
+      kind: adamw
+      lr: 0.0002
+      min_lr: 0.0002
+      weight_decay: 0.0
+      beta1: 0.9
+      beta2: 0.95
 
 compile:
   enabled: true
@@ -95,39 +97,12 @@ compile:
   fullgraph: true
   dynamic: false
 
-train:
-  epochs: 80
-  global_batch_size: 1024
-  max_steps: null
-  grad_clip: 1.0
-  ema_decay: 0.9995
-  seed: 0
-  timestep_loc: 0.0
-  timestep_scale: 1.0
-  timestep_shift: 4.0
-  velocity_denominator_floor: 0.05
-  base_loss_weight: 1.0
-  optimizer:
-    kind: adamw
-    lr: 0.0002
-    min_lr: 0.0002
-    weight_decay: 0.0
-    beta1: 0.9
-    beta2: 0.95
-
 sampling:
-  num_samples: 50000
   batch_size: 32
-  semantic_steps: 10
-  target_steps: 40
+  steps: 40
   solver: euler
   timestep_shift: 4.0
-  ig_scale: 1.78
-  ig_start: 0.1
-  ig_end: 1.0
-  cfg_scale: 1.0
-  cfg_start: 0.0
-  cfg_end: 1.0
+  noise_seed: 0
   log_interval: 10
 
 evaluation:
@@ -135,9 +110,10 @@ evaluation:
   batch_size: 32
   device: auto
   log_interval: 10
+  reconstruction_fid: true
 
 validation:
-  interval: 5
+  interval: 2
   periodic_samples: 10000
   final_samples: 50000
   plan_path: validation-plan.pt
@@ -145,16 +121,16 @@ validation:
 
 checkpoint:
   directory: checkpoints
-  interval: 5
+  interval: 2
   keep_last_n: 8
-  save_best_fid: true
+  save_best_lpips: true
 
 wandb:
   enabled: true
   entity: null
-  project: dino-semantic-cascade
-  name: semantic-cascade
+  project: dino-semantic-bridge
+  name: semantic-to-target
   group: null
-  tags: [dinov3, semantic-cascade, internal-guidance]
+  tags: [dinov3, reconstruction, flow-matching]
   mode: online
   checkpoint_artifacts: false

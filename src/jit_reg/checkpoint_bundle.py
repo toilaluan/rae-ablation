@@ -16,6 +16,7 @@ class CheckpointBundle:
     weights: Path
     plan: ValidationPlan
     validation_plan_hash: str
+    endpoint_kind: str
 
 
 def resolve_checkpoint_directory(path: str | Path) -> Path:
@@ -34,7 +35,7 @@ def _expected_plan_hash(directory: Path) -> str:
     metadata_path = directory / "metadata.json"
     if not metadata_path.is_file():
         raise ValueError(
-            "checkpoint predates schema v16; old checkpoints are not supported"
+            "checkpoint predates schema v18; old checkpoints are not supported"
         )
     metadata = json.loads(metadata_path.read_text())
     if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
@@ -86,8 +87,11 @@ def _load_plan(
     reconstructed = create_validation_plan(
         config.validation.final_samples,
         config.validation.periodic_samples,
-        config.model.num_classes,
-        config.train.seed + 7,
+        config.flow.train.seed + 7,
+        min(
+            config.data.validation_size,
+            config.data.max_samples or config.data.validation_size,
+        ),
     )
     if reconstructed.plan_hash == expected_hash:
         return reconstructed
@@ -101,10 +105,16 @@ def load_checkpoint_bundle(path: str | Path) -> CheckpointBundle:
     directory = resolve_checkpoint_directory(path)
     config = load_checkpoint_config(directory / "config.json")
     expected_hash = _expected_plan_hash(directory)
+    metadata = json.loads((directory / "metadata.json").read_text())
+    endpoint_kind = metadata.get("endpoint_kind")
+    if endpoint_kind not in {"target", "pixel"} or endpoint_kind != config.flow.endpoint:
+        raise ValueError("checkpoint endpoint kind does not match its configuration")
     plan = _load_plan(directory, config, expected_hash)
     weights = directory / "ema.safetensors"
     if not weights.is_file():
         weights = directory / "ema-export.safetensors"
     if not weights.is_file():
         raise FileNotFoundError(f"checkpoint EMA weights are missing: {directory}")
-    return CheckpointBundle(directory, config, weights, plan, expected_hash)
+    return CheckpointBundle(
+        directory, config, weights, plan, expected_hash, endpoint_kind
+    )

@@ -73,18 +73,11 @@ def precompute_rope_tables(
     image_width: int,
     head_dim: int,
     *,
-    prefix_tokens: int = 0,
-    spatial_pool_size: int | None = None,
-    spatial_prefix_start: int = 0,
     dtype: torch.dtype = torch.float32,
 ) -> tuple[Tensor, Tensor]:
-    """Build one image-plus-prefix RoPE table for a static attention layout."""
+    """Build a 2D RoPE table for a static image-token layout."""
     if image_height < 1 or image_width < 1:
         raise ValueError("RoPE grid dimensions must be positive")
-    if prefix_tokens < 0:
-        raise ValueError("RoPE prefix token count cannot be negative")
-    if spatial_prefix_start < 0:
-        raise ValueError("spatial RoPE prefix start cannot be negative")
     image_y = torch.arange(image_height, dtype=torch.float32)
     image_x = torch.arange(image_width, dtype=torch.float32)
     image_y = (
@@ -93,45 +86,7 @@ def precompute_rope_tables(
     image_x = (
         image_x[None, :].expand(image_height, image_width).reshape(-1)
     )
-    image_cos, image_sin = rope_cos_sin(
-        image_y, image_x, head_dim, dtype
-    )
-    if prefix_tokens == 0:
-        return image_cos, image_sin
-    prefix_cos = torch.ones(prefix_tokens, head_dim, dtype=dtype)
-    prefix_sin = torch.zeros(prefix_tokens, head_dim, dtype=dtype)
-    if spatial_pool_size is not None:
-        spatial_tokens = spatial_pool_size**2
-        if spatial_prefix_start + spatial_tokens > prefix_tokens:
-            raise ValueError(
-                "spatial RoPE tokens must fit within the prefix"
-            )
-        cell = torch.arange(spatial_pool_size, dtype=torch.float32) + 0.5
-        prefix_y = cell * (image_height / spatial_pool_size) - 0.5
-        prefix_x = cell * (image_width / spatial_pool_size) - 0.5
-        prefix_y = (
-            prefix_y[:, None]
-            .expand(spatial_pool_size, spatial_pool_size)
-            .reshape(-1)
-        )
-        prefix_x = (
-            prefix_x[None, :]
-            .expand(spatial_pool_size, spatial_pool_size)
-            .reshape(-1)
-        )
-        spatial_cos, spatial_sin = rope_cos_sin(
-            prefix_y, prefix_x, head_dim, dtype
-        )
-        prefix_cos[spatial_prefix_start : spatial_prefix_start + spatial_tokens] = (
-            spatial_cos
-        )
-        prefix_sin[spatial_prefix_start : spatial_prefix_start + spatial_tokens] = (
-            spatial_sin
-        )
-    return (
-        torch.cat((prefix_cos, image_cos), dim=0),
-        torch.cat((prefix_sin, image_sin), dim=0),
-    )
+    return rope_cos_sin(image_y, image_x, head_dim, dtype)
 
 
 def apply_2d_rope_positions(

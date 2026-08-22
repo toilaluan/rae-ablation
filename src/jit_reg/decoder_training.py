@@ -17,6 +17,12 @@ from torch.utils.data._utils.collate import default_collate
 from .checkpoint import EMA
 from .config import ExperimentConfig
 from .data import prepare_pixels
+from .evaluation import (
+    FeatureMoments,
+    _default_feature_extractor,
+    inception_features,
+    reconstruction_fid,
+)
 from .pixel_decoder import (
     ReconstructionObjective,
     TransformerPixelDecoder,
@@ -143,13 +149,24 @@ def validate_decoder(
     loader: DataLoader[Any],
     config: ExperimentConfig,
     output: Path,
+    objective: ReconstructionObjective | None = None,
 ) -> dict[str, float]:
     rank, _world_size = _distributed()
     device = next(_unwrap(decoder).parameters()).device
     evaluation = TransformerPixelDecoder(config.decoder).to(device)
     ema.copy_to(evaluation)
     evaluation.eval()
-    total = torch.zeros(4, device=device)
+    total = torch.zeros(6, device=device)
+    inception = (
+        _default_feature_extractor(device).to(device).eval()
+        if config.evaluation.reconstruction_fid
+        else None
+    )
+    feature_moments = (
+        (FeatureMoments(2048, device), FeatureMoments(2048, device))
+        if inception is not None
+        else None
+    )
     preview: tuple[Tensor, Tensor] | None = None
     for batch_index, (pixels, _indices) in enumerate(loader):
         if batch_index >= config.decoder.train.validation_batches:
@@ -160,21 +177,48 @@ def validate_decoder(
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             reconstructed = evaluation(tokens)
         difference = reconstructed.float() - target
+        if inception is not None and feature_moments is not None:
+            feature_moments[0].update(inception_features(inception, target))
+            feature_moments[1].update(inception_features(inception, reconstructed))
         batch = target.shape[0]
         total[0] += difference.abs().flatten(1).mean(1).sum()
         total[1] += difference.square().flatten(1).mean(1).sum()
         total[2] += batch
         total[3] += 1
+        if objective is not None and objective.perceptual is not None:
+            total[4] += objective.perceptual(
+                2 * reconstructed.float() - 1, 2 * target.float() - 1
+            ).sum()
+        target_flat = target.float().flatten(1)
+        output_flat = reconstructed.float().flatten(1)
+        mu_x = target_flat.mean(1)
+        mu_y = output_flat.mean(1)
+        var_x = target_flat.var(1, unbiased=False)
+        var_y = output_flat.var(1, unbiased=False)
+        covariance = (
+            (target_flat - mu_x[:, None]) * (output_flat - mu_y[:, None])
+        ).mean(1)
+        total[5] += (
+            ((2 * mu_x * mu_y + 0.01**2) * (2 * covariance + 0.03**2))
+            / ((mu_x.square() + mu_y.square() + 0.01**2) * (var_x + var_y + 0.03**2))
+        ).sum()
         if preview is None:
             preview = target, reconstructed
     total = _reduce(total)
+    if feature_moments is not None:
+        for moments in feature_moments:
+            moments.all_reduce()
     count = max(total[2].item(), 1)
     mse = total[1].item() / count
     metrics = {
         "decoder/validation_l1": total[0].item() / count,
         "decoder/validation_mse": mse,
         "decoder/validation_psnr": -10 * torch.log10(torch.tensor(max(mse, 1e-12))).item(),
+        "decoder/validation_lpips": total[4].item() / count,
+        "decoder/validation_ssim": total[5].item() / count,
     }
+    if feature_moments is not None:
+        metrics["decoder/validation_rfid"] = reconstruction_fid(*feature_moments)
     if rank == 0 and preview is not None:
         _save_grid(*preview, output)
     del evaluation
@@ -215,7 +259,7 @@ def save_decoder_checkpoint(
     )
     torch.save(
         {
-            "schema_version": 14,
+            "schema_version": 18,
             "epoch": state.epoch,
             "global_step": state.global_step,
             "wandb_run_id": state.wandb_run_id,
@@ -223,6 +267,7 @@ def save_decoder_checkpoint(
             "discriminator_optimizer": discriminator_optimizer.state_dict(),
             "vision_fingerprint": vision_fingerprint(config.vision),
             "latent_statistics_sha256": latent_statistics_sha256,
+            "feature_space": "normalized-raw-block2-patch-states",
             "cpu_rng_state": torch.random.get_rng_state(),
             "cuda_rng_states": torch.cuda.get_rng_state_all()
             if torch.cuda.is_available()
@@ -236,9 +281,10 @@ def save_decoder_checkpoint(
     (temporary / "metadata.json").write_text(
         json.dumps(
             {
-                "schema_version": 14,
+                "schema_version": 18,
                 "vision_fingerprint": vision_fingerprint(config.vision),
                 "latent_statistics_sha256": latent_statistics_sha256,
+                "feature_space": "normalized-raw-block2-patch-states",
             },
             indent=2,
             sort_keys=True,
@@ -265,7 +311,7 @@ def load_decoder_checkpoint(
 ) -> DecoderState:
     resolved = (path / "last").resolve() if (path / "last").is_dir() else path.resolve()
     state = torch.load(resolved / "training.pt", map_location="cpu", weights_only=False)
-    if state.get("schema_version") != 14:
+    if state.get("schema_version") != 18:
         raise ValueError("decoder checkpoint uses an incompatible schema")
     expected = vision_fingerprint(config.vision)
     if state.get("vision_fingerprint") != expected:
@@ -278,6 +324,8 @@ def load_decoder_checkpoint(
     metadata = json.loads(metadata_path.read_text())
     if metadata.get("latent_statistics_sha256") != expected_latent_statistics_sha256:
         raise ValueError("decoder checkpoint latent-statistics metadata mismatch")
+    if metadata.get("feature_space") != "normalized-raw-block2-patch-states":
+        raise ValueError("decoder checkpoint feature-space mismatch")
     _unwrap(decoder).load_state_dict(load_file(str(resolved / "decoder.safetensors")))
     ema.load_state_dict(load_file(str(resolved / "ema.safetensors")))
     _unwrap(discriminator).load_state_dict(
@@ -428,6 +476,7 @@ def train_decoder(
         final = state.epoch == train.epochs or (
             train.max_steps is not None and state.global_step >= train.max_steps
         )
+        validation_metrics: dict[str, float] = {}
         if state.epoch % train.validation_interval == 0 or final:
             preview = output / "previews" / f"validation-{state.epoch:04d}.png"
             validation_metrics = validate_decoder(
@@ -437,6 +486,7 @@ def train_decoder(
                 validation_loader,
                 config,
                 preview,
+                objective,
             )
             logger.log(validation_metrics, state.global_step)
             if rank == 0 and preview.is_file():
@@ -447,6 +497,16 @@ def train_decoder(
                     key="decoder/validation_preview",
                 )
         if rank == 0:
+            if validation_metrics:
+                metrics_path = output / "validation" / f"epoch-{state.epoch:04d}.json"
+                metrics_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary_metrics = metrics_path.with_suffix(
+                    metrics_path.suffix + f".partial-{os.getpid()}"
+                )
+                temporary_metrics.write_text(
+                    json.dumps(validation_metrics, indent=2, sort_keys=True) + "\n"
+                )
+                os.replace(temporary_metrics, metrics_path)
             checkpoint = save_decoder_checkpoint(
                 output / "checkpoints",
                 state,
@@ -460,6 +520,18 @@ def train_decoder(
             )
             if config.wandb.checkpoint_artifacts:
                 logger.log_checkpoint(str(checkpoint), f"decoder-epoch-{state.epoch:04d}")
+            if validation_metrics:
+                best_path = output / "checkpoints" / "best-lpips.json"
+                current = validation_metrics["decoder/validation_lpips"]
+                previous = json.loads(best_path.read_text()) if best_path.exists() else None
+                if previous is None or current < previous["lpips"]:
+                    best_path.write_text(
+                        json.dumps({"lpips": current, "checkpoint": checkpoint.name}) + "\n"
+                    )
+                    link = output / "checkpoints" / "best-lpips"
+                    temporary = output / "checkpoints" / f".best-lpips-{os.getpid()}"
+                    temporary.symlink_to(checkpoint.name, target_is_directory=True)
+                    os.replace(temporary, link)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
         if final:

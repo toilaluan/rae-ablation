@@ -17,19 +17,25 @@ from jit_reg.endpoint_cache import (
 )
 
 
-def test_paired_endpoint_cache_roundtrip_resume_and_size(tmp_path) -> None:
+def test_endpoint_cache_roundtrip_resume_and_size(tmp_path) -> None:
     config = ExperimentConfig()
     config.data.max_samples = 3
+    config.validation.periodic_samples = 2
+    config.validation.final_samples = 3
     config.vision.cache.directory = str(tmp_path)
     spec = endpoint_cache_spec(config, 3, "statistics-digest")
     path = endpoint_cache_path(config, spec)
-    expected_values = 3 * 768 * 8 * 8 * 2
-    assert required_endpoint_cache_bytes(spec) == 2 * expected_values + 3
+    spatial_values = 3 * 768 * 8 * 8
+    assert required_endpoint_cache_bytes(spec) == 2 * (2 * spatial_values) + 3
     assert EndpointCacheWriter.initialize(path, spec) is False
     writer = EndpointCacheWriter(path, spec)
     target = torch.arange(3, dtype=torch.float32).reshape(3, 1, 1, 1).expand(3, 768, 8, 8)
     semantic = target + 10
-    writer.write(torch.tensor([0, 2]), target[[0, 2]], semantic[[0, 2]])
+    writer.write(
+        torch.tensor([0, 2]),
+        target[[0, 2]],
+        semantic[[0, 2]],
+    )
     assert writer.pending_indices().tolist() == [1]
 
     resumed = EndpointCacheWriter(path, spec)
@@ -47,11 +53,11 @@ def test_paired_endpoint_cache_roundtrip_resume_and_size(tmp_path) -> None:
     assert manifest["complete"] is True
 
 
-def test_endpoint_cache_fingerprint_tracks_sources_not_cascade(tmp_path) -> None:
+def test_endpoint_cache_fingerprint_ignores_flow_route_but_tracks_sources(tmp_path) -> None:
     config = ExperimentConfig()
     config.vision.cache.directory = str(tmp_path)
     first = endpoint_cache_spec(config, 2, "statistics")
-    config.cascade.pool_size = 4
+    config.flow.endpoint = "pixel"
     second = endpoint_cache_spec(config, 2, "statistics")
     assert endpoint_cache_fingerprint(first) == endpoint_cache_fingerprint(second)
     config.data.revision = "different"
@@ -66,3 +72,17 @@ def test_incomplete_endpoint_cache_is_rejected(tmp_path) -> None:
     EndpointCacheWriter.initialize(endpoint_cache_path(config, spec), spec)
     with pytest.raises(ValueError, match="incomplete"):
         EndpointCache(config, 1, "statistics")
+
+
+def test_legacy_endpoint_cache_schema_is_rejected(tmp_path) -> None:
+    config = ExperimentConfig()
+    config.vision.cache.directory = str(tmp_path)
+    spec = endpoint_cache_spec(config, 2, "statistics")
+    path = endpoint_cache_path(config, spec)
+    EndpointCacheWriter.initialize(path, spec)
+    manifest_path = path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["schema_version"] = 2
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="incompatible schema"):
+        EndpointCacheWriter(path, spec)

@@ -21,7 +21,7 @@ from .config import ExperimentConfig
 from .data import preprocessing_metadata
 from .vision import vision_fingerprint
 
-ENDPOINT_CACHE_SCHEMA_VERSION = 1
+ENDPOINT_CACHE_SCHEMA_VERSION = 3
 TARGET_FILE = "target.bf16"
 SEMANTIC_FILE = "semantic.bf16"
 COMPLETION_FILE = "completion.u8"
@@ -50,9 +50,14 @@ def endpoint_cache_spec(
         "vision_fingerprint": vision_fingerprint(config.vision),
         "latent_statistics_sha256": latent_statistics_sha256,
         "tensors": {
-            "target": "normalized-block2-patch-tokens",
-            "semantic": "normalized-block12-unpooled-patch-tokens",
-            "shape": list(config.vision.token_shape),
+            "target": {
+                "description": "normalized-raw-block2-patch-states",
+                "shape": list(config.vision.token_shape),
+            },
+            "semantic": {
+                "description": "normalized-finalnorm-block12-patch-states",
+                "shape": list(config.vision.token_shape),
+            },
             "dtype": "bfloat16",
         },
     }
@@ -67,17 +72,23 @@ def endpoint_cache_path(config: ExperimentConfig, spec: dict[str, Any]) -> Path:
     return Path(config.vision.cache.directory) / endpoint_cache_fingerprint(spec)
 
 
-def _shape(spec: dict[str, Any]) -> tuple[int, ...]:
+def _shape(spec: dict[str, Any], name: str) -> tuple[int, ...]:
     return (
         int(spec["dataset"]["dataset_size"]),
-        *(int(value) for value in spec["tensors"]["shape"]),
+        *(int(value) for value in spec["tensors"][name]["shape"]),
+    )
+
+
+def _files(spec: dict[str, Any]) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    return (
+        (TARGET_FILE, _shape(spec, "target")),
+        (SEMANTIC_FILE, _shape(spec, "semantic")),
     )
 
 
 def required_endpoint_cache_bytes(spec: dict[str, Any]) -> int:
-    shape = _shape(spec)
-    values = int(np.prod(shape, dtype=np.int64)) * np.dtype(np.uint16).itemsize
-    return 2 * values + shape[0]
+    values = sum(int(np.prod(shape, dtype=np.int64)) * 2 for _, shape in _files(spec))
+    return values + int(spec["dataset"]["dataset_size"])
 
 
 def preflight_endpoint_cache_capacity(
@@ -88,13 +99,11 @@ def preflight_endpoint_cache_capacity(
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     target = path or root
-    shape = _shape(spec)
-    value_bytes = int(np.prod(shape, dtype=np.int64)) * 2
-    expected = (
-        (TARGET_FILE, value_bytes),
-        (SEMANTIC_FILE, value_bytes),
-        (COMPLETION_FILE, shape[0]),
-    )
+    expected = [
+        (filename, int(np.prod(shape, dtype=np.int64)) * 2)
+        for filename, shape in _files(spec)
+    ]
+    expected.append((COMPLETION_FILE, int(spec["dataset"]["dataset_size"])))
     needed = 0
     for filename, size in expected:
         candidate = target / filename
@@ -115,10 +124,12 @@ def _manifest(spec: dict[str, Any], complete: bool) -> dict[str, Any]:
         "fingerprint": endpoint_cache_fingerprint(spec),
         "complete": complete,
         "spec": spec,
-        "shape": list(_shape(spec)),
-        "target_file": TARGET_FILE,
-        "semantic_file": SEMANTIC_FILE,
-        "completion_file": COMPLETION_FILE,
+        "shapes": {name: list(_shape(spec, name)) for name in ("target", "semantic")},
+        "files": {
+            "target": TARGET_FILE,
+            "semantic": SEMANTIC_FILE,
+            "completion": COMPLETION_FILE,
+        },
     }
 
 
@@ -134,28 +145,21 @@ def _validate_manifest(
     manifest = json.loads(manifest_path.read_text())
     if manifest.get("schema_version") != ENDPOINT_CACHE_SCHEMA_VERSION:
         raise ValueError("endpoint-cache manifest uses an incompatible schema")
-    if (
-        manifest.get("fingerprint") != endpoint_cache_fingerprint(spec)
-        or manifest.get("spec") != spec
-        or manifest.get("shape") != list(_shape(spec))
-    ):
+    if manifest.get("fingerprint") != endpoint_cache_fingerprint(spec) or manifest.get("spec") != spec:
         raise ValueError(f"endpoint-cache manifest is incompatible: {directory}")
-    shape = _shape(spec)
-    value_bytes = int(np.prod(shape, dtype=np.int64)) * 2
-    for filename, size in (
-        (TARGET_FILE, value_bytes),
-        (SEMANTIC_FILE, value_bytes),
-        (COMPLETION_FILE, shape[0]),
-    ):
+    for filename, shape in _files(spec):
+        size = int(np.prod(shape, dtype=np.int64)) * 2
         candidate = directory / filename
         if not candidate.is_file() or candidate.stat().st_size != size:
             raise ValueError(f"endpoint-cache file has the wrong size: {candidate}")
+    count = int(spec["dataset"]["dataset_size"])
+    completion_path = directory / COMPLETION_FILE
+    if not completion_path.is_file() or completion_path.stat().st_size != count:
+        raise ValueError(f"endpoint-cache file has the wrong size: {completion_path}")
     if require_complete:
         if not manifest.get("complete"):
             raise ValueError(f"endpoint cache is incomplete: {directory}")
-        completion = np.memmap(
-            directory / COMPLETION_FILE, mode="r", dtype=np.uint8, shape=(shape[0],)
-        )
+        completion = np.memmap(completion_path, mode="r", dtype=np.uint8, shape=(count,))
         if np.any(completion != 1):
             raise ValueError(f"endpoint-cache completion bitmap is incomplete: {directory}")
     return manifest
@@ -180,22 +184,23 @@ class EndpointCacheWriter:
     def __init__(self, directory: str | Path, spec: dict[str, Any]) -> None:
         self.directory = Path(directory)
         self.spec = spec
-        self.shape = _shape(spec)
         _validate_manifest(self.directory, spec, require_complete=False)
+        self.target_shape = _shape(spec, "target")
+        self.semantic_shape = _shape(spec, "semantic")
         self.target = np.memmap(
-            self.directory / TARGET_FILE, mode="r+", dtype=np.uint16, shape=self.shape
+            self.directory / TARGET_FILE, mode="r+", dtype=np.uint16, shape=self.target_shape
         )
         self.semantic = np.memmap(
             self.directory / SEMANTIC_FILE,
             mode="r+",
             dtype=np.uint16,
-            shape=self.shape,
+            shape=self.semantic_shape,
         )
         self.completion = np.memmap(
             self.directory / COMPLETION_FILE,
             mode="r+",
             dtype=np.uint8,
-            shape=(self.shape[0],),
+            shape=(self.target_shape[0],),
         )
 
     @classmethod
@@ -204,26 +209,17 @@ class EndpointCacheWriter:
         destination.mkdir(parents=True, exist_ok=True)
         manifest_path = destination / MANIFEST_FILE
         if manifest_path.exists():
-            return bool(
-                _validate_manifest(destination, spec, require_complete=False)["complete"]
-            )
-        shape = _shape(spec)
-        target = np.memmap(
-            destination / TARGET_FILE, mode="w+", dtype=np.uint16, shape=shape
-        )
-        semantic = np.memmap(
-            destination / SEMANTIC_FILE, mode="w+", dtype=np.uint16, shape=shape
-        )
+            return bool(_validate_manifest(destination, spec, require_complete=False)["complete"])
+        arrays = []
+        for filename, shape in _files(spec):
+            arrays.append(np.memmap(destination / filename, mode="w+", dtype=np.uint16, shape=shape))
+        count = int(spec["dataset"]["dataset_size"])
         completion = np.memmap(
-            destination / COMPLETION_FILE,
-            mode="w+",
-            dtype=np.uint8,
-            shape=(shape[0],),
+            destination / COMPLETION_FILE, mode="w+", dtype=np.uint8, shape=(count,)
         )
         completion[:] = 0
-        target.flush()
-        semantic.flush()
-        completion.flush()
+        for value in (*arrays, completion):
+            value.flush()
         _json_atomic(manifest_path, _manifest(spec, False))
         return False
 
@@ -232,23 +228,27 @@ class EndpointCacheWriter:
             raise ValueError("rank must be within world size")
         return np.flatnonzero(np.asarray(self.completion) == 0)[rank::world_size]
 
+    @staticmethod
+    def _bits(value: Tensor) -> np.ndarray:
+        return value.detach().cpu().to(torch.bfloat16).contiguous().view(torch.uint16).numpy()
+
     def write(self, indices: Tensor, target: Tensor, semantic: Tensor) -> None:
         positions = indices.detach().cpu().numpy().astype(np.int64, copy=False)
-        expected = (len(positions), *self.shape[1:])
-        if positions.ndim != 1 or tuple(target.shape) != expected or semantic.shape != target.shape:
-            raise ValueError(f"cached endpoint tensors must have shape {expected}")
-        if np.any(positions < 0) or np.any(positions >= self.shape[0]):
+        expected = {
+            "target": (len(positions), *self.target_shape[1:]),
+            "semantic": (len(positions), *self.semantic_shape[1:]),
+        }
+        if positions.ndim != 1 or any(
+            tuple(value.shape) != expected[name]
+            for name, value in (("target", target), ("semantic", semantic))
+        ):
+            raise ValueError(f"cached endpoint tensors must have shapes {expected}")
+        if np.any(positions < 0) or np.any(positions >= self.target_shape[0]):
             raise IndexError("endpoint-cache index is out of range")
-        target_bits = (
-            target.detach().cpu().to(torch.bfloat16).contiguous().view(torch.uint16).numpy()
-        )
-        semantic_bits = (
-            semantic.detach().cpu().to(torch.bfloat16).contiguous().view(torch.uint16).numpy()
-        )
-        self.target[positions] = target_bits
-        self.semantic[positions] = semantic_bits
-        self.target.flush()
-        self.semantic.flush()
+        self.target[positions] = self._bits(target)
+        self.semantic[positions] = self._bits(semantic)
+        for value in (self.target, self.semantic):
+            value.flush()
         self.completion[positions] = 1
         self.completion.flush()
 
@@ -298,16 +298,8 @@ class AsyncEndpointCacheWriter:
                 self._free.put(
                     _HostBuffer(
                         torch.empty(batch_size, dtype=torch.int64, pin_memory=True),
-                        torch.empty(
-                            (batch_size, *writer.shape[1:]),
-                            dtype=torch.bfloat16,
-                            pin_memory=True,
-                        ),
-                        torch.empty(
-                            (batch_size, *writer.shape[1:]),
-                            dtype=torch.bfloat16,
-                            pin_memory=True,
-                        ),
+                        torch.empty((batch_size, *writer.target_shape[1:]), dtype=torch.bfloat16, pin_memory=True),
+                        torch.empty((batch_size, *writer.semantic_shape[1:]), dtype=torch.bfloat16, pin_memory=True),
                     )
                 )
             self._thread = threading.Thread(target=self._writer_loop, daemon=True)
@@ -398,12 +390,11 @@ class EndpointCache:
         self.directory = endpoint_cache_path(config, self.spec)
         self.manifest = _validate_manifest(self.directory, self.spec, require_complete=True)
         self.fingerprint = str(self.manifest["fingerprint"])
-        self.shape = _shape(self.spec)
         self.target = np.memmap(
-            self.directory / TARGET_FILE, mode="r", dtype=np.uint16, shape=self.shape
+            self.directory / TARGET_FILE, mode="r", dtype=np.uint16, shape=_shape(self.spec, "target")
         )
         self.semantic = np.memmap(
-            self.directory / SEMANTIC_FILE, mode="r", dtype=np.uint16, shape=self.shape
+            self.directory / SEMANTIC_FILE, mode="r", dtype=np.uint16, shape=_shape(self.spec, "semantic")
         )
 
     @staticmethod
@@ -411,8 +402,10 @@ class EndpointCache:
         positions = indices.detach().cpu().numpy().astype(np.int64, copy=False)
         if positions.ndim != 1 or np.any(positions < 0) or np.any(positions >= values.shape[0]):
             raise IndexError("endpoint-cache index is out of range")
-        bits = np.asarray(values[positions]).copy()
-        return torch.from_numpy(bits).view(torch.bfloat16)
+        return torch.from_numpy(np.asarray(values[positions]).copy()).view(torch.bfloat16)
 
     def lookup(self, indices: Tensor) -> tuple[Tensor, Tensor]:
-        return self._lookup(self.target, indices), self._lookup(self.semantic, indices)
+        return (
+            self._lookup(self.target, indices),
+            self._lookup(self.semantic, indices),
+        )
