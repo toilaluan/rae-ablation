@@ -5,11 +5,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-from jit_reg.compare import compare_runs
+from cascade_dit.compare import compare_runs
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compare matched DINO-DDT experiment results")
+    parser = argparse.ArgumentParser(description="Compare matched CascadeDiT results")
     parser.add_argument("first", type=Path)
     parser.add_argument("second", type=Path)
     parser.add_argument("--output", type=Path)

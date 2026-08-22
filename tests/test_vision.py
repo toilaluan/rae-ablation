@@ -3,9 +3,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from jit_reg.config import IMAGE_SIZE, VisionConfig
-from jit_reg.latent_statistics import EndpointLatentNormalizer, LatentStatistics
-from jit_reg.vision import DINOEndpointEncoder
+from cascade_dit.config import SemanticTokenConfig
+from cascade_dit.semantic_statistics import SemanticStatistics, SemanticTokenNormalizer
+from cascade_dit.vision import DINOSemanticEncoder
 
 
 class Embeddings(nn.Module):
@@ -15,92 +15,43 @@ class Embeddings(nn.Module):
 
     def forward(self, pixels: torch.Tensor, bool_masked_pos: object = None) -> torch.Tensor:
         del bool_masked_pos
-        batch = pixels.shape[0]
         patches = (pixels.shape[-1] // 16) ** 2
-        return torch.zeros(batch, 5 + patches, 768, device=pixels.device, dtype=pixels.dtype)
+        return torch.zeros(pixels.shape[0], 5 + patches, 768, dtype=pixels.dtype)
 
 
 class Block(nn.Module):
-    def __init__(self, value: int) -> None:
-        super().__init__()
-        self.value = value
-
     def forward(
-        self,
-        states: torch.Tensor,
-        attention_mask: object = None,
-        position_embeddings: object = None,
+        self, states: torch.Tensor, position_embeddings: object = None
     ) -> torch.Tensor:
-        del attention_mask, position_embeddings
-        return states + self.value
+        del position_embeddings
+        return states + 1
 
 
 class FakeDINO(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.embeddings = Embeddings()
-        self.rope_embeddings = lambda pixels: (pixels.new_zeros(1), pixels.new_zeros(1))
-        self.layer = nn.ModuleList(Block(index) for index in range(1, 13))
+        self.rope_embeddings = lambda pixels: pixels.new_zeros(1)
+        self.layer = nn.ModuleList(Block() for _ in range(12))
         self.norm = nn.Identity()
 
 
-def test_dino_extracts_both_normalized_patch_endpoints_in_one_pass() -> None:
-    model = FakeDINO()
-    encoder = DINOEndpointEncoder(model, VisionConfig())
-    target, semantic = encoder.encode_pair(
-        torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.uint8)
+def test_dino_extracts_normalized_unpooled_tokens_from_128px_view() -> None:
+    statistics = SemanticStatistics(
+        mean=torch.full((768,), 4.0),
+        std=torch.full((768,), 2.0),
+        count=2,
+        semantic_encoder_fingerprint="encoder",
+        data_fingerprint="data",
     )
-    assert target.shape == semantic.shape == (1, 768, 8, 8)
-    assert torch.all(target == sum(range(1, 3)))
-    assert torch.all(semantic == sum(range(1, 13)))
+    encoder = DINOSemanticEncoder(
+        FakeDINO(),
+        SemanticTokenConfig(),
+        normalizer=SemanticTokenNormalizer(statistics),
+    )
+    tokens = encoder.encode(torch.zeros(1, 3, 256, 256, dtype=torch.uint8))
+    assert tokens.shape == (1, 768, 8, 8)
+    assert torch.all(tokens == 4)
     assert all(not parameter.requires_grad for parameter in encoder.parameters())
     encoder.train()
     assert encoder.training is False
-
-
-def test_target_only_encoder_stops_at_target_layer() -> None:
-    model = FakeDINO()
-    encoder = DINOEndpointEncoder(model, VisionConfig(), include_semantic=False)
-    target = encoder.encode_target(torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE))
-    assert torch.all(target == sum(range(1, 3)))
-
-
-def test_dino_applies_separate_normalizers_to_endpoints() -> None:
-    statistics = LatentStatistics(
-        target_mean=torch.ones(768),
-        target_std=torch.full((768,), 2.0),
-        semantic_mean=torch.full((768,), 10.0),
-        semantic_std=torch.full((768,), 4.0),
-        count=2,
-        vision_fingerprint="vision",
-        data_fingerprint="data",
-    )
-    encoder = DINOEndpointEncoder(
-        FakeDINO(),
-        VisionConfig(),
-        normalizer=EndpointLatentNormalizer(statistics),
-    )
-    target, semantic = encoder.encode_pair(torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE))
-    assert torch.all(target == (sum(range(1, 3)) - 1) / 2)
-    assert torch.all(semantic == (sum(range(1, 13)) - 10) / 4)
-
-
-def test_target_only_encoder_uses_target_normalization_for_both_outputs() -> None:
-    statistics = LatentStatistics(
-        target_mean=torch.ones(768),
-        target_std=torch.full((768,), 2.0),
-        semantic_mean=torch.full((768,), 10.0),
-        semantic_std=torch.full((768,), 4.0),
-        count=2,
-        vision_fingerprint="vision",
-        data_fingerprint="data",
-    )
-    encoder = DINOEndpointEncoder(
-        FakeDINO(),
-        VisionConfig(),
-        include_semantic=False,
-        normalizer=EndpointLatentNormalizer(statistics),
-    )
-    target, duplicate = encoder(torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE))
-    assert torch.equal(target, duplicate)
-    assert torch.all(target == (sum(range(1, 3)) - 1) / 2)

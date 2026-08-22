@@ -2,136 +2,81 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 from torch import nn
 
-from jit_reg.model import DDTOutput
-from jit_reg.objective import SEMANTIC_STAGE, TARGET_STAGE
-from jit_reg.sample_runtime import SamplingParameters
-from jit_reg.sampling import ode_sample
+from cascade_dit.sample_runtime import SamplingParameters
+from cascade_dit.sampling import sample_cascade, sample_image_latents
+from cascade_dit.validation import noise_for_samples
 
 
-class GuidanceModel(nn.Module):
+class RecordingModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.config = SimpleNamespace(num_classes=2)
-        self.stages: list[torch.Tensor] = []
-        self.timesteps: list[torch.Tensor] = []
-        self.label_batches: list[torch.Tensor] = []
+        self.semantic_states: list[torch.Tensor] = []
+        self.image_states: list[torch.Tensor] = []
 
-    def forward(
-        self,
-        noisy: torch.Tensor,
-        timestep: torch.Tensor,
-        stage: torch.Tensor,
-        labels: torch.Tensor,
-    ) -> DDTOutput:
-        self.stages.append(stage.detach().clone())
-        self.timesteps.append(timestep.detach().clone())
-        self.label_batches.append(labels.detach().clone())
-        shape = (labels.shape[0], *((1,) * (noisy.ndim - 1)))
-        label = labels.reshape(shape).to(noisy.dtype)
-        full = torch.ones_like(noisy) * (2 + label)
-        base = torch.ones_like(noisy) * label
-        projection = torch.zeros(labels.shape[0], 1, 1, device=noisy.device)
-        return DDTOutput(full, base, projection)
-
-
-class SamplingOnlyModel(GuidanceModel):
-    def forward_predictions(
-        self,
-        noisy: torch.Tensor,
-        timestep: torch.Tensor,
-        stage: torch.Tensor,
-        labels: torch.Tensor,
+    def forward_semantic_predictions(
+        self, values: torch.Tensor, timestep: torch.Tensor, labels: torch.Tensor
     ) -> SimpleNamespace:
-        output = super().forward(noisy, timestep, stage, labels)
-        return SimpleNamespace(
-            full_prediction=output.full_prediction,
-            base_prediction=output.base_prediction,
-        )
+        del timestep, labels
+        self.semantic_states.append(values.detach().clone())
+        return SimpleNamespace(full=torch.zeros_like(values), base=torch.zeros_like(values))
 
-    def forward(self, *args: object, **kwargs: object) -> DDTOutput:
-        raise AssertionError("sampling should use forward_predictions")
+    def forward_image_prediction(
+        self,
+        values: torch.Tensor,
+        timestep: torch.Tensor,
+        labels: torch.Tensor,
+        semantic_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del timestep, labels, semantic_tokens
+        self.image_states.append(values.detach().clone())
+        return torch.zeros_like(values)
 
 
-def test_default_step_allocation_has_explicit_solver_nfe() -> None:
+def test_sampling_nfe_uses_two_routes_or_latent_only() -> None:
     assert SamplingParameters().sampling_nfe == 50
     assert SamplingParameters(solver="heun").sampling_nfe == 98
+    assert SamplingParameters(semantic_steps=0).sampling_nfe == 40
+    assert SamplingParameters(semantic_steps=0, solver="heun").sampling_nfe == 79
 
 
-def test_euler_uses_exact_per_stage_step_allocation_and_boundary() -> None:
-    model = SamplingOnlyModel()
-    ode_sample(
+def test_cascade_initializes_fresh_image_noise() -> None:
+    model = RecordingModel()
+    semantic_noise = torch.full((1, 1, 1, 1), 3.0)
+    image_noise = torch.full((1, 1, 1, 1), 7.0)
+    generated = sample_cascade(
         model,
-        torch.zeros(1, 1, 1, 1),
-        torch.tensor([1]),
-        semantic_steps=2,
-        target_steps=3,
-        timestep_shift=1,
-        ig_scale=1,
-        num_classes=2,
-    )
-    assert [int(stage[0]) for stage in model.stages] == [
-        SEMANTIC_STAGE,
-        SEMANTIC_STAGE,
-        TARGET_STAGE,
-        TARGET_STAGE,
-        TARGET_STAGE,
-    ]
-    assert [float(timestep[0]) for timestep in model.timesteps] == pytest.approx(
-        [1.0, 0.5, 1.0, 2 / 3, 1 / 3]
-    )
-
-
-def test_heun_skips_singular_endpoint_correction_on_each_stage() -> None:
-    model = GuidanceModel()
-    ode_sample(
-        model,
-        torch.zeros(1, 1, 1, 1),
-        torch.tensor([1]),
-        semantic_steps=2,
-        target_steps=3,
-        timestep_shift=1,
-        ig_scale=1,
-        solver="heun",
-        num_classes=2,
-    )
-    assert len(model.stages) == 2 * 5 - 2
-    values = [int(stage[0]) for stage in model.stages]
-    assert values[:3] == [SEMANTIC_STAGE] * 3
-    assert values[3:] == [TARGET_STAGE] * 5
-
-
-def test_semantic_uses_internal_guidance_and_target_uses_only_cfg() -> None:
-    noise = torch.zeros(1, 1, 1, 1)
-    pure_model = GuidanceModel()
-    pure = ode_sample(
-        pure_model,
-        noise,
+        semantic_noise,
+        image_noise,
         torch.tensor([1]),
         semantic_steps=1,
-        target_steps=1,
-        timestep_shift=1,
-        ig_scale=2,
+        image_steps=1,
         num_classes=2,
     )
-    # Semantic IG produces clean S=5; target then produces conditional T=3.
-    assert pure.item() == pytest.approx(3.0)
-    assert [batch.numel() for batch in pure_model.label_batches] == [1, 1]
-    cfg_model = GuidanceModel()
-    combined = ode_sample(
-        cfg_model,
-        noise,
-        torch.tensor([1]),
-        semantic_steps=1,
-        target_steps=1,
-        timestep_shift=1,
-        ig_scale=2,
-        cfg_scale=2,
+    assert torch.equal(model.semantic_states[0], semantic_noise)
+    assert torch.equal(model.image_states[0], image_noise)
+    assert generated.semantic_tokens is not None
+
+
+def test_image_noise_is_batch_and_architecture_invariant() -> None:
+    seeds = torch.tensor([12, 33])
+    together = noise_for_samples(seeds, (2, 3, 3), "cpu", dtype=torch.float32)
+    apart = torch.cat(
+        [
+            noise_for_samples(seed[None], (2, 3, 3), "cpu", dtype=torch.float32)
+            for seed in seeds
+        ]
+    )
+    assert torch.equal(together, apart)
+    model = RecordingModel()
+    sample_image_latents(
+        model,
+        together,
+        torch.tensor([0, 1]),
+        steps=1,
         num_classes=2,
     )
-    # Semantic remains IG=5 without duplication. Target CFG is 4+2*(3-4)=2.
-    assert combined.item() == pytest.approx(2.0)
-    assert [batch.numel() for batch in cfg_model.label_batches] == [1, 2]
+    assert torch.equal(model.image_states[0], together)

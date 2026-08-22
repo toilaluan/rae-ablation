@@ -4,8 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
-from jit_reg.evaluation import evaluate_npz, save_evaluation
-from jit_reg.validation import ValidationPlan
+from cascade_dit.evaluation import evaluate_npz, save_evaluation
+from cascade_dit.validation import ValidationPlan
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -3,29 +3,55 @@ from __future__ import annotations
 import pytest
 import torch
 
-from jit_reg.config import IMAGE_SIZE
-from jit_reg.training import TrainBatch, _collate, _PreparedBatchIterator
+from cascade_dit.config import IMAGE_SIZE
+from cascade_dit.training import (
+    RepresentationCacheCollator,
+    TrainBatch,
+    _PreparedBatchIterator,
+    training_requires_pixels,
+)
 
 
-def test_train_collator_preserves_uint8_pixels_and_metadata() -> None:
-    first = torch.zeros(3, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.uint8)
-    second = torch.ones(3, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.uint8)
-    batch = _collate([(first, 11, 2), (second, 13, 5)])
-    assert batch.target is None and batch.semantic is None
-    assert batch.pixels.dtype == torch.uint8
-    assert batch.pixels.shape == (2, 3, IMAGE_SIZE, IMAGE_SIZE)
-    assert torch.equal(batch.labels, torch.tensor([11, 13]))
-    assert torch.equal(batch.indices, torch.tensor([2, 5]))
+class FakeCache:
+    def __init__(self, shape: tuple[int, ...]) -> None:
+        self.shape = shape
+
+    def lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(indices.numel(), *self.shape, dtype=torch.bfloat16)
 
 
-def test_prepared_batch_iterator_moves_only_online_batch() -> None:
-    raw = torch.zeros(2, 3, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.uint8)
+def test_collator_supports_all_cache_combinations() -> None:
+    pixels = torch.zeros(3, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.uint8)
+    samples = [(pixels, 3, 7), (pixels, 4, 8)]
+    collator = RepresentationCacheCollator(
+        FakeCache((128, 16, 16)), FakeCache((768, 8, 8))
+    )
+    batch = collator(samples)
+    assert batch.pixels is not None
+    assert batch.image_latents.shape == (2, 128, 16, 16)
+    assert batch.semantic_tokens.shape == (2, 768, 8, 8)
+    cached_only = collator([(None, 3, 7), (None, 4, 8)])
+    assert cached_only.pixels is None
+
+
+def test_pixel_loading_policy_for_baseline_and_cascades() -> None:
+    image_cache = FakeCache((128, 16, 16))
+    semantic_cache = FakeCache((768, 8, 8))
+    assert training_requires_pixels("latent", None, None)
+    assert not training_requires_pixels("latent", image_cache, None)  # type: ignore[arg-type]
+    assert training_requires_pixels("shared_cascade", image_cache, None)  # type: ignore[arg-type]
+    assert not training_requires_pixels(  # type: ignore[arg-type]
+        "decoupled_cascade", image_cache, semantic_cache
+    )
+
+
+def test_prepared_batch_iterator_preserves_cached_tensors() -> None:
     source = iter(
         [
             TrainBatch(
-                raw,
                 None,
-                None,
+                torch.zeros(2, 128, 16, 16, dtype=torch.bfloat16),
+                torch.zeros(2, 768, 8, 8, dtype=torch.bfloat16),
                 torch.tensor([3, 4]),
                 torch.tensor([8, 9]),
             )
@@ -33,8 +59,7 @@ def test_prepared_batch_iterator_moves_only_online_batch() -> None:
     )
     iterator = _PreparedBatchIterator(source, torch.device("cpu"))
     batch = next(iterator)
-    assert batch.pixels.dtype == torch.uint8
-    assert batch.labels.dtype == torch.long
-    assert batch.indices.dtype == torch.long
+    assert batch.image_latents.dtype == torch.bfloat16
+    assert batch.semantic_tokens.dtype == torch.bfloat16
     with pytest.raises(StopIteration):
         next(iterator)
