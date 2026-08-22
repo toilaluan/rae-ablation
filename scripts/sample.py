@@ -8,7 +8,7 @@ import torch
 from safetensors.torch import load_file
 
 from cascade_dit.checkpoint_bundle import load_checkpoint_bundle
-from cascade_dit.config import IMAGE_LATENT_SHAPE, SEMANTIC_TOKEN_SHAPE
+from cascade_dit.config import SEMANTIC_TOKEN_SHAPE
 from cascade_dit.distributed import broadcast_string, initialize_distributed
 from cascade_dit.evaluation import evaluate_npz, save_evaluation
 from cascade_dit.mage import load_mage_vae_codec
@@ -34,6 +34,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-steps", type=int)
     parser.add_argument("--solver", choices=("euler", "heun"))
     parser.add_argument("--timestep-shift", type=float)
+    parser.add_argument("--semantic-timestep-shift", type=float)
+    parser.add_argument("--image-timestep-shift", type=float)
     parser.add_argument("--semantic-guidance-scale", type=float)
     parser.add_argument("--semantic-guidance-start", type=float)
     parser.add_argument("--semantic-guidance-end", type=float)
@@ -55,6 +57,26 @@ def main() -> None:
     bundle = load_checkpoint_bundle(args.checkpoint_dir)
     config, defaults = bundle.config, bundle.config.sampling
     sample_count = int(_value(args.num_samples, defaults.num_samples))
+    if args.timestep_shift is not None and (
+        args.semantic_timestep_shift is not None or args.image_timestep_shift is not None
+    ):
+        raise ValueError(
+            "--timestep-shift cannot be combined with route-specific timestep shifts"
+        )
+    semantic_timestep_shift = float(
+        args.timestep_shift
+        if args.timestep_shift is not None
+        else _value(
+            args.semantic_timestep_shift, defaults.semantic_timestep_shift
+        )
+    )
+    image_timestep_shift = float(
+        args.timestep_shift
+        if args.timestep_shift is not None
+        else _value(args.image_timestep_shift, defaults.image_timestep_shift)
+    )
+    if config.model.architecture == "latent":
+        semantic_timestep_shift = image_timestep_shift
     parameters = SamplingParameters(
         batch_size=int(_value(args.batch_size, defaults.batch_size)),
         semantic_steps=(
@@ -64,7 +86,8 @@ def main() -> None:
         ),
         image_steps=int(_value(args.image_steps, defaults.image_steps)),
         solver=str(_value(args.solver, defaults.solver)),
-        timestep_shift=float(_value(args.timestep_shift, defaults.timestep_shift)),
+        semantic_timestep_shift=semantic_timestep_shift,
+        image_timestep_shift=image_timestep_shift,
         semantic_guidance_scale=float(
             _value(
                 args.semantic_guidance_scale, defaults.semantic_guidance_scale
@@ -103,8 +126,12 @@ def main() -> None:
     model.load_state_dict(load_file(str(bundle.weights), device=str(device)))
     model.eval()
     execution_model = compile_model_regions(model, config.compile)
-    codec = load_mage_vae_codec(config.image_latents, device)
-    if codec.provenance != representations.get("mage_vae"):
+    codec = (
+        load_mage_vae_codec(config.image_latents, device)
+        if config.model.image_target == "mage_latents"
+        else None
+    )
+    if codec is not None and codec.provenance != representations.get("mage_vae"):
         raise ValueError("sampling Mage-VAE does not match checkpoint provenance")
 
     @torch.inference_mode()
@@ -114,11 +141,15 @@ def main() -> None:
         dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
         batch_labels = labels.to(device)
         image_noise = noise_for_samples(
-            noise_seeds, IMAGE_LATENT_SHAPE, device, dtype=dtype, seed_offset=0
+            noise_seeds,
+            config.model.image_target_shape,
+            device,
+            dtype=dtype,
+            seed_offset=0,
         )
         common = {
             "steps": parameters.image_steps,
-            "timestep_shift": parameters.timestep_shift,
+            "timestep_shift": parameters.image_timestep_shift,
             "class_guidance_scale": parameters.class_guidance_scale,
             "class_guidance_interval": (
                 parameters.class_guidance_start,
@@ -147,7 +178,8 @@ def main() -> None:
                 batch_labels,
                 semantic_steps=parameters.semantic_steps,
                 image_steps=parameters.image_steps,
-                timestep_shift=parameters.timestep_shift,
+                semantic_timestep_shift=parameters.semantic_timestep_shift,
+                image_timestep_shift=parameters.image_timestep_shift,
                 semantic_guidance_scale=parameters.semantic_guidance_scale,
                 semantic_guidance_interval=(
                     parameters.semantic_guidance_start,
@@ -162,12 +194,13 @@ def main() -> None:
                 num_classes=config.model.num_classes,
                 velocity_denominator_floor=config.train.velocity_denominator_floor,
             )
-        return codec.decode(generated.image_latents)
+        if codec is not None:
+            return codec.decode(generated.image_latents)
+        return generated.image_latents.float().add(1).mul(0.5).clamp(0, 1)
 
     representation_schema = {
         "schema_version": REPRESENTATION_SCHEMA_VERSION,
         "architecture": config.model.architecture,
-        "image_latents": representations["mage_vae"],
         "semantic_tokens": representations.get("semantic_encoder"),
         "training_caches": metadata.get("cache_provenance"),
         "conditioning": (
@@ -177,6 +210,10 @@ def main() -> None:
         ),
         "prediction": "clean-x0",
     }
+    if config.model.image_target == "mage_latents":
+        representation_schema["image_latents"] = representations["mage_vae"]
+    else:
+        representation_schema["pixels"] = representations["pixels"]
     output_dir = bundle.directory / sampling_output_name(sample_count, parameters)
     archive = sample_to_archive(
         output_dir=output_dir,
@@ -184,7 +221,7 @@ def main() -> None:
         sample_count=sample_count,
         num_classes=config.model.num_classes,
         image_size=config.image_latents.image_size,
-        patch_size=config.model.image_latent_patch_size,
+        patch_size=config.model.image_target_patch_size,
         grid_size=config.model.token_grid_size,
         architecture=config.model.architecture,
         representation_schema=representation_schema,

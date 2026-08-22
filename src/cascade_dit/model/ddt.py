@@ -9,8 +9,6 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from ..config import (
-    IMAGE_LATENT_CHANNELS,
-    IMAGE_LATENT_SHAPE,
     SEMANTIC_CHANNELS,
     SEMANTIC_TOKEN_SHAPE,
     ModelConfig,
@@ -284,6 +282,37 @@ def _validate_semantic_condition(image_latents: Tensor, semantic_tokens: Tensor)
         raise ValueError("semantic_tokens must have shape [B,768,8,8]")
 
 
+def _select_image_semantic_condition(
+    clean_semantic_tokens: Tensor,
+    predicted_semantic_tokens: Tensor,
+    predicted_semantic_mask: Tensor,
+    image_labels: Tensor,
+    num_classes: int,
+) -> Tensor:
+    if predicted_semantic_mask.shape != (clean_semantic_tokens.shape[0],):
+        raise ValueError("predicted_semantic_mask must have shape [B]")
+    condition = torch.where(
+        predicted_semantic_mask[:, None, None, None],
+        predicted_semantic_tokens.detach(),
+        clean_semantic_tokens.detach(),
+    )
+    return torch.where(
+        (image_labels == num_classes)[:, None, None, None],
+        torch.zeros_like(condition),
+        condition,
+    )
+
+
+def _zero_null_semantic_condition(
+    semantic_tokens: Tensor, labels: Tensor, num_classes: int
+) -> Tensor:
+    return torch.where(
+        (labels == num_classes)[:, None, None, None],
+        torch.zeros_like(semantic_tokens),
+        semantic_tokens,
+    )
+
+
 class _DDTCore(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -374,7 +403,7 @@ class _DDTCore(nn.Module):
 
 
 class LatentDDT(_DDTCore):
-    """Pure native Mage image-latent DDT baseline."""
+    """Single-route image-target DDT baseline."""
 
     def __init__(self, config: ModelConfig | None = None) -> None:
         config = config or ModelConfig(architecture="latent")
@@ -383,17 +412,17 @@ class LatentDDT(_DDTCore):
         config.validate()
         super().__init__(config)
         encoder_width, decoder_width = config.hidden_size
-        inputs = ((IMAGE_LATENT_CHANNELS, config.image_latent_patch_size),)
+        inputs = ((config.image_target_channels, config.image_target_patch_size),)
         self.source_embedder = RoutePatchEmbedder(inputs, encoder_width)
         self.target_embedder = RoutePatchEmbedder(inputs, decoder_width)
         self.image_latent_head = DDTFinalLayer(
             decoder_width,
-            IMAGE_LATENT_CHANNELS,
-            config.image_latent_patch_size,
+            config.image_target_channels,
+            config.image_target_patch_size,
         )
 
     def forward(self, image_latents: Tensor, timestep: Tensor, labels: Tensor) -> Tensor:
-        _validate_common(image_latents, timestep, labels, IMAGE_LATENT_SHAPE)
+        _validate_common(image_latents, timestep, labels, self.config.image_target_shape)
         with self._autocast(image_latents):
             conditioning, _captured, _timestep_base = self._encode(
                 self.source_embedder(image_latents), timestep, labels
@@ -449,15 +478,15 @@ class ConditionalLatentDDT(_DDTCore):
         super().__init__(config)
         encoder_width, decoder_width = config.hidden_size
         inputs = (
-            (IMAGE_LATENT_CHANNELS, config.image_latent_patch_size),
+            (config.image_target_channels, config.image_target_patch_size),
             (SEMANTIC_CHANNELS, config.semantic_patch_size),
         )
         self.source_embedder = RoutePatchEmbedder(inputs, encoder_width)
         self.target_embedder = RoutePatchEmbedder(inputs, decoder_width)
         self.image_latent_head = DDTFinalLayer(
             decoder_width,
-            IMAGE_LATENT_CHANNELS,
-            config.image_latent_patch_size,
+            config.image_target_channels,
+            config.image_target_patch_size,
         )
 
     def forward(
@@ -467,8 +496,11 @@ class ConditionalLatentDDT(_DDTCore):
         labels: Tensor,
         semantic_tokens: Tensor,
     ) -> Tensor:
-        _validate_common(image_latents, timestep, labels, IMAGE_LATENT_SHAPE)
+        _validate_common(image_latents, timestep, labels, self.config.image_target_shape)
         _validate_semantic_condition(image_latents, semantic_tokens)
+        semantic_tokens = _zero_null_semantic_condition(
+            semantic_tokens, labels, self.config.num_classes
+        )
         with self._autocast(image_latents):
             conditioning, _captured, _timestep_base = self._encode(
                 self.source_embedder(image_latents, semantic_tokens), timestep, labels
@@ -495,7 +527,7 @@ class SharedCascadeDDT(_DDTCore):
         encoder_width, decoder_width = config.hidden_size
         semantic_inputs = ((SEMANTIC_CHANNELS, config.semantic_patch_size),)
         image_inputs = (
-            (IMAGE_LATENT_CHANNELS, config.image_latent_patch_size),
+            (config.image_target_channels, config.image_target_patch_size),
             (SEMANTIC_CHANNELS, config.semantic_patch_size),
         )
         self.semantic_source_embedder = RoutePatchEmbedder(
@@ -514,8 +546,8 @@ class SharedCascadeDDT(_DDTCore):
         )
         self.image_latent_head = DDTFinalLayer(
             decoder_width,
-            IMAGE_LATENT_CHANNELS,
-            config.image_latent_patch_size,
+            config.image_target_channels,
+            config.image_target_patch_size,
         )
 
     def forward_semantic_predictions(
@@ -546,8 +578,11 @@ class SharedCascadeDDT(_DDTCore):
         labels: Tensor,
         semantic_tokens: Tensor,
     ) -> Tensor:
-        _validate_common(image_latents, timestep, labels, IMAGE_LATENT_SHAPE)
+        _validate_common(image_latents, timestep, labels, self.config.image_target_shape)
         _validate_semantic_condition(image_latents, semantic_tokens)
+        semantic_tokens = _zero_null_semantic_condition(
+            semantic_tokens, labels, self.config.num_classes
+        )
         with self._autocast(image_latents):
             conditioning, _captured, _timestep_base = self._encode(
                 self.image_source_embedder(image_latents, semantic_tokens),
@@ -573,12 +608,12 @@ class SharedCascadeDDT(_DDTCore):
         semantic = self.forward_semantic_predictions(
             noisy_semantic_tokens, semantic_timestep, semantic_labels
         )
-        if predicted_semantic_mask.shape != (noisy_semantic_tokens.shape[0],):
-            raise ValueError("predicted_semantic_mask must have shape [B]")
-        semantic_condition = torch.where(
-            predicted_semantic_mask[:, None, None, None],
-            semantic.full.detach(),
-            clean_semantic_tokens.detach(),
+        semantic_condition = _select_image_semantic_condition(
+            clean_semantic_tokens,
+            semantic.full,
+            predicted_semantic_mask,
+            image_labels,
+            self.config.num_classes,
         )
         image_latent = self.forward_image_prediction(
             noisy_image_latents, image_timestep, image_labels, semantic_condition
@@ -631,12 +666,12 @@ class DecoupledCascadeDDT(nn.Module):
         semantic = self.forward_semantic_predictions(
             noisy_semantic_tokens, semantic_timestep, semantic_labels
         )
-        if predicted_semantic_mask.shape != (noisy_semantic_tokens.shape[0],):
-            raise ValueError("predicted_semantic_mask must have shape [B]")
-        semantic_condition = torch.where(
-            predicted_semantic_mask[:, None, None, None],
-            semantic.full.detach(),
-            clean_semantic_tokens.detach(),
+        semantic_condition = _select_image_semantic_condition(
+            clean_semantic_tokens,
+            semantic.full,
+            predicted_semantic_mask,
+            image_labels,
+            self.config.num_classes,
         )
         image_latent = self.forward_image_prediction(
             noisy_image_latents, image_timestep, image_labels, semantic_condition

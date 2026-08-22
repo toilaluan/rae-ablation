@@ -33,18 +33,29 @@ def _validate_provenance(
     if architecture not in {"latent", "shared_cascade", "decoupled_cascade"}:
         raise ValueError("checkpoint architecture is invalid")
     mage = representation_provenance.get("mage_vae")
-    if not isinstance(mage, dict):
-        raise ValueError("checkpoint requires Mage-VAE provenance")
-    required = {
-        "repository",
-        "revision",
-        "weight_sha256",
-        "posterior",
-        "image_latent_shape",
-        "encode_preprocessing",
-    }
-    if not required.issubset(mage) or mage.get("posterior") != "mean":
-        raise ValueError("checkpoint Mage-VAE provenance is incomplete")
+    pixels = representation_provenance.get("pixels")
+    if isinstance(mage, dict) and pixels is None:
+        required = {
+            "repository",
+            "revision",
+            "weight_sha256",
+            "posterior",
+            "image_latent_shape",
+            "encode_preprocessing",
+        }
+        if not required.issubset(mage) or mage.get("posterior") != "mean":
+            raise ValueError("checkpoint Mage-VAE provenance is incomplete")
+    elif isinstance(pixels, dict) and mage is None:
+        required = {"kind", "shape", "range", "data_fingerprint", "preprocessing"}
+        if (
+            not required.issubset(pixels)
+            or pixels.get("kind") != "pixels"
+            or pixels.get("shape") != [3, 256, 256]
+            or pixels.get("range") != [-1.0, 1.0]
+        ):
+            raise ValueError("checkpoint pixel provenance is incomplete")
+    else:
+        raise ValueError("checkpoint requires exactly one image-target provenance")
     if architecture != "latent":
         semantic = representation_provenance.get("semantic_encoder")
         if not isinstance(semantic, dict) or not all(
@@ -159,6 +170,12 @@ class CheckpointManager:
         configured_architecture = resolved_config.get("model", {}).get("architecture")
         if configured_architecture != architecture:
             raise ValueError("checkpoint architecture and resolved config disagree")
+        configured_target = resolved_config.get("model", {}).get(
+            "image_target", "mage_latents"
+        )
+        has_mage = "mage_vae" in representation_provenance
+        if (configured_target == "mage_latents") != has_mage:
+            raise ValueError("checkpoint image target and provenance disagree")
         model_architecture = getattr(getattr(model, "config", None), "architecture", None)
         if model_architecture != architecture:
             raise ValueError("checkpoint architecture and model disagree")
@@ -304,6 +321,9 @@ class CheckpointManager:
                 raise ValueError(f"checkpoint {key} provenance is inconsistent")
         if config.model.architecture != state["architecture"]:
             raise ValueError("checkpoint architecture and config are inconsistent")
+        has_mage = "mage_vae" in state["representation_provenance"]
+        if (config.model.image_target == "mage_latents") != has_mage:
+            raise ValueError("checkpoint image target and provenance are inconsistent")
         checks = (
             ("architecture", expected_architecture),
             ("data_fingerprint", expected_data_fingerprint),

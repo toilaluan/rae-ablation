@@ -8,6 +8,7 @@ from cascade_dit.training import (
     RepresentationCacheCollator,
     TrainBatch,
     _PreparedBatchIterator,
+    extract_representations,
     training_requires_pixels,
 )
 
@@ -43,6 +44,33 @@ def test_pixel_loading_policy_for_baseline_and_cascades() -> None:
     assert not training_requires_pixels(  # type: ignore[arg-type]
         "decoupled_cascade", image_cache, semantic_cache
     )
+    assert training_requires_pixels(  # type: ignore[arg-type]
+        "decoupled_cascade", image_cache, semantic_cache, "pixels"
+    )
+
+
+def test_direct_pixel_target_is_normalized_without_mage() -> None:
+    pixels = torch.tensor([0, 255], dtype=torch.uint8).reshape(2, 1, 1, 1)
+    pixels = pixels.expand(2, 3, IMAGE_SIZE, IMAGE_SIZE)
+    semantic = torch.zeros(2, 768, 8, 8)
+    batch = TrainBatch(
+        pixels,
+        None,
+        semantic,
+        torch.tensor([0, 1]),
+        torch.tensor([0, 1]),
+    )
+    target, restored_semantic = extract_representations(
+        batch,
+        "shared_cascade",
+        None,
+        None,
+        "pixels",
+    )
+    assert target.dtype == torch.float32
+    assert target[0].unique().item() == -1
+    assert target[1].unique().item() == 1
+    assert restored_semantic is semantic
 
 
 def test_prepared_batch_iterator_preserves_cached_tensors() -> None:

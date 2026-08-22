@@ -172,9 +172,14 @@ def sample_image_latents(
             ).float()
         else:
             condition = (
-                torch.cat((semantic_tokens, semantic_tokens))
+                torch.cat((semantic_tokens, torch.zeros_like(semantic_tokens)))
                 if use_guidance
                 else semantic_tokens
+            )
+            condition = torch.where(
+                (model_labels == num_classes)[:, None, None, None],
+                torch.zeros_like(condition),
+                condition,
             )
             prediction = method(
                 model_state.to(image_noise.dtype),
@@ -212,7 +217,8 @@ def sample_cascade(
     *,
     semantic_steps: int = 10,
     image_steps: int = 40,
-    timestep_shift: float = 1.0,
+    semantic_timestep_shift: float = 1.0,
+    image_timestep_shift: float = 1.0,
     semantic_guidance_scale: float = 1.78,
     semantic_guidance_interval: tuple[float, float] = (0.1, 1.0),
     class_guidance_scale: float = 1.0,
@@ -228,7 +234,7 @@ def sample_cascade(
         semantic_noise,
         labels,
         steps=semantic_steps,
-        timestep_shift=timestep_shift,
+        timestep_shift=semantic_timestep_shift,
         semantic_guidance_scale=semantic_guidance_scale,
         semantic_guidance_interval=semantic_guidance_interval,
         solver=solver,
@@ -240,7 +246,7 @@ def sample_cascade(
         labels,
         semantic_tokens,
         steps=image_steps,
-        timestep_shift=timestep_shift,
+        timestep_shift=image_timestep_shift,
         class_guidance_scale=class_guidance_scale,
         class_guidance_interval=class_guidance_interval,
         solver=solver,

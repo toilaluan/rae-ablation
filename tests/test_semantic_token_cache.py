@@ -14,6 +14,7 @@ def test_semantic_cache_fingerprint_ignores_ddt_model() -> None:
     config.model.hidden_size = [32, 48]
     config.model.depth = [2, 1]
     config.model.num_heads = [4, 3]
+    config.model.image_target = "pixels"
     second = semantic_token_cache_spec(config, 2, "statistics")
     assert semantic_token_cache_fingerprint(first) == semantic_token_cache_fingerprint(
         second

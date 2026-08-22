@@ -26,7 +26,8 @@ class SamplingParameters:
     semantic_steps: int = 10
     image_steps: int = 40
     solver: str = "euler"
-    timestep_shift: float = 1.0
+    semantic_timestep_shift: float = 1.0
+    image_timestep_shift: float = 1.0
     semantic_guidance_scale: float = 1.78
     semantic_guidance_start: float = 0.1
     semantic_guidance_end: float = 1.0
@@ -52,8 +53,12 @@ class SamplingParameters:
             raise ValueError("semantic sampling steps cannot be negative")
         if self.solver not in {"euler", "heun"}:
             raise ValueError("sampling solver must be euler or heun")
-        if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
-            raise ValueError("timestep shift must be finite and positive")
+        for name, shift in (
+            ("semantic timestep shift", self.semantic_timestep_shift),
+            ("image timestep shift", self.image_timestep_shift),
+        ):
+            if not math.isfinite(shift) or shift <= 0:
+                raise ValueError(f"{name} must be finite and positive")
         if not math.isfinite(self.semantic_guidance_scale) or not math.isfinite(self.class_guidance_scale):
             raise ValueError("guidance scales must be finite")
         if not 0 <= self.semantic_guidance_start < self.semantic_guidance_end <= 1:
@@ -75,12 +80,18 @@ def sampling_output_name(sample_count: int, parameters: SamplingParameters) -> s
     parameters.validate()
     if sample_count < 1:
         raise ValueError("sample count must be positive")
+    shift_slug = (
+        f"-shift{_float_slug(parameters.image_timestep_shift)}"
+        if parameters.semantic_timestep_shift == parameters.image_timestep_shift
+        else f"-semantic-shift{_float_slug(parameters.semantic_timestep_shift)}"
+        f"-image-shift{_float_slug(parameters.image_timestep_shift)}"
+    )
     return (
         f"samples-{parameters.solver}-n{sample_count}"
         f"-semantic{parameters.semantic_steps}-image{parameters.image_steps}"
         f"-semantic-guidance{_float_slug(parameters.semantic_guidance_scale)}"
         f"-class-guidance{_float_slug(parameters.class_guidance_scale)}"
-        f"-shift{_float_slug(parameters.timestep_shift)}"
+        f"{shift_slug}"
         f"-semantic-window{_float_slug(parameters.semantic_guidance_start)}-{_float_slug(parameters.semantic_guidance_end)}"
         f"-class-window{_float_slug(parameters.class_guidance_start)}-{_float_slug(parameters.class_guidance_end)}"
     )
@@ -175,6 +186,28 @@ def _manifest_base(
 ) -> dict[str, Any]:
     counts = torch.bincount(labels, minlength=num_classes)
     ids_digest = hashlib.sha256(sample_ids.numpy().tobytes()).hexdigest()
+    sampling: dict[str, Any] = {
+        "solver": parameters.solver,
+        "semantic_steps": parameters.semantic_steps,
+        "image_steps": parameters.image_steps,
+        "sampling_steps": parameters.semantic_steps + parameters.image_steps,
+        "sampling_nfe": parameters.sampling_nfe,
+        "semantic_guidance_scale": parameters.semantic_guidance_scale,
+        "semantic_guidance_interval": [
+            parameters.semantic_guidance_start,
+            parameters.semantic_guidance_end,
+        ],
+        "class_guidance_scale": parameters.class_guidance_scale,
+        "class_guidance_interval": [
+            parameters.class_guidance_start,
+            parameters.class_guidance_end,
+        ],
+    }
+    if parameters.semantic_timestep_shift == parameters.image_timestep_shift:
+        sampling["timestep_shift"] = parameters.image_timestep_shift
+    else:
+        sampling["semantic_timestep_shift"] = parameters.semantic_timestep_shift
+        sampling["image_timestep_shift"] = parameters.image_timestep_shift
     return {
         "schema_version": SAMPLING_MANIFEST_SCHEMA_VERSION,
         "checkpoint_sha256": checkpoint_hash,
@@ -190,18 +223,7 @@ def _manifest_base(
         "class_counts": counts.tolist(),
         "image_shape": [image_size, image_size, 3],
         "image_dtype": "uint8",
-        "sampling": {
-            "solver": parameters.solver,
-            "semantic_steps": parameters.semantic_steps,
-            "image_steps": parameters.image_steps,
-            "sampling_steps": parameters.semantic_steps + parameters.image_steps,
-            "sampling_nfe": parameters.sampling_nfe,
-            "semantic_guidance_scale": parameters.semantic_guidance_scale,
-            "semantic_guidance_interval": [parameters.semantic_guidance_start, parameters.semantic_guidance_end],
-            "class_guidance_scale": parameters.class_guidance_scale,
-            "timestep_shift": parameters.timestep_shift,
-            "class_guidance_interval": [parameters.class_guidance_start, parameters.class_guidance_end],
-        },
+        "sampling": sampling,
     }
 
 
@@ -412,7 +434,8 @@ def sample_to_archive(
             f"image_steps={parameters.image_steps} nfe={parameters.sampling_nfe} "
             f"semantic_guidance={parameters.semantic_guidance_scale:g} "
             f"class_guidance={parameters.class_guidance_scale:g} "
-            f"timestep_shift={parameters.timestep_shift:g} "
+            f"semantic_timestep_shift={parameters.semantic_timestep_shift:g} "
+            f"image_timestep_shift={parameters.image_timestep_shift:g} "
             f"semantic_guidance_interval=[{parameters.semantic_guidance_start:g}, {parameters.semantic_guidance_end:g}] "
             f"class_guidance_interval=[{parameters.class_guidance_start:g}, {parameters.class_guidance_end:g}]"
         )

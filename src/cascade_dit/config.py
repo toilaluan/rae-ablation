@@ -10,6 +10,8 @@ from typing import Any
 CONFIG_SCHEMA_VERSION = 2
 
 IMAGE_SIZE = 256
+PIXEL_CHANNELS = 3
+PIXEL_SHAPE = (PIXEL_CHANNELS, IMAGE_SIZE, IMAGE_SIZE)
 IMAGE_LATENT_CHANNELS = 128
 IMAGE_LATENT_SIZE = 16
 IMAGE_LATENT_SHAPE = (IMAGE_LATENT_CHANNELS, IMAGE_LATENT_SIZE, IMAGE_LATENT_SIZE)
@@ -138,6 +140,7 @@ class SemanticTokenConfig:
 @dataclass
 class ModelConfig:
     architecture: str = "shared_cascade"
+    image_target: str = "mage_latents"
     image_latent_patch_size: int = 2
     semantic_patch_size: int = 1
     hidden_size: list[int] = field(default_factory=lambda: [1152, 2048])
@@ -160,6 +163,18 @@ class ModelConfig:
         return IMAGE_LATENT_SHAPE
 
     @property
+    def image_target_shape(self) -> tuple[int, int, int]:
+        return PIXEL_SHAPE if self.image_target == "pixels" else IMAGE_LATENT_SHAPE
+
+    @property
+    def image_target_channels(self) -> int:
+        return self.image_target_shape[0]
+
+    @property
+    def image_target_patch_size(self) -> int:
+        return IMAGE_SIZE // self.token_grid_size if self.image_target == "pixels" else self.image_latent_patch_size
+
+    @property
     def semantic_token_shape(self) -> tuple[int, int, int]:
         return SEMANTIC_TOKEN_SHAPE
 
@@ -168,6 +183,8 @@ class ModelConfig:
             raise ValueError(
                 "model.architecture must be latent, shared_cascade, or decoupled_cascade"
             )
+        if self.image_target not in {"mage_latents", "pixels"}:
+            raise ValueError("model.image_target must be mage_latents or pixels")
         paired = (self.hidden_size, self.depth, self.num_heads)
         if not all(len(values) == 2 for values in paired):
             raise ValueError(
@@ -226,9 +243,12 @@ class TrainConfig:
     grad_clip: float = 1.0
     ema_decay: float = 0.9995
     seed: int = 0
-    timestep_loc: float = 0.0
-    timestep_scale: float = 1.0
-    timestep_shift: float = 4.0
+    semantic_timestep_loc: float = 0.0
+    semantic_timestep_scale: float = 1.0
+    semantic_timestep_shift: float = 4.0
+    image_timestep_loc: float = 0.0
+    image_timestep_scale: float = 1.0
+    image_timestep_shift: float = 4.0
     velocity_denominator_floor: float = 0.05
     semantic_base_loss_weight: float = 1.0
     predicted_semantic_condition_probability: float = 0.25
@@ -242,7 +262,8 @@ class SamplingConfig:
     semantic_steps: int = 10
     image_steps: int = 40
     solver: str = "euler"
-    timestep_shift: float = 1.0
+    semantic_timestep_shift: float = 1.0
+    image_timestep_shift: float = 1.0
     semantic_guidance_scale: float = 1.78
     semantic_guidance_start: float = 0.1
     semantic_guidance_end: float = 1.0
@@ -330,12 +351,18 @@ class ExperimentConfig:
             raise ValueError("train.max_steps must be positive")
         if not 0 < self.train.ema_decay < 1:
             raise ValueError("train.ema_decay must be in (0,1)")
-        if not math.isfinite(self.train.timestep_loc):
-            raise ValueError("train.timestep_loc must be finite")
+        for name, value in (
+            ("train.semantic_timestep_loc", self.train.semantic_timestep_loc),
+            ("train.image_timestep_loc", self.train.image_timestep_loc),
+        ):
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
         _positive(
             "training flow settings",
-            self.train.timestep_scale,
-            self.train.timestep_shift,
+            self.train.semantic_timestep_scale,
+            self.train.semantic_timestep_shift,
+            self.train.image_timestep_scale,
+            self.train.image_timestep_shift,
             self.train.velocity_denominator_floor,
         )
         if self.train.semantic_base_loss_weight < 0:
@@ -373,8 +400,12 @@ class ExperimentConfig:
             raise ValueError("sampling.solver must be euler or heun")
         if values.num_samples % self.model.num_classes:
             raise ValueError("sampling.num_samples must be class balanced")
-        if not math.isfinite(values.timestep_shift) or values.timestep_shift <= 0:
-            raise ValueError("sampling.timestep_shift must be finite and positive")
+        for name, shift in (
+            ("sampling.semantic_timestep_shift", values.semantic_timestep_shift),
+            ("sampling.image_timestep_shift", values.image_timestep_shift),
+        ):
+            if not math.isfinite(shift) or shift <= 0:
+                raise ValueError(f"{name} must be finite and positive")
         for scale in (
             values.semantic_guidance_scale,
             values.class_guidance_scale,
@@ -402,6 +433,40 @@ def _require_current_schema(values: Any, source: str | Path) -> dict[str, Any]:
     return values
 
 
+def _migrate_timestep_fields(values: dict[str, Any], source: str | Path) -> dict[str, Any]:
+    """Translate schema-v2 shared timestep fields without retaining legacy state."""
+    migrated = deepcopy(values)
+    groups = {
+        "train": {
+            "timestep_loc": ("semantic_timestep_loc", "image_timestep_loc"),
+            "timestep_scale": ("semantic_timestep_scale", "image_timestep_scale"),
+            "timestep_shift": ("semantic_timestep_shift", "image_timestep_shift"),
+        },
+        "sampling": {
+            "timestep_shift": ("semantic_timestep_shift", "image_timestep_shift"),
+        },
+    }
+    for group_name, legacy_fields in groups.items():
+        group = migrated.get(group_name)
+        if group is None:
+            continue
+        if not isinstance(group, dict):
+            continue
+        for legacy, replacements in legacy_fields.items():
+            if legacy not in group:
+                continue
+            conflicts = [replacement for replacement in replacements if replacement in group]
+            if conflicts:
+                joined = ", ".join(f"{group_name}.{name}" for name in conflicts)
+                raise ValueError(
+                    f"{source} mixes legacy {group_name}.{legacy} with {joined}"
+                )
+            value = group.pop(legacy)
+            for replacement in replacements:
+                group[replacement] = value
+    return migrated
+
+
 def _structured_config(values: dict[str, Any]) -> ExperimentConfig:
     from omegaconf import OmegaConf
 
@@ -427,11 +492,14 @@ def load_config(
     values: dict[str, Any] = {"schema_version": CONFIG_SCHEMA_VERSION}
     if path is not None:
         loaded = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
-        values = _require_current_schema(loaded, path)
+        values = _migrate_timestep_fields(
+            _require_current_schema(loaded, path), path
+        )
     if overrides:
         override_values = OmegaConf.to_container(OmegaConf.from_dotlist(overrides), resolve=True)
         if not isinstance(override_values, dict):
             raise ValueError("configuration overrides must form an object")
+        override_values = _migrate_timestep_fields(override_values, "configuration overrides")
         values = OmegaConf.to_container(OmegaConf.merge(values, override_values), resolve=True)
         assert isinstance(values, dict)
     return _structured_config(values)
@@ -439,4 +507,6 @@ def load_config(
 
 def load_checkpoint_config(path: str | Path) -> ExperimentConfig:
     values = json.loads(Path(path).read_text())
-    return _structured_config(deepcopy(_require_current_schema(values, path)))
+    return _structured_config(
+        _migrate_timestep_fields(_require_current_schema(values, path), path)
+    )

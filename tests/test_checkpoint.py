@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import torch
 from torch import nn
 
@@ -75,6 +77,21 @@ def test_checkpoint_restores_architecture_provenance_and_every_rng_stream(tmp_pa
         representation_provenance=representations,
         cache_provenance=caches,
     )
+    saved_config = json.loads((checkpoint / "config.json").read_text())
+    saved_config["model"].pop("image_target")
+    train_values = saved_config["train"]
+    train_values["timestep_loc"] = train_values.pop("semantic_timestep_loc")
+    train_values.pop("image_timestep_loc")
+    train_values["timestep_scale"] = train_values.pop("semantic_timestep_scale")
+    train_values.pop("image_timestep_scale")
+    train_values["timestep_shift"] = train_values.pop("semantic_timestep_shift")
+    train_values.pop("image_timestep_shift")
+    sampling_values = saved_config["sampling"]
+    sampling_values["timestep_shift"] = sampling_values.pop(
+        "semantic_timestep_shift"
+    )
+    sampling_values.pop("image_timestep_shift")
+    (checkpoint / "config.json").write_text(json.dumps(saved_config))
     restored = manager.load(
         checkpoint,
         model,
@@ -85,3 +102,61 @@ def test_checkpoint_restores_architecture_provenance_and_every_rng_stream(tmp_pa
     )
     assert restored.architecture == "latent"
     assert set(restored.rng_streams) == set(streams.state_dict())
+
+
+def test_pixel_target_checkpoint_roundtrip_uses_pixel_provenance(tmp_path) -> None:
+    config = ExperimentConfig(
+        model=ModelConfig(
+            architecture="latent",
+            image_target="pixels",
+            hidden_size=(32, 48),
+            depth=(1, 1),
+            num_heads=(4, 3),
+            base_model_depth=1,
+            num_classes=2,
+        )
+    )
+    model = build_model(config.model)
+    ema = EMA(model)
+    streams = RNGStreams.create(9)
+    plan = create_validation_plan(4, 2, 2, 13)
+    plan_path = tmp_path / "pixel-plan.pt"
+    plan.save(plan_path)
+    representations = {
+        "pixels": {
+            "kind": "pixels",
+            "shape": [3, 256, 256],
+            "dtype": "float32",
+            "range": [-1.0, 1.0],
+            "data_fingerprint": "data",
+            "preprocessing": "uint8-to-[-1,1]",
+        }
+    }
+    caches = {"image_latents": "not-used", "semantic_tokens": "not-used"}
+    manager = CheckpointManager(tmp_path / "pixel-checkpoints")
+    checkpoint = manager.save(
+        completed_epoch=1,
+        global_step=2,
+        model=model,
+        ema=ema,
+        optimizer_state={},
+        rng_streams=streams.state_dict(),
+        architecture="latent",
+        data_fingerprint="data",
+        validation_plan_hash=plan.plan_hash,
+        validation_plan_path=plan_path,
+        last_completed_validation_epoch=None,
+        wandb_run_id=None,
+        resolved_config=config.as_dict(),
+        representation_provenance=representations,
+        cache_provenance=caches,
+    )
+    restored = manager.load(
+        checkpoint,
+        model,
+        ema,
+        expected_architecture="latent",
+        expected_representation_provenance=representations,
+        expected_cache_provenance=caches,
+    )
+    assert restored.representation_provenance == representations

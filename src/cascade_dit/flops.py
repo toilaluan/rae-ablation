@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from .config import IMAGE_LATENT_CHANNELS, SEMANTIC_CHANNELS, ExperimentConfig
+from .config import SEMANTIC_CHANNELS, ExperimentConfig
 
 
 def _attention_flops(tokens: int, width: int, heads: int) -> int:
@@ -32,10 +32,10 @@ def ddt_forward_flops(
         input_width = SEMANTIC_CHANNELS
         output_width = SEMANTIC_CHANNELS
     else:
-        input_width = model.image_latent_patch_size**2 * IMAGE_LATENT_CHANNELS
+        input_width = model.image_target_patch_size**2 * model.image_target_channels
         if model.architecture != "latent":
             input_width += SEMANTIC_CHANNELS
-        output_width = model.image_latent_patch_size**2 * IMAGE_LATENT_CHANNELS
+        output_width = model.image_target_patch_size**2 * model.image_target_channels
     total = 2 * spatial * input_width * (encoder_width + decoder_width)
     total += encoder_depth * (
         _attention_flops(encoder_tokens, encoder_width, encoder_heads)

@@ -7,7 +7,12 @@ import torch
 
 from cascade_dit.checkpoint import EMA, CheckpointManager
 from cascade_dit.config import ExperimentConfig, load_config
-from cascade_dit.data import data_fingerprint, load_imagenet, preprocessing_metadata
+from cascade_dit.data import (
+    data_fingerprint,
+    load_imagenet,
+    pixel_target_provenance,
+    preprocessing_metadata,
+)
 from cascade_dit.distributed import initialize_distributed
 from cascade_dit.image_latent_cache import ImageLatentCache
 from cascade_dit.mage import (
@@ -44,7 +49,9 @@ torch._dynamo.config.cache_size_limit = 1000
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train Cascade DDT on native Mage latents")
+    parser = argparse.ArgumentParser(
+        description="Train Cascade DDT on native Mage latents or direct pixels"
+    )
     parser.add_argument("--config", type=Path, default=Path("configs/cascade-shared.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
@@ -62,7 +69,12 @@ def _sampling_parameters(config: ExperimentConfig) -> SamplingParameters:
         ),
         image_steps=values.image_steps,
         solver=values.solver,
-        timestep_shift=values.timestep_shift,
+        semantic_timestep_shift=(
+            values.image_timestep_shift
+            if config.model.architecture == "latent"
+            else values.semantic_timestep_shift
+        ),
+        image_timestep_shift=values.image_timestep_shift,
         semantic_guidance_scale=values.semantic_guidance_scale,
         semantic_guidance_start=values.semantic_guidance_start,
         semantic_guidance_end=values.semantic_guidance_end,
@@ -100,13 +112,17 @@ def main() -> None:
         config.validation.plan_path = str(args.output / "validation-plan.pt")
     config.validate()
     rank, world_size, device = initialize_distributed()
-    mage_path = hf_hub_download(
-        repo_id=config.image_latents.repository,
-        filename=config.image_latents.weight_file,
-        revision=config.image_latents.revision,
-    )
-    mage_digest = file_sha256(mage_path)
-    mage_provenance = mage_vae_provenance(config.image_latents, mage_digest)
+    mage_target = config.model.image_target == "mage_latents"
+    mage_digest: str | None = None
+    mage_provenance: dict[str, object] | None = None
+    if mage_target:
+        mage_path = hf_hub_download(
+            repo_id=config.image_latents.repository,
+            filename=config.image_latents.weight_file,
+            revision=config.image_latents.revision,
+        )
+        mage_digest = file_sha256(mage_path)
+        mage_provenance = mage_vae_provenance(config.image_latents, mage_digest)
     cascade = config.model.architecture != "latent"
     statistics = None
     statistics_digest = "not-used"
@@ -133,7 +149,8 @@ def main() -> None:
             "shape": list(config.semantic_tokens.shape),
             "preprocessing": "256px-view-resized-to-128px-bicubic-imagenet-normalized",
         }
-    needs_pixels = not config.image_latents.cache.enabled or (
+    use_image_cache = mage_target and config.image_latents.cache.enabled
+    needs_pixels = not use_image_cache or (
         cascade and not config.semantic_tokens.cache.enabled
     )
     dataset = load_imagenet(
@@ -143,7 +160,7 @@ def main() -> None:
     )
     image_cache = (
         ImageLatentCache(config, len(dataset), mage_digest)
-        if config.image_latents.cache.enabled
+        if use_image_cache and mage_digest is not None
         else None
     )
     semantic_cache = (
@@ -152,12 +169,15 @@ def main() -> None:
         else None
     )
     if needs_pixels != training_requires_pixels(
-        config.model.architecture, image_cache, semantic_cache
+        config.model.architecture,
+        image_cache,
+        semantic_cache,
+        config.model.image_target,
     ):
         raise RuntimeError("dataset pixel-loading policy is inconsistent with caches")
     mage_codec = (
         None
-        if image_cache is not None
+        if not mage_target or image_cache is not None
         else load_mage_vae_codec(config.image_latents, device)
     )
     semantic_encoder = (
@@ -174,11 +194,21 @@ def main() -> None:
         torch.manual_seed(streams.initialization.initial_seed())
         model = build_model(config.model).to(device)
     fingerprint = data_fingerprint(config.data, config.image_latents.image_size)
-    representation_provenance: dict[str, object] = {"mage_vae": mage_provenance}
+    representation_provenance: dict[str, object] = (
+        {"mage_vae": mage_provenance}
+        if mage_provenance is not None
+        else {"pixels": pixel_target_provenance(config.data, config.image_latents.image_size)}
+    )
     if semantic_provenance is not None:
         representation_provenance["semantic_encoder"] = semantic_provenance
     cache_provenance = {
-        "image_latents": image_cache.fingerprint if image_cache is not None else "online",
+        "image_latents": (
+            "not-used"
+            if not mage_target
+            else image_cache.fingerprint
+            if image_cache is not None
+            else "online"
+        ),
         "semantic_tokens": (
             "not-used"
             if not cascade
@@ -249,6 +279,7 @@ def main() -> None:
     )
     logger.event(
         f"training initialized: architecture={config.model.architecture}, "
+        f"image_target={config.model.image_target}, "
         f"image_latents={cache_provenance['image_latents']}, "
         f"semantic_tokens={cache_provenance['semantic_tokens']}, "
         f"parameters={logged_config['model_parameters']['total']:,}"
@@ -271,6 +302,14 @@ def main() -> None:
         preview = output / "preview.png"
         if preview.is_file():
             logger.log_grid(str(preview), f"EMA epoch {epoch}", state.global_step)
+        semantic_pca = output / "semantic-pca-preview.png"
+        if semantic_pca.is_file():
+            logger.log_grid(
+                str(semantic_pca),
+                f"EMA semantic PCA epoch {epoch}",
+                state.global_step,
+                key="validation/semantic_pca_preview",
+            )
         return metrics
 
     try:

@@ -11,6 +11,7 @@ data:
 
 model:
   architecture: latent
+  image_target: mage_latents
   image_latent_patch_size: 2
   semantic_patch_size: 1
   hidden_size: [1152, 2048]
@@ -81,9 +82,12 @@ train:
   grad_clip: 1.0
   ema_decay: 0.9995
   seed: 0
-  timestep_loc: 0.0
-  timestep_scale: 1.0
-  timestep_shift: 4.0
+  semantic_timestep_loc: 0.0
+  semantic_timestep_scale: 1.0
+  semantic_timestep_shift: 4.0
+  image_timestep_loc: 0.0
+  image_timestep_scale: 1.0
+  image_timestep_shift: 4.0
   velocity_denominator_floor: 0.05
   semantic_base_loss_weight: 1.0
   predicted_semantic_condition_probability: 0.25
@@ -101,7 +105,8 @@ sampling:
   semantic_steps: 0
   image_steps: 40
   solver: euler
-  timestep_shift: 1.0
+  semantic_timestep_shift: 1.0
+  image_timestep_shift: 1.0
   semantic_guidance_scale: 1.78
   semantic_guidance_start: 0.1
   semantic_guidance_end: 1.0

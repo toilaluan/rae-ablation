@@ -56,6 +56,19 @@ def data_fingerprint(config: DataConfig, image_size: int = IMAGE_SIZE) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def pixel_target_provenance(
+    config: DataConfig, image_size: int = IMAGE_SIZE
+) -> dict[str, Any]:
+    return {
+        "kind": "pixels",
+        "shape": [3, image_size, image_size],
+        "dtype": "float32",
+        "range": [-1.0, 1.0],
+        "data_fingerprint": data_fingerprint(config, image_size),
+        "preprocessing": "dataset_uint8_or_[0,1]_to_[-1,1]",
+    }
+
+
 class ImageNetDataset(Dataset[tuple[Tensor | None, int, int]]):
     """Small tensor adapter over the pinned Hugging Face ImageNet-256 dataset."""
 

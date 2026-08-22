@@ -66,11 +66,16 @@ class RunLogger:
         self.log(metrics, step=step)
         if not self.is_main_process:
             return
+        image_metric = (
+            "train/image_target_velocity_loss"
+            if "train/image_target_velocity_loss" in metrics
+            else "train/image_latent_velocity_loss"
+        )
         self.event(
             "train: "
             f"step={step} epoch={self._metric(metrics, 'train/epoch', '.3f')} "
             f"loss={self._metric(metrics, 'train/loss', '.6f')} "
-            f"image={self._metric(metrics, 'train/image_latent_velocity_loss', '.6f')} "
+            f"image={self._metric(metrics, image_metric, '.6f')} "
             f"semantic_full={self._metric(metrics, 'train/semantic_full_velocity_loss', '.6f')} "
             f"semantic_base={self._metric(metrics, 'train/semantic_base_velocity_loss', '.6f')} "
             f"predicted_condition={self._metric(metrics, 'train/predicted_semantic_condition_fraction', '.3f')} "

@@ -49,6 +49,7 @@ def test_image_cache_fingerprint_ignores_ddt_model_and_rejects_corruption(tmp_pa
     config.model.hidden_size = [32, 48]
     config.model.depth = [2, 1]
     config.model.num_heads = [4, 3]
+    config.model.image_target = "pixels"
     second = image_latent_cache_spec(config, 2, "mage")
     assert image_latent_cache_fingerprint(first) == image_latent_cache_fingerprint(second)
     path = image_latent_cache_path(config, first)

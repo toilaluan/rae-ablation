@@ -13,6 +13,7 @@ from torch.utils.data._utils.collate import default_collate
 
 from .checkpoint import EMA, CheckpointManager, should_checkpoint
 from .config import ExperimentConfig
+from .data import prepare_pixels
 from .image_latent_cache import ImageLatentCache
 from .mage import MageVAECodec
 from .model.tokens import classifier_free_labels
@@ -164,7 +165,10 @@ def training_requires_pixels(
     architecture: str,
     image_latent_cache: ImageLatentCache | None,
     semantic_token_cache: SemanticTokenCache | None,
+    image_target: str = "mage_latents",
 ) -> bool:
+    if image_target == "pixels":
+        return True
     return image_latent_cache is None or (
         architecture != "latent" and semantic_token_cache is None
     )
@@ -218,9 +222,14 @@ def extract_representations(
     architecture: str,
     mage_codec: MageVAECodec | None,
     semantic_encoder: DINOSemanticEncoder | None,
+    image_target: str = "mage_latents",
 ) -> tuple[Tensor, Tensor | None]:
     pixels, cached_image_latents, cached_semantic_tokens, _labels, _indices = batch
-    if cached_image_latents is None:
+    if image_target == "pixels":
+        if pixels is None:
+            raise RuntimeError("direct-pixel training requires dataset pixels")
+        image_latents = prepare_pixels(pixels, pixels.device).mul(2).sub(1)
+    elif cached_image_latents is None:
         if pixels is None or mage_codec is None:
             raise RuntimeError("online Mage-VAE image latent extraction is unavailable")
         image_latents = mage_codec.encode_pixels(pixels)
@@ -251,9 +260,9 @@ def compute_training_losses(
         batch_size,
         streams.image_timesteps,
         device,
-        loc=config.train.timestep_loc,
-        scale=config.train.timestep_scale,
-        shift=config.train.timestep_shift,
+        loc=config.train.image_timestep_loc,
+        scale=config.train.image_timestep_scale,
+        shift=config.train.image_timestep_shift,
     )
     image_noise = torch.randn(
         image_latents.shape,
@@ -281,9 +290,9 @@ def compute_training_losses(
         batch_size,
         streams.semantic_timesteps,
         device,
-        loc=config.train.timestep_loc,
-        scale=config.train.timestep_scale,
-        shift=config.train.timestep_shift,
+        loc=config.train.semantic_timestep_loc,
+        scale=config.train.semantic_timestep_scale,
+        shift=config.train.semantic_timestep_shift,
     )
     semantic_noise = torch.randn(
         semantic_tokens.shape,
@@ -380,6 +389,7 @@ def train(
                 config.model.architecture,
                 mage_codec,
                 semantic_encoder,
+                config.model.image_target,
             )
             losses = compute_training_losses(
                 execution_model,
@@ -413,20 +423,25 @@ def train(
                 and batch_index + 1 == len(loader)
             )
             if logger.should_log_training(state.global_step, force=final_step):
+                training_metrics = {
+                    "train/loss": losses.total.item(),
+                    "train/image_target_velocity_loss": losses.image_latent_velocity.item(),
+                    "train/semantic_full_velocity_loss": losses.semantic_full_velocity.item(),
+                    "train/semantic_base_velocity_loss": losses.semantic_base_velocity.item(),
+                    "train/predicted_semantic_condition_fraction": losses.predicted_semantic_condition_fraction.item(),
+                    "train/lr": learning_rate,
+                    "train/gradient_norm": float(gradient_norm),
+                    "train/epoch": progress,
+                    "train/global_step": state.global_step,
+                    "progress/images_seen": state.global_step
+                    * config.train.global_batch_size,
+                }
+                if config.model.image_target == "mage_latents":
+                    training_metrics["train/image_latent_velocity_loss"] = (
+                        losses.image_latent_velocity.item()
+                    )
                 logger.log_training(
-                    {
-                        "train/loss": losses.total.item(),
-                        "train/image_latent_velocity_loss": losses.image_latent_velocity.item(),
-                        "train/semantic_full_velocity_loss": losses.semantic_full_velocity.item(),
-                        "train/semantic_base_velocity_loss": losses.semantic_base_velocity.item(),
-                        "train/predicted_semantic_condition_fraction": losses.predicted_semantic_condition_fraction.item(),
-                        "train/lr": learning_rate,
-                        "train/gradient_norm": float(gradient_norm),
-                        "train/epoch": progress,
-                        "train/global_step": state.global_step,
-                        "progress/images_seen": state.global_step
-                        * config.train.global_batch_size,
-                    },
+                    training_metrics,
                     step=state.global_step,
                     force=final_step,
                 )

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cascade-dit"
 version = "0.1.0"
-description = "Native Mage-latent and DINO-semantic cascade diffusion transformers"
+description = "Pixel/Mage-target and DINO-semantic cascade diffusion transformers"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
