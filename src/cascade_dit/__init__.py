@@ -1,16 +1,16 @@
-"""CascadeDiT native Mage-latent and DINO-semantic diffusion."""
+"""Cascade DDT native Mage-latent and DINO-semantic diffusion."""
 
 from .config import ExperimentConfig, ModelConfig, load_config
 from .image_latent_cache import ImageLatentCache
 from .mage import MageVAECodec
 from .model import (
     CascadePredictions,
-    ConditionalLatentDiT,
-    DecoupledCascadeDiT,
-    LatentDiT,
-    SemanticDiT,
+    ConditionalLatentDDT,
+    DecoupledCascadeDDT,
+    LatentDDT,
+    SemanticDDT,
     SemanticPredictions,
-    SharedCascadeDiT,
+    SharedCascadeDDT,
     build_model,
 )
 from .semantic_token_cache import SemanticTokenCache
@@ -18,18 +18,18 @@ from .vision import DINOSemanticEncoder
 
 __all__ = [
     "CascadePredictions",
-    "ConditionalLatentDiT",
+    "ConditionalLatentDDT",
     "DINOSemanticEncoder",
-    "DecoupledCascadeDiT",
+    "DecoupledCascadeDDT",
     "ExperimentConfig",
     "ImageLatentCache",
-    "LatentDiT",
+    "LatentDDT",
     "MageVAECodec",
     "ModelConfig",
-    "SemanticDiT",
+    "SemanticDDT",
     "SemanticPredictions",
     "SemanticTokenCache",
-    "SharedCascadeDiT",
+    "SharedCascadeDDT",
     "build_model",
     "load_config",
 ]

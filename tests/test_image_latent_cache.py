@@ -41,11 +41,14 @@ def test_image_latent_cache_roundtrip_resume_and_exact_size(tmp_path) -> None:
     assert json.loads((path / "manifest.json").read_text())["complete"] is True
 
 
-def test_image_cache_fingerprint_ignores_architecture_and_rejects_corruption(tmp_path) -> None:
+def test_image_cache_fingerprint_ignores_ddt_model_and_rejects_corruption(tmp_path) -> None:
     config = ExperimentConfig()
     config.image_latents.cache.directory = str(tmp_path)
     first = image_latent_cache_spec(config, 2, "mage")
     config.model.architecture = "latent"
+    config.model.hidden_size = [32, 48]
+    config.model.depth = [2, 1]
+    config.model.num_heads = [4, 3]
     second = image_latent_cache_spec(config, 2, "mage")
     assert image_latent_cache_fingerprint(first) == image_latent_cache_fingerprint(second)
     path = image_latent_cache_path(config, first)

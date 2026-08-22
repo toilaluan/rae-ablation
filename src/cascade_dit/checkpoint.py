@@ -13,8 +13,8 @@ from torch import Tensor, nn
 
 from .model.compile import clean_state_dict
 
-CHECKPOINT_SCHEMA_VERSION = 1
-TRAINING_STATE_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
+TRAINING_STATE_SCHEMA_VERSION = 2
 
 
 def _contiguous(state: dict[str, object]) -> dict[str, Tensor]:
@@ -278,7 +278,7 @@ class CheckpointManager:
             path = self.directory / path
         metadata_path = path / "metadata.json"
         if not metadata_path.is_file():
-            raise ValueError("checkpoint predates CascadeDiT; old checkpoints are unsupported")
+            raise ValueError("checkpoint predates Cascade DDT; old checkpoints are unsupported")
         metadata = json.loads(metadata_path.read_text())
         if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
             raise ValueError("checkpoint schema is incompatible; migration is unsupported")

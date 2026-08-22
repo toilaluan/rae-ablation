@@ -1,6 +1,6 @@
-# CascadeDiT
+# Cascade DDT
 
-CascadeDiT trains class-conditional diffusion transformers for ImageNet-256 using two
+Cascade DDT trains class-conditional diffusion transformers for ImageNet-256 using two
 aligned native representations:
 
 - image latents `T=[B,128,16,16]` are deterministic posterior means from the native
@@ -9,18 +9,27 @@ aligned native representations:
   patch tokens extracted from a 128px view.
 
 The image-latent patch size is 2 and the semantic patch size is 1, so both routes use
-the same 8x8 transformer-token grid. Mage latents are not patch-packed and receive no
-Flux BN transform or dataset normalization.
+the same 8x8 transformer-token grid. For conditional image generation, each flattened
+Mage patch `[128*2*2]` is concatenated with its aligned DINO patch `[768]`; the same
+1280-wide fused tokens are independently projected into the DDT encoder and decoder
+widths. Mage latents receive no Flux BN transform or dataset normalization.
+
+The transformer follows the encoder-heavy/decoder-light design of the
+[RAEv2 DDT](https://github.com/nanovisionx/RAEv2/blob/main/src/stage2/models/DDT.py),
+reimplemented with local primitives. Presets use encoder/decoder widths `[1152,2048]`,
+depths `[28,2]`, heads `[16,16]`, RMSNorm, QK-normalized attention, 2D RoPE, SwiGLU,
+and timestep/class attention tokens. Decoder AdaLN and prediction heads are
+zero-initialized.
 
 ## Architectures
 
 Select exactly one architecture with `model.architecture`:
 
-- `latent` builds `LatentDiT`, a pure image-latent baseline with no semantic modules;
-- `shared_cascade` builds `SharedCascadeDiT`, with route-specific projections and heads
-  around one shared transformer core;
-- `decoupled_cascade` builds `DecoupledCascadeDiT`, containing independent `SemanticDiT`
-  and `ConditionalLatentDiT` denoisers with no shared parameters.
+- `latent` builds `LatentDDT`, a pure image-latent baseline with no semantic modules;
+- `shared_cascade` builds `SharedCascadeDDT`, with route-specific projections and heads
+  around one shared DDT core;
+- `decoupled_cascade` builds `DecoupledCascadeDDT`, containing independent `SemanticDDT`
+  and `ConditionalLatentDDT` denoisers with no shared parameters.
 
 Cascade training evaluates both Gaussian-flow routes every step. Semantic and image
 timesteps/noise are independently sampled. A seeded 25% mask selects detached online
@@ -31,8 +40,9 @@ single backward pass optimizes:
 L_image_latent + L_semantic_full + semantic_base_loss_weight * L_semantic_base
 ```
 
-Every conditional image block receives the 64 semantic patches through zero-initialized
-patchwise AdaLN shift, scale, and gates. Timestep and class tokens are never modulated.
+The semantic condition selected for each example is concatenated into both image-route
+DDT patch streams. The semantic base prediction is read from encoder block 8 and the
+full prediction is read from the decoder, preserving internal semantic guidance.
 
 ## Pinned representations
 
@@ -69,9 +79,11 @@ torchrun --standalone --nproc-per-node=8 scripts/cache_semantic_tokens.py \
 The full ImageNet training image-latent payload is approximately 78.2 GiB. Its
 fingerprint contains only dataset preprocessing, Mage identity, deterministic-posterior
 policy, image size, latent schema, shape, and dtype, so one cache works with all three
-architectures. All online/cache combinations are supported. With both caches enabled,
-cascade training reads no RGB and instantiates neither frozen encoder; a cached latent
-baseline uses no RGB, DINO, or training-time VAE.
+architectures and is unchanged by the DDT migration. The presets enable the image
+cache, plus the semantic cache for cascade models. Training only opens completed cache
+manifests; a missing or incompatible cache fails instead of rebuilding it. With both
+caches enabled, cascade training reads no RGB and instantiates neither frozen encoder;
+a cached latent baseline uses no RGB, DINO, or training-time VAE.
 
 ## Train and sample
 
@@ -88,8 +100,6 @@ Example:
 ```bash
 torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --config configs/cascade-shared.yaml \
-  --override image_latents.cache.enabled=true \
-  --override semantic_tokens.cache.enabled=true \
   --output runs/cascade-shared-seed0
 
 torchrun --standalone --nproc-per-node=8 scripts/sample.py \
@@ -104,6 +114,10 @@ fresh independent image-latent noise, generates image latents conditioned on sem
 tokens with class guidance, and decodes through Mage-VAE. The latent baseline skips the
 semantic route while retaining the identical image-noise seed stream for paired runs.
 Evaluation defaults to ImageNet-256 references.
+
+DDT uses configuration and checkpoint schema version 2. DiT model, EMA, and optimizer
+checkpoints cannot be resumed; start a fresh DDT output directory while reusing the
+existing representation caches.
 
 ## Verification
 

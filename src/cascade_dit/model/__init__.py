@@ -1,23 +1,23 @@
-from .dit import (
+from .ddt import (
     CascadePredictions,
-    ConditionalLatentDiT,
-    DecoupledCascadeDiT,
-    LatentDiT,
-    SemanticDiT,
+    ConditionalLatentDDT,
+    DecoupledCascadeDDT,
+    LatentDDT,
+    SemanticDDT,
     SemanticPredictions,
-    SharedCascadeDiT,
+    SharedCascadeDDT,
     build_model,
 )
 from .tokens import classifier_free_labels
 
 __all__ = [
     "CascadePredictions",
-    "ConditionalLatentDiT",
-    "DecoupledCascadeDiT",
-    "LatentDiT",
-    "SemanticDiT",
+    "ConditionalLatentDDT",
+    "DecoupledCascadeDDT",
+    "LatentDDT",
+    "SemanticDDT",
     "SemanticPredictions",
-    "SharedCascadeDiT",
+    "SharedCascadeDDT",
     "build_model",
     "classifier_free_labels",
 ]

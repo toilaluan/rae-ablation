@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 1
+CONFIG_SCHEMA_VERSION = 2
 
 IMAGE_SIZE = 256
 IMAGE_LATENT_CHANNELS = 128
@@ -140,11 +140,11 @@ class ModelConfig:
     architecture: str = "shared_cascade"
     image_latent_patch_size: int = 2
     semantic_patch_size: int = 1
-    hidden_size: int = 768
-    depth: int = 12
-    num_heads: int = 12
+    hidden_size: list[int] = field(default_factory=lambda: [1152, 2048])
+    depth: list[int] = field(default_factory=lambda: [28, 2])
+    num_heads: list[int] = field(default_factory=lambda: [16, 16])
     mlp_ratio: float = 4.0
-    base_model_depth: int = 4
+    base_model_depth: int = 8
     num_classes: int = 1000
     class_dropout_probability: float = 0.1
     num_timestep_tokens: int = 4
@@ -168,13 +168,19 @@ class ModelConfig:
             raise ValueError(
                 "model.architecture must be latent, shared_cascade, or decoupled_cascade"
             )
+        paired = (self.hidden_size, self.depth, self.num_heads)
+        if not all(len(values) == 2 for values in paired):
+            raise ValueError(
+                "model.hidden_size, model.depth, and model.num_heads must be "
+                "encoder/decoder pairs"
+            )
         _positive(
             "model dimensions",
             self.image_latent_patch_size,
             self.semantic_patch_size,
-            self.hidden_size,
-            self.depth,
-            self.num_heads,
+            *self.hidden_size,
+            *self.depth,
+            *self.num_heads,
             self.mlp_ratio,
             self.base_model_depth,
             self.num_classes,
@@ -185,12 +191,19 @@ class ModelConfig:
             raise ValueError(
                 "model patches must align native image latents and semantic tokens on 8x8"
             )
-        if self.hidden_size % self.num_heads:
-            raise ValueError("model.hidden_size must be divisible by model.num_heads")
-        if (self.hidden_size // self.num_heads) % 4:
-            raise ValueError("model attention head size must be divisible by four")
-        if self.base_model_depth > self.depth:
-            raise ValueError("model.base_model_depth must be within model.depth")
+        for route, width, heads in zip(
+            ("encoder", "decoder"), self.hidden_size, self.num_heads, strict=True
+        ):
+            if width % heads:
+                raise ValueError(
+                    f"model {route} hidden size must be divisible by its head count"
+                )
+            if (width // heads) % 4:
+                raise ValueError(
+                    f"model {route} attention head size must be divisible by four"
+                )
+        if self.base_model_depth > self.depth[0]:
+            raise ValueError("model.base_model_depth must be within encoder depth")
         if not 0 <= self.class_dropout_probability < 1:
             raise ValueError("model.class_dropout_probability must be in [0,1)")
 

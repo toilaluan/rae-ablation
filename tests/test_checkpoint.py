@@ -33,9 +33,9 @@ def test_checkpoint_restores_architecture_provenance_and_every_rng_stream(tmp_pa
     config = ExperimentConfig(
         model=ModelConfig(
             architecture="latent",
-            hidden_size=64,
-            depth=1,
-            num_heads=4,
+            hidden_size=(32, 48),
+            depth=(1, 1),
+            num_heads=(4, 3),
             base_model_depth=1,
             num_classes=2,
         )

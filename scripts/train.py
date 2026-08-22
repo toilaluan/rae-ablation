@@ -44,7 +44,7 @@ torch._dynamo.config.cache_size_limit = 1000
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train CascadeDiT on native Mage latents")
+    parser = argparse.ArgumentParser(description="Train Cascade DDT on native Mage latents")
     parser.add_argument("--config", type=Path, default=Path("configs/cascade-shared.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--output", type=Path)
@@ -82,11 +82,11 @@ def _parameter_counts(model: torch.nn.Module) -> dict[str, int]:
             if parameter.requires_grad
         ),
     }
-    semantic = getattr(model, "semantic_dit", None)
-    image = getattr(model, "image_latent_dit", None)
+    semantic = getattr(model, "semantic_ddt", None)
+    image = getattr(model, "image_latent_ddt", None)
     if semantic is not None and image is not None:
-        counts["semantic_dit"] = sum(p.numel() for p in semantic.parameters())
-        counts["conditional_latent_dit"] = sum(p.numel() for p in image.parameters())
+        counts["semantic_ddt"] = sum(p.numel() for p in semantic.parameters())
+        counts["conditional_latent_ddt"] = sum(p.numel() for p in image.parameters())
     return counts
 
 

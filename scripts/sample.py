@@ -26,7 +26,7 @@ from cascade_dit.validation import noise_for_samples
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Sample a CascadeDiT checkpoint")
+    parser = argparse.ArgumentParser(description="Sample a Cascade DDT checkpoint")
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--num-samples", type=int)
     parser.add_argument("--batch-size", type=int)

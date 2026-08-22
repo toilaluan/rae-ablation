@@ -1,4 +1,4 @@
-schema_version: 1
+schema_version: 2
 
 data:
   repository: benjamin-paine/imagenet-1k-256x256
@@ -13,11 +13,11 @@ model:
   architecture: latent
   image_latent_patch_size: 2
   semantic_patch_size: 1
-  hidden_size: 768
-  depth: 12
-  num_heads: 12
+  hidden_size: [1152, 2048]
+  depth: [28, 2]
+  num_heads: [16, 16]
   mlp_ratio: 4.0
-  base_model_depth: 4
+  base_model_depth: 8
   num_classes: 1000
   class_dropout_probability: 0.1
   num_timestep_tokens: 4
@@ -39,7 +39,7 @@ image_latents:
     fullgraph: true
     dynamic: false
   cache:
-    enabled: false
+    enabled: true
     directory: data/image-latents
     batch_size: 128
     log_interval: 10
