@@ -21,12 +21,17 @@ def test_checked_in_nested_config_and_baseline_override() -> None:
     assert (config.model.encoder.width, config.model.encoder.depth) == (1152, 12)
     assert (config.model.decoder.width, config.model.decoder.depth) == (2048, 2)
     assert config.curriculum.mixing.pure_current_probability == pytest.approx(0.85)
+    assert config.optimizer.scheduler.kind == "cosine"
     baseline = load_config(
         "configs/experiment.yaml",
         ["experiment.mode=pixel_baseline", "model.encoder.depth=6"],
     )
     assert baseline.experiment.mode == "pixel_baseline"
     assert baseline.model.encoder.depth == 6
+    constant = load_config(
+        "configs/experiment.yaml", ["optimizer.scheduler.kind=constant"]
+    )
+    assert constant.optimizer.scheduler.kind == "constant"
 
 
 def test_dynamic_stage_list_controls_R_width_and_epochs() -> None:
@@ -77,4 +82,9 @@ def test_stage_timestep_shifts_and_evaluation_sample_counts_are_validated() -> N
 
     config.validation.periodic_samples = 51_000
     with pytest.raises(ValueError, match="cannot exceed"):
+        config.validate()
+
+    config = ExperimentConfig()
+    config.optimizer.scheduler.kind = "linear"
+    with pytest.raises(ValueError, match="constant or cosine"):
         config.validate()

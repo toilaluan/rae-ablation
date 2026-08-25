@@ -473,8 +473,10 @@ class ExperimentConfig:
 
     def _validate_optimizer(self) -> None:
         values = self.optimizer
-        if values.kind != "adamw" or values.scheduler.kind != "cosine":
-            raise ValueError("optimizer must be AdamW with one global cosine schedule")
+        if values.kind != "adamw":
+            raise ValueError("optimizer.kind must be adamw")
+        if values.scheduler.kind not in {"constant", "cosine"}:
+            raise ValueError("optimizer.scheduler.kind must be constant or cosine")
         if len(values.adamw.betas) != 2 or not all(
             0 <= beta < 1 for beta in values.adamw.betas
         ):

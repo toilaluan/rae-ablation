@@ -412,6 +412,7 @@ class ExperimentRunner:
             scheduler = self.config.optimizer.scheduler
             self.scheduler = build_training_scheduler(
                 self.optimizer,
+                kind=scheduler.kind,
                 steps_per_epoch=steps_per_epoch,
                 total_epochs=self.config.total_epochs,
                 warmup_epochs=scheduler.warmup_epochs,

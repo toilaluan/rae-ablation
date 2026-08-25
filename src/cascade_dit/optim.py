@@ -27,11 +27,14 @@ def build_optimizer(
 def build_training_scheduler(
     optimizer: torch.optim.Optimizer,
     *,
+    kind: str = "cosine",
     steps_per_epoch: int,
     total_epochs: int,
     warmup_epochs: int = 0,
     min_lr_ratio: float = 0.0,
 ) -> torch.optim.lr_scheduler.LambdaLR:
+    if kind not in {"constant", "cosine"}:
+        raise ValueError("training scheduler kind must be constant or cosine")
     if steps_per_epoch < 1 or total_epochs < 1 or warmup_epochs < 0:
         raise ValueError("invalid training scheduler counts")
     total_steps = steps_per_epoch * total_epochs
@@ -40,6 +43,8 @@ def build_training_scheduler(
     def multiplier(step: int) -> float:
         if warmup_steps and step < warmup_steps:
             return max((step + 1) / warmup_steps, 1 / warmup_steps)
+        if kind == "constant":
+            return 1.0
         progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
         cosine = 0.5 * (1 + math.cos(math.pi * min(max(progress, 0), 1)))
         return min_lr_ratio + (1 - min_lr_ratio) * cosine

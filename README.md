@@ -49,8 +49,10 @@ token. `R` is never dropped during CFG.
 Training predicts clean `x0` and evaluates velocity-space loss on a linear Gaussian flow
 with shifted-logit-normal timesteps. Each curriculum stage controls its own timestep
 shift. Every model parameter trains throughout one global AdamW optimizer, EMA, and
-50-epoch cosine schedule. Stage boundaries change the data distribution and active
-timestep shift; they do not mutate the model or reset optimization state.
+50-epoch scheduler. `optimizer.scheduler.kind` accepts `cosine` or `constant`; both
+support the configured linear warmup, while `min_lr_ratio` applies only to cosine.
+Stage boundaries change the data distribution and active timestep shift; they do not
+mutate the model or reset optimization state.
 
 ## Preparation and training
 
