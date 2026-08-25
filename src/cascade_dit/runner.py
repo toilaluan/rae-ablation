@@ -233,7 +233,13 @@ class ExperimentRunner:
             source_model = None
             if self.config.curriculum.source_consistency_weight:
                 source_model = self.ema.to_model(self.model).to(self.device).eval()
+
+            t0 = time.time()
             for batch in loader:
+                t1 = time.time()
+                load_time = t1 - t0
+                t0 = t1
+                   
                 tokens = batch.tokens.to(self.device, non_blocking=True)
                 labels = batch.labels.to(self.device, non_blocking=True)
                 weights = batch.representation_weights.to(
@@ -276,6 +282,7 @@ class ExperimentRunner:
                     "target_rms": float(tokens.float().square().mean().sqrt()),
                     "lr": self.optimizer.param_groups[0]["lr"],
                     "gradient_norm": float(gradient_norm),
+                    "load_time": float(load_time),
                 }
                 for mode, name in enumerate(MIXTURE_MODE_NAMES):
                     metrics[f"mode/{name}"] = int((modes == mode).sum())

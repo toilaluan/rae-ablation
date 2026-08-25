@@ -12,7 +12,7 @@ data:
   split: train
   validation_split: validation
   image_size: 128
-  workers: 8
+  workers: 16
   prefetch_factor: 4
   max_samples: null
   shuffle: true
@@ -30,13 +30,13 @@ representations:
   manifest: manifest.json
   stages:
     - name: dino12
-      epochs: 20
+      epochs: 15
       source: {kind: dino, layer: 12}
     - name: dino8
-      epochs: 20
+      epochs: 5
       source: {kind: dino, layer: 8}
     - name: rgb
-      epochs: 20
+      epochs: 30
       source: {kind: rgb, layer: null}
   dtype: bfloat16
   cache_batch_size: 256
@@ -49,9 +49,9 @@ model:
   architecture: ddt
   token_dim: 768
   encoder:
-    width: 768
+    width: 1152
     depth: 12
-    heads: 12
+    heads: 16
   decoder:
     width: 2048
     depth: 2

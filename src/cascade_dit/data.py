@@ -240,7 +240,10 @@ class MixedRepresentationDataset(Dataset[tuple[Tensor, Tensor, int, int, int]]):
         if stage.source.kind == "rgb":
             if pixels is None:
                 raise ValueError("RGB pixels were not loaded for a nonzero RGB weight")
+            import time
+            start = time.time()
             raw = patchify_rgb(pixels[None].float().div(255))[0]
+            print(f"patchify_rgb time: {time.time() - start:.4f}s")
         else:
             values = np.asarray(self.caches[stage.name][source_index]).copy()
             raw = torch.from_numpy(values).view(torch.bfloat16).float()
