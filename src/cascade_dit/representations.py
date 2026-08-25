@@ -139,6 +139,14 @@ def fingerprint(payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def cached_stages_include(
+    cached: Iterable[dict[str, Any]], requested: Iterable[dict[str, Any]]
+) -> bool:
+    """Return whether requested stages are an ordered subset of cached stages."""
+    remaining = iter(cached)
+    return all(any(candidate == stage for candidate in remaining) for stage in requested)
+
+
 @dataclass
 class RepresentationManifest:
     dataset_size: int

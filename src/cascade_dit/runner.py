@@ -36,9 +36,9 @@ from .optim import (
     trainable_parameter_count,
 )
 from .preparation import (
-    preparation_fingerprint,
     representation_manifest_fingerprint,
     statistics_from_manifest,
+    validate_manifest_compatibility,
 )
 from .representations import RepresentationManifest, unpatchify_rgb
 from .rng import RNGStreams
@@ -64,8 +64,7 @@ def load_representation_manifest(
         root / config.representations.manifest,
         require_complete=config.representations.require_complete,
     )
-    if manifest.preparation_fingerprint != preparation_fingerprint(config):
-        raise ValueError("prepared representation settings do not match experiment config")
+    validate_manifest_compatibility(config, manifest)
     return manifest, representation_manifest_fingerprint(manifest)
 
 

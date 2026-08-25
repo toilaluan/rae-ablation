@@ -58,6 +58,8 @@ mutate the model or reset optimization state.
 
 Preparation extracts every configured DINO layer in one encoder pass, writes separate
 resumable BF16 memmaps, and accumulates independent DINO/RGB normalization statistics.
+An existing cache can be reused by a curriculum that keeps an ordered subset of its
+stages, so a cached stage such as DINO layer 8 can be removed without re-preparation.
 The default three DINO caches require about 352 GiB for full ImageNet. This schema uses
 `data/direct-representations` by default and intentionally does not reuse alignment-era
 manifests or caches. Existing runtime data is never deleted automatically.

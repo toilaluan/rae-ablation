@@ -14,7 +14,12 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from .config import IMAGE_SIZE, TOKEN_COUNT, TOKEN_DIM, DataConfig, ExperimentConfig
-from .representations import ChannelStatistics, RepresentationManifest, patchify_rgb
+from .representations import (
+    ChannelStatistics,
+    RepresentationManifest,
+    cached_stages_include,
+    patchify_rgb,
+)
 
 PURE_CURRENT = 0
 ADJACENT_MIX = 1
@@ -389,8 +394,8 @@ def make_stage_loader(
     expected_stages = [
         {"name": stage.name, "source": asdict(stage.source)} for stage in config.stages
     ]
-    if manifest.stages != expected_stages:
-        raise ValueError("prepared representation stages differ from configuration")
+    if not cached_stages_include(manifest.stages, expected_stages):
+        raise ValueError("prepared representations do not include configured stages")
     dataset = load_imagenet(config.data, load_pixels=True)
     if len(dataset) != manifest.dataset_size:
         raise ValueError("dataset size differs from prepared representations")

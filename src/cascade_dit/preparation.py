@@ -17,6 +17,7 @@ from .representations import (
     ChannelStatisticsAccumulator,
     LayerMemmap,
     RepresentationManifest,
+    cached_stages_include,
     fingerprint,
     patchify_rgb,
     preflight_representation_capacity,
@@ -86,16 +87,52 @@ def _stage_payload(config: ExperimentConfig) -> list[dict[str, object]]:
     ]
 
 
-def preparation_fingerprint(config: ExperimentConfig) -> str:
+def _dino_layers_from_stages(stages: list[dict[str, object]]) -> list[int]:
+    return [
+        int(source["layer"])
+        for stage in stages
+        if isinstance((source := stage.get("source")), dict)
+        and source.get("kind") == "dino"
+        and source.get("layer") is not None
+    ]
+
+
+def preparation_fingerprint(
+    config: ExperimentConfig, stages: list[dict[str, object]] | None = None
+) -> str:
+    selected_stages = _stage_payload(config) if stages is None else stages
     return fingerprint(
         {
             "dataset": data_fingerprint(config.data, config.data.image_size),
-            "encoder": encoder_fingerprint(config.encoder, config.dino_layers),
-            "stages": _stage_payload(config),
+            "encoder": encoder_fingerprint(
+                config.encoder, _dino_layers_from_stages(selected_stages)
+            ),
+            "stages": selected_stages,
             "normalization_epsilon": config.representations.normalization_epsilon,
             "cache_dtype": config.representations.dtype,
         }
     )
+
+
+def validate_manifest_compatibility(
+    config: ExperimentConfig, manifest: RepresentationManifest
+) -> None:
+    requested_stages = _stage_payload(config)
+    cached_stages = manifest.stages
+    if not cached_stages_include(cached_stages, requested_stages):
+        raise ValueError(
+            "completed representation manifest does not include the configured stages"
+        )
+    cached_layers = _dino_layers_from_stages(cached_stages)
+    if (
+        manifest.dataset_fingerprint
+        != data_fingerprint(config.data, config.data.image_size)
+        or manifest.encoder_fingerprint
+        != encoder_fingerprint(config.encoder, cached_layers)
+        or manifest.preparation_fingerprint
+        != preparation_fingerprint(config, cached_stages)
+    ):
+        raise ValueError("completed representation manifest fingerprint mismatch")
 
 
 def _loader(dataset: object, indices: Tensor, config: ExperimentConfig) -> DataLoader:
@@ -209,7 +246,23 @@ def _initialize_preparation_state(
             existing = json.loads(state_path.read_text())
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise ValueError("representation preparation state is corrupt") from error
-        if existing != expected:
+        if not isinstance(existing, dict):
+            raise ValueError("representation preparation state is corrupt")
+        cached_stages = existing.get("stages")
+        compatible = (
+            isinstance(cached_stages, list)
+            and cached_stages_include(cached_stages, expected["stages"])
+            and existing.get("schema_version") == expected["schema_version"]
+            and existing.get("dataset_size") == expected["dataset_size"]
+            and existing.get("dataset_fingerprint") == expected["dataset_fingerprint"]
+            and existing.get("shape") == expected["shape"]
+            and existing.get("dtype") == expected["dtype"]
+            and existing.get("encoder_fingerprint")
+            == encoder_fingerprint(config.encoder, _dino_layers_from_stages(cached_stages))
+            and existing.get("preparation_fingerprint")
+            == preparation_fingerprint(config, cached_stages)
+        )
+        if not compatible:
             raise ValueError("representation preparation fingerprint mismatch")
         return
     cache_files = list(root.glob("*.bf16")) + list(root.glob("*.completion.u8"))
@@ -234,14 +287,7 @@ def prepare_representations(
     manifest_path = root / config.representations.manifest
     if manifest_path.is_file():
         existing = RepresentationManifest.load(manifest_path)
-        if (
-            existing.dataset_fingerprint
-            != data_fingerprint(config.data, config.data.image_size)
-            or existing.encoder_fingerprint
-            != encoder_fingerprint(config.encoder, config.dino_layers)
-            or existing.preparation_fingerprint != preparation_fingerprint(config)
-        ):
-            raise ValueError("completed representation manifest fingerprint mismatch")
+        validate_manifest_compatibility(config, existing)
         return existing
 
     dataset = load_imagenet(config.data, config.data.image_size, load_pixels=True)
