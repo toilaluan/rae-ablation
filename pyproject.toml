@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cascade-dit"
-version = "0.1.0"
-description = "Pixel/Mage-target and DINO-semantic cascade diffusion transformers"
+version = "0.2.0"
+description = "Progressive DINO-to-pixel LightningDiT experiments"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

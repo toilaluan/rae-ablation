@@ -2,161 +2,94 @@ from __future__ import annotations
 
 import json
 
+import pytest
 import torch
-from torch import nn
 
-from cascade_dit.checkpoint import EMA, CheckpointManager
-from cascade_dit.config import ExperimentConfig, ModelConfig
-from cascade_dit.model import build_model
+from cascade_dit.checkpoint import EMA, CheckpointManager, ResumeState
+from cascade_dit.checkpoint_bundle import load_checkpoint_bundle
+from cascade_dit.config import DetailHeadsConfig, ExperimentConfig, ModelConfig
+from cascade_dit.model import LightningDiT
 from cascade_dit.rng import RNGStreams
-from cascade_dit.validation import create_validation_plan
 
 
-def test_ema_foreach_updates_floating_state_and_copies_integer_buffers() -> None:
-    model = nn.BatchNorm1d(3)
-    ema = EMA(model, decay=0.75)
-    original = {key: value.clone() for key, value in ema.state_dict().items()}
+def _model() -> LightningDiT:
+    return LightningDiT(
+        ModelConfig(hidden_size=16, depth=1, num_heads=1, num_classes=4, rope=False),
+        DetailHeadsConfig(pixel_enabled=False),
+    )
+
+
+def _state(model: LightningDiT, *, complete: bool = False) -> ResumeState:
+    optimizer = torch.optim.AdamW(model.parameters())
+    return ResumeState(
+        schema_version=3,
+        completed_epoch=80 if complete else 20,
+        global_step=7,
+        stage_index=3 if complete else 0,
+        stage="rgb" if complete else "dino12",
+        epoch_within_stage=20,
+        transition_state="stable",
+        training_complete=complete,
+        images_seen=1024,
+        estimated_flops=123,
+        wall_clock_seconds=4.5,
+        optimizer=optimizer.state_dict(),
+        scheduler=None,
+        rng_streams=RNGStreams.create(4).state_dict(),
+        data_fingerprint="data",
+        representation_fingerprint="representations",
+    )
+
+
+def test_checkpoint_roundtrip_and_old_schema_rejection(tmp_path) -> None:
+    model = _model()
+    ema = EMA(model)
+    manager = CheckpointManager(tmp_path)
+    saved = manager.save(model=model, ema=ema, state=_state(model), config=ExperimentConfig())
     with torch.no_grad():
-        model.weight.add_(4)
-        model.bias.add_(4)
-        model.running_mean.add_(4)
-        model.running_var.add_(4)
-        model.num_batches_tracked.add_(1)
-    ema.update(model)
-    current = model.state_dict()
-    for key, value in ema.state_dict().items():
-        if value.is_floating_point():
-            assert torch.allclose(value, original[key].lerp(current[key], 0.25))
-        else:
-            assert torch.equal(value, current[key])
+        next(model.parameters()).zero_()
+    restored = manager.load(saved, model, ema, expected_data_fingerprint="data")
+    assert restored.completed_epoch == 20
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "metadata.json").write_text(json.dumps({"schema_version": 2}))
+    with pytest.raises(ValueError, match="incompatible"):
+        manager.load(old, model, ema)
 
 
-def test_checkpoint_restores_architecture_provenance_and_every_rng_stream(tmp_path) -> None:
-    config = ExperimentConfig(
-        model=ModelConfig(
-            architecture="latent",
-            hidden_size=(32, 48),
-            depth=(1, 1),
-            num_heads=(4, 3),
-            base_model_depth=1,
-            num_classes=2,
-        )
-    )
-    model = build_model(config.model)
+def test_boundary_save_is_idempotent_and_sampling_requires_complete_rgb(tmp_path) -> None:
+    model = _model()
     ema = EMA(model)
-    streams = RNGStreams.create(7)
-    plan = create_validation_plan(4, 2, 2, 11)
-    plan_path = tmp_path / "plan.pt"
-    plan.save(plan_path)
-    representations = {
-        "mage_vae": {
-            "repository": "mage-flow-community/Mage-Flow",
-            "revision": "revision",
-            "weight_sha256": "weights",
-            "posterior": "mean",
-            "image_latent_shape": [128, 16, 16],
-            "encode_preprocessing": "[-1,1]",
-        }
-    }
-    caches = {"image_latents": "online", "semantic_tokens": "not-used"}
-    manager = CheckpointManager(tmp_path / "checkpoints")
-    checkpoint = manager.save(
-        completed_epoch=1,
-        global_step=3,
+    manager = CheckpointManager(tmp_path)
+    before = _state(model)
+    before = ResumeState(**(vars(before) | {"transition_state": "before"}))
+    first = manager.save_boundary(
+        target_stage_index=1,
+        position="before",
         model=model,
         ema=ema,
-        optimizer_state={"state": "optimizer"},
-        rng_streams=streams.state_dict(),
-        architecture="latent",
-        data_fingerprint="data",
-        validation_plan_hash=plan.plan_hash,
-        validation_plan_path=plan_path,
-        last_completed_validation_epoch=None,
-        wandb_run_id=None,
-        resolved_config=config.as_dict(),
-        representation_provenance=representations,
-        cache_provenance=caches,
+        state=before,
+        config=ExperimentConfig(),
     )
-    saved_config = json.loads((checkpoint / "config.json").read_text())
-    saved_config["model"].pop("image_target")
-    train_values = saved_config["train"]
-    train_values["timestep_loc"] = train_values.pop("semantic_timestep_loc")
-    train_values.pop("image_timestep_loc")
-    train_values["timestep_scale"] = train_values.pop("semantic_timestep_scale")
-    train_values.pop("image_timestep_scale")
-    train_values["timestep_shift"] = train_values.pop("semantic_timestep_shift")
-    train_values.pop("image_timestep_shift")
-    sampling_values = saved_config["sampling"]
-    sampling_values["timestep_shift"] = sampling_values.pop(
-        "semantic_timestep_shift"
-    )
-    sampling_values.pop("image_timestep_shift")
-    (checkpoint / "config.json").write_text(json.dumps(saved_config))
-    restored = manager.load(
-        checkpoint,
-        model,
-        ema,
-        expected_architecture="latent",
-        expected_representation_provenance=representations,
-        expected_cache_provenance=caches,
-    )
-    assert restored.architecture == "latent"
-    assert set(restored.rng_streams) == set(streams.state_dict())
-
-
-def test_pixel_target_checkpoint_roundtrip_uses_pixel_provenance(tmp_path) -> None:
-    config = ExperimentConfig(
-        model=ModelConfig(
-            architecture="latent",
-            image_target="pixels",
-            hidden_size=(32, 48),
-            depth=(1, 1),
-            num_heads=(4, 3),
-            base_model_depth=1,
-            num_classes=2,
-        )
-    )
-    model = build_model(config.model)
-    ema = EMA(model)
-    streams = RNGStreams.create(9)
-    plan = create_validation_plan(4, 2, 2, 13)
-    plan_path = tmp_path / "pixel-plan.pt"
-    plan.save(plan_path)
-    representations = {
-        "pixels": {
-            "kind": "pixels",
-            "shape": [3, 256, 256],
-            "dtype": "float32",
-            "range": [-1.0, 1.0],
-            "data_fingerprint": "data",
-            "preprocessing": "uint8-to-[-1,1]",
-        }
-    }
-    caches = {"image_latents": "not-used", "semantic_tokens": "not-used"}
-    manager = CheckpointManager(tmp_path / "pixel-checkpoints")
-    checkpoint = manager.save(
-        completed_epoch=1,
-        global_step=2,
+    second = manager.save_boundary(
+        target_stage_index=1,
+        position="before",
         model=model,
         ema=ema,
-        optimizer_state={},
-        rng_streams=streams.state_dict(),
-        architecture="latent",
-        data_fingerprint="data",
-        validation_plan_hash=plan.plan_hash,
-        validation_plan_path=plan_path,
-        last_completed_validation_epoch=None,
-        wandb_run_id=None,
-        resolved_config=config.as_dict(),
-        representation_provenance=representations,
-        cache_provenance=caches,
+        state=before,
+        config=ExperimentConfig(),
     )
-    restored = manager.load(
-        checkpoint,
-        model,
-        ema,
-        expected_architecture="latent",
-        expected_representation_provenance=representations,
-        expected_cache_provenance=caches,
+    assert first == second
+    with pytest.raises(ValueError, match="completed RGB"):
+        load_checkpoint_bundle(first, require_rgb_complete=True)
+
+
+def test_completed_rgb_checkpoint_is_sampling_eligible(tmp_path) -> None:
+    model = _model()
+    model.set_stage("rgb", torch.eye(768))
+    ema = EMA(model)
+    manager = CheckpointManager(tmp_path)
+    saved = manager.save(
+        model=model, ema=ema, state=_state(model, complete=True), config=ExperimentConfig()
     )
-    assert restored.representation_provenance == representations
+    assert load_checkpoint_bundle(saved, require_rgb_complete=True).weights.is_file()

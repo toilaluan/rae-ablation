@@ -1,0 +1,156 @@
+schema_version: 3
+
+experiment:
+  mode: progressive
+  name: dino-to-pixel-lightningdit-b1
+  seed: 0
+  output_directory: runs/experiment
+
+data:
+  repository: benjamin-paine/imagenet-1k-256x256
+  revision: 1bd0400450249a7fe90c0aece37d0d03e7ea956a
+  split: train
+  validation_split: validation
+  image_size: 128
+  workers: 16
+  prefetch_factor: 4
+  max_samples: null
+  shuffle: true
+
+encoder:
+  repository: facebook/dinov3-vitb16-pretrain-lvd1689m
+  revision: 5931719e67bbdb9737e363e781fb0c67687896bc
+  layers: [12, 8, 4]
+  patch_size: 16
+  hidden_size: 768
+  num_register_tokens: 4
+  apply_final_norm: true
+
+representations:
+  directory: data/representations
+  manifest: manifest.json
+  dtype: bfloat16
+  cache_batch_size: 128
+  asynchronous_writes: true
+  statistics_dtype: float64
+  normalization_epsilon: 1.0e-6
+  require_complete: true
+
+alignment:
+  enabled: true
+  subset_size: 50000
+  subset_seed: 17
+  heldout_size: 10000
+  pairs: [dino12->dino8, dino8->dino4, dino4->rgb]
+  identity: false
+  direct_layer12_to_rgb: false
+  svd_driver: gesvd
+
+model:
+  token_dim: 768
+  hidden_size: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+  num_classes: 1000
+  class_dropout_probability: 0.1
+  qk_norm: true
+  rms_norm: true
+  rope: true
+  swiglu: true
+  adaln_shift: true
+  gradient_checkpointing: false
+  sdpa: true
+
+detail_heads:
+  token_enabled: true
+  token_depth: 2
+  token_expansion: 2.0
+  pixel_enabled: true
+  pixel_channels: [64, 128, 256, 512]
+  pixel_bottleneck_context: 768
+  zero_initialize: true
+
+curriculum:
+  stages: [dino12, dino8, dino4, rgb]
+  epochs: [20, 20, 20, 20]
+  transition_warmup_epochs: 1
+  fully_train_blocks: [0, 1, 10, 11]
+  lora_blocks: [2, 3, 4, 5, 6, 7, 8, 9]
+  lora_rank: 16
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  later_stage_full_finetune: false
+  source_consistency_weight: 0.0
+
+objective:
+  prediction: x0
+  loss_space: velocity
+  timestep_distribution: shifted_logit_normal
+  timestep_loc: 0.0
+  timestep_scale: 1.0
+  timestep_shift: 4.0
+  denominator_floor: 0.05
+  cosine_loss_weight: 0.0
+  cosine_loss_epsilon: 1.0e-8
+
+optimizer:
+  kind: adamw
+  initial_lr: 2.0e-4
+  transition_lr: 5.0e-5
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.0
+  gradient_clip: 1.0
+  global_batch_size: 1024
+  ema_decay: 0.9999
+  schedule: cosine
+  min_lr_ratio: 0.0
+
+sampling:
+  steps: 40
+  solver: euler
+  timestep_shift: 1.0
+  guidance_scale: 1.0
+  guidance_start: 0.0
+  guidance_end: 1.0
+  batch_size: 32
+  seed: 0
+
+validation:
+  interval_epochs: 5
+  batches: 32
+  pca_preview_samples: 16
+
+checkpoint:
+  directory: checkpoints
+  interval_epochs: 5
+  save_boundary_before: true
+  save_boundary_after: true
+  resume: null
+
+compile:
+  enabled: true
+  backend: inductor
+  mode: default
+  fullgraph: true
+  dynamic: false
+
+wandb:
+  enabled: false
+  entity: null
+  project: dino-to-pixel-lightningdit
+  name: null
+  group: null
+  tags: []
+  mode: online
+  checkpoint_artifacts: false
+
+evaluation:
+  num_samples: 50000
+  reference_npz: data/VIRTUAL_imagenet128_labeled.npz
+  metrics: [fid, is]
+  batch_size: 32
+  device: auto
+  report_flops: true
+  report_peak_memory: true

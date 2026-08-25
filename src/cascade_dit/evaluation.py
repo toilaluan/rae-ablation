@@ -143,7 +143,7 @@ def _default_feature_extractor(device: torch.device) -> nn.Module:
 
     return create_feature_extractor(
         "inception-v3-compat",
-        ["2048"],
+        ["2048", "logits_unbiased"],
         cuda=device.type == "cuda",
         verbose=False,
     )
@@ -165,6 +165,7 @@ def extract_feature_statistics(
     extractor = extractor.to(device).eval()
     feature_sum: Tensor | None = None
     feature_outer: Tensor | None = None
+    probability_batches: list[Tensor] = []
     count = 0
     started = time.perf_counter()
     total_batches = math.ceil(reader.shape[0] / batch_size)
@@ -173,6 +174,8 @@ def extract_feature_statistics(
         tensor = torch.from_numpy(writable).permute(0, 3, 1, 2).to(device)
         output = extractor(tensor)
         features = output[0] if isinstance(output, (tuple, list)) else output
+        if isinstance(output, (tuple, list)) and len(output) > 1:
+            probability_batches.append(output[1].detach().float().softmax(dim=-1).cpu())
         features = features.detach().to(device="cpu", dtype=torch.float64)
         if features.ndim != 2:
             raise ValueError("Inception feature extractor did not return a matrix")
@@ -195,7 +198,25 @@ def extract_feature_statistics(
         raise ValueError("not enough generated features for FID")
     mu = feature_sum / count
     sigma = (feature_outer - count * torch.outer(mu, mu)) / (count - 1)
-    return {"mu": mu.numpy(), "sigma": sigma.numpy()}
+    result = {"mu": mu.numpy(), "sigma": sigma.numpy()}
+    if probability_batches:
+        result["probabilities"] = torch.cat(probability_batches).numpy()
+    return result
+
+
+def inception_score(probabilities: np.ndarray, splits: int = 10) -> float:
+    values = np.asarray(probabilities, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] < splits or splits < 1:
+        raise ValueError("Inception probabilities must be [N,C] with at least one row per split")
+    epsilon = np.finfo(np.float64).eps
+    scores = []
+    for subset in np.array_split(values, splits):
+        marginal = subset.mean(axis=0, keepdims=True)
+        divergence = subset * (
+            np.log(subset.clip(min=epsilon)) - np.log(marginal.clip(min=epsilon))
+        )
+        scores.append(float(np.exp(divergence.sum(axis=1).mean())))
+    return float(np.mean(scores))
 
 
 def evaluate_npz(
@@ -234,7 +255,12 @@ def evaluate_npz(
     )
     fid = fid_from_statistics(generated_stats, reference_stats)
     log(f"FID: {fid:.6f}")
-    return {"FID": fid}
+    metrics = {"FID": fid}
+    if "probabilities" in generated_stats:
+        score = inception_score(generated_stats["probabilities"])
+        metrics["IS"] = score
+        log(f"IS: {score:.6f}")
+    return metrics
 
 
 def save_evaluation(path: str | Path, metrics: dict[str, Any], plan_hash: str) -> None:
@@ -243,7 +269,7 @@ def save_evaluation(path: str | Path, metrics: dict[str, Any], plan_hash: str) -
     temporary = target.with_suffix(target.suffix + ".partial")
     temporary.write_text(
         json.dumps(
-            {"validation_plan_hash": plan_hash, "metrics": metrics}, indent=2, sort_keys=True
+            {"sampling_plan_hash": plan_hash, "metrics": metrics}, indent=2, sort_keys=True
         )
         + "\n"
     )

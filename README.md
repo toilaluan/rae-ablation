@@ -1,150 +1,108 @@
-# Cascade DDT
+# Progressive DINO-to-Pixel LightningDiT
 
-Cascade DDT trains class-conditional diffusion transformers for ImageNet-256 using an
-image target plus aligned semantic tokens. Select the image target with
-`model.image_target`:
+This repository contains one class-conditional ImageNet-128 experiment and its matched
+pixel baseline. The progressive run trains on four normalized 8x8 token targets:
 
-- `mage_latents` (the default) uses deterministic native Mage-VAE posterior means
-  `T=[B,128,16,16]`;
-- `pixels` diffuses RGB `T=[B,3,256,256]` directly in `[-1,1]`, without loading Mage;
-- semantic tokens `S=[B,768,8,8]` are normalized, unpooled final-layer DINOv3-B/16
-  patch tokens extracted from a 128px view.
+1. DINOv3-B/16 layer 12 for 20 epochs.
+2. DINOv3-B/16 layer 8 for 20 epochs.
+3. DINOv3-B/16 layer 4 for 20 epochs.
+4. Flattened 3x16x16 RGB patches for 20 epochs.
 
-Mage patches use size 2 and pixel patches use size 32; semantic patches use size 1, so
-every route has the same 8x8 transformer-token grid. Each image-target patch is
-concatenated with its aligned DINO patch and independently projected into the DDT
-encoder and decoder widths. Mage latents receive no Flux BN transform or dataset
-normalization.
+All representations have shape `[B,64,768]`. DINO layers are one-indexed; CLS and four
+register tokens are removed, and DINO's final norm is independently applied to every
+selected intermediate output. DINO and RGB targets use full-training-set, per-channel
+mean and standard deviation. Images are resized to 128x128 without augmentation so
+cached features, RGB patches, alignments, and baseline batches remain paired.
 
-The transformer follows the encoder-heavy/decoder-light design of the
-[RAEv2 DDT](https://github.com/nanovisionx/RAEv2/blob/main/src/stage2/models/DDT.py),
-reimplemented with local primitives. Presets use encoder/decoder widths `[1152,2048]`,
-depths `[28,2]`, heads `[16,16]`, RMSNorm, QK-normalized attention, 2D RoPE, SwiGLU,
-and timestep/class attention tokens. Decoder AdaLN and prediction heads are
-zero-initialized.
+## Model and objective
 
-## Architectures
+The shared denoiser is a local token-native integration of
+[LightningDiT-B/1](https://github.com/hustvl/LightningDiT/blob/main/models/lightningdit.py):
+12 blocks, width 768, 12 heads, RMSNorm, QK norm, two-dimensional RoPE, SwiGLU, AdaLN,
+SDPA, and class conditioning. It predicts clean `x0` tokens and converts them to velocity
+for a shifted-logit-normal linear Gaussian-flow loss. The velocity denominator is floored
+at 0.05. The optional LightningDiT cosine term is zero by default.
 
-Select exactly one architecture with `model.architecture`:
+Every stage uses a pointwise token detail head: projected noisy tokens and final
+transformer context are summed, passed through two width-768 RMSNorm/SiLU residual MLPs
+with expansion 2, and mapped through a zero-initialized output projection. At the RGB
+stage, a zero-initialized DiP-style patch U-Net additionally processes each 3x16x16 patch
+independently. Its resolution path is `16→8→4→2→1→2→4→8→16`, its down channels are
+`3→64→128→256→512`, and the transformer context is concatenated at the 1x1 bottleneck.
 
-- `latent` builds `LatentDDT`, a pure image-target baseline with no semantic modules;
-- `shared_cascade` builds `SharedCascadeDDT`, with route-specific projections and heads
-  around one shared DDT core;
-- `decoupled_cascade` builds `DecoupledCascadeDDT`, containing independent `SemanticDDT`
-  and `ConditionalLatentDDT` denoisers with no shared parameters.
+Consecutive targets are initialized with full-rank 768x768 orthogonal Procrustes maps.
+This borrows the alignment motivation from
+[AsymFlow](https://arxiv.org/abs/2605.12964), but it is deliberately **not** AsymFlow's
+low-rank asymmetric parameterization: these matrices are full-rank initialization
+alignments. Cumulative projectors stay outside the nonlinear model. At export, the final
+projector is folded into the linear input, output, and token-detail weights; the RGB
+convolutional head is never rotated.
 
-Cascade training evaluates both Gaussian-flow routes every step. Semantic and image
-timesteps/noise are independently sampled from separately configurable shifted
-logit-normal distributions. A seeded 25% mask selects detached online full-head
-semantic predictions in place of detached clean semantic conditioning. When class
-dropout selects the null class, the image route receives an all-zero semantic
-condition; classifier-free sampling uses the same convention. The single backward
-pass optimizes:
+## Preparation
 
-```text
-L_image_latent + L_semantic_full + semantic_base_loss_weight * L_semantic_base
-```
-
-The semantic condition selected for each example is concatenated into both image-route
-DDT patch streams. The semantic base prediction is read from encoder block 8 and the
-full prediction is read from the decoder, preserving internal semantic guidance.
-
-## Pinned representations
-
-The Mage-VAE is pinned to `mage-flow-community/Mage-Flow` revision
-`5edf242ad658cb85050ee077c6629d59e5388fe7`. The inference implementation is attributed
-to the [official Mage source](https://github.com/microsoft/Mage/blob/76bec2bb3818863f470de7e867c2dc7f1d0bfd83/mage_flow/models/modules/mage_vae.py),
-and the repository validates the published
-[VAE config](https://huggingface.co/mage-flow-community/Mage-Flow/blob/5edf242ad658cb85050ee077c6629d59e5388fe7/vae/config.json)
-contract. Encoding accepts 256px floating-point images in `[-1,1]` and always uses the
-posterior mean. Decoding returns clamped `[0,1]` 256px images.
-
-Generate semantic-only normalization statistics before online cascade training or
-semantic caching:
+The single preparation workflow extracts layers 12, 8, and 4 in one DINO pass into
+separate resumable BF16 memmaps, computes DINO/RGB statistics, and fits deterministic
+50,000-image Procrustes maps with held-out diagnostics. A complete ImageNet run needs
+about 352 GiB for the three DINO caches. Capacity and runtime directories are never
+deleted automatically.
 
 ```bash
-torchrun --standalone --nproc-per-node=8 scripts/generate_semantic_statistics.py \
-  --config configs/cascade-shared.yaml
+torchrun --standalone --nproc-per-node=8 scripts/prepare_representations.py \
+  --config configs/experiment.yaml
 ```
 
-## Independent caches
+The versioned manifest records cache completion, statistics, dataset and encoder
+fingerprints, held-out MSE, orthogonality errors, matrix keys, and the explicit full-rank
+parameterization description. Corrupt, incomplete, or mismatched artifacts are rejected.
 
-Image latents and semantic tokens have independent resumable, distributed BF16 memmap
-caches. Each builder performs capacity preflight, maintains a completion bitmap, uses
-asynchronous pinned-memory copies on CUDA, and atomically finalizes its manifest.
-
-```bash
-torchrun --standalone --nproc-per-node=8 scripts/cache_image_latents.py \
-  --config configs/latent-baseline.yaml
-
-torchrun --standalone --nproc-per-node=8 scripts/cache_semantic_tokens.py \
-  --config configs/cascade-shared.yaml
-```
-
-The full ImageNet training image-latent payload is approximately 78.2 GiB. Its
-fingerprint contains only dataset preprocessing, Mage identity, deterministic-posterior
-policy, image size, latent schema, shape, and dtype, so one cache works with all three
-architectures and is unchanged by the DDT migration. The presets enable the image
-cache, plus the semantic cache for cascade models. Training only opens completed cache
-manifests; a missing or incompatible cache fails instead of rebuilding it. With both
-caches enabled, cascade training reads no RGB and instantiates neither frozen encoder;
-a cached latent baseline uses no RGB, DINO, or training-time VAE.
-
-Direct-pixel training bypasses the image-latent cache while retaining compatibility
-with an existing semantic-token cache. Existing Mage and semantic cache fingerprints
-and manifests are unchanged.
-
-## Train and sample
-
-Three presets are provided:
-
-```text
-configs/latent-baseline.yaml
-configs/cascade-shared.yaml
-configs/cascade-decoupled.yaml
-```
-
-Example:
+## Training
 
 ```bash
 torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/cascade-shared.yaml \
-  --output runs/cascade-shared-seed0
+  --config configs/experiment.yaml \
+  --output runs/progressive-seed0
+```
 
-torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --checkpoint-dir runs/cascade-shared-seed0/checkpoints/last \
-  --semantic-steps 10 \
-  --image-steps 40 \
+Stage 1 trains the whole transformer, linear I/O, and token head; the RGB patch head is
+not introduced yet. At later stages, I/O/detail heads and blocks `0,1,10,11` train fully.
+Blocks `2…9` receive fresh rank-16, alpha-16, dropout-0.05 LoRA on attention and SwiGLU
+linears. Base parameters and conditioning in those blocks stay frozen. Before each
+transition, LoRA is merged into both model and EMA; fresh zero-output adapters are then
+attached, the loader and compiled execution view are rebuilt, and AdamW/cosine state is
+reset with one warmup epoch. Boundary checkpoints are written before and after the
+idempotent transition.
+
+The matched baseline uses exactly the exported RGB architecture, target normalization,
+data order, RNG streams, objective, sampling, and evaluation settings, but initializes it
+from scratch and trains every parameter for all 80 epochs:
+
+```bash
+torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/experiment.yaml \
+  --override experiment.mode=pixel_baseline \
+  --output runs/pixel-baseline-seed0
+```
+
+Follow-up identity-alignment, direct layer-12-to-RGB, and full-finetune settings are
+available under `alignment` and `curriculum` overrides. Source consistency remains
+available but defaults to zero so it does not confound the primary experiment.
+
+## Sampling and evaluation
+
+Sampling accepts only a completed RGB checkpoint. It runs one flow trajectory in
+normalized RGB-token space, applies interval CFG, reverses dataset normalization,
+unpatchifies, and clamps images to `[0,1]`.
+
+```bash
+python scripts/sample.py \
+  --checkpoint-dir runs/progressive-seed0/checkpoints/last \
+  --num-samples 50000 \
   --evaluate
 ```
 
-Use direct pixels for any architecture with an override:
-
-```bash
-torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/cascade-shared.yaml \
-  --override model.image_target=pixels \
-  --output runs/cascade-shared-pixels-seed0
-```
-
-Cascade sampling generates semantic tokens with internal full/base guidance, creates
-fresh independent image-target noise, generates the target conditioned on semantic
-tokens with class guidance, and either decodes through Mage-VAE or emits pixels
-directly. Semantic and image routes have independent `sampling.*_timestep_shift`
-settings and matching standalone CLI flags. The legacy `--timestep-shift` flag still
-sets both. The latent baseline skips the semantic route while retaining the identical
-image-noise seed stream for paired runs. Evaluation defaults to ImageNet-256
-references.
-
-Cascade training validation also writes `semantic-pca-preview.png`, a per-image PCA
-visualization of the first 16 generated semantic feature maps, and logs it to W&B when
-enabled.
-
-DDT uses configuration and checkpoint schema version 2. Configs and checkpoints using
-the former shared training or sampling timestep fields are migrated on load by copying
-their values to both routes. Current Mage model, EMA, optimizer, RNG, and cache state
-remain resumable. A Mage-target checkpoint cannot be loaded as a pixel-target model or
-vice versa.
+Intermediate stages are evaluated with validation loss and feature PCA previews rather
+than image FID. Final comparisons record FID-50k, IS, wall-clock time, images seen,
+estimated FLOPs, peak memory, and total/trainable parameter counts.
 
 ## Verification
 
@@ -152,3 +110,6 @@ vice versa.
 uv run --extra dev pytest -q
 uv run --extra dev ruff check .
 ```
+
+Configuration and checkpoints use clean schema version 3. Old DDT/Mage artifacts are
+rejected with an explicit error and are not migrated or deleted.

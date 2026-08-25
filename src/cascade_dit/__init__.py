@@ -1,37 +1,26 @@
-"""Cascade DDT native Mage-latent and DINO-semantic diffusion."""
+"""Progressive DINO-to-pixel LightningDiT experiment."""
 
+from .alignment import OrthogonalProjector, StreamingProcrustes, cumulative_projectors
 from .config import ExperimentConfig, ModelConfig, load_config
-from .image_latent_cache import ImageLatentCache
-from .mage import MageVAECodec
-from .model import (
-    CascadePredictions,
-    ConditionalLatentDDT,
-    DecoupledCascadeDDT,
-    LatentDDT,
-    SemanticDDT,
-    SemanticPredictions,
-    SharedCascadeDDT,
-    build_model,
-)
-from .semantic_token_cache import SemanticTokenCache
-from .vision import DINOSemanticEncoder
+from .model import LightningDiT, PixelPatchDetailer, TokenDetailHead, build_model
+from .representations import ChannelStatistics, patchify_rgb, unpatchify_rgb
+from .vision import DINOMultiLayerEncoder
 
 __all__ = [
-    "CascadePredictions",
-    "ConditionalLatentDDT",
-    "DINOSemanticEncoder",
-    "DecoupledCascadeDDT",
+    "ChannelStatistics",
+    "DINOMultiLayerEncoder",
     "ExperimentConfig",
-    "ImageLatentCache",
-    "LatentDDT",
-    "MageVAECodec",
+    "LightningDiT",
     "ModelConfig",
-    "SemanticDDT",
-    "SemanticPredictions",
-    "SemanticTokenCache",
-    "SharedCascadeDDT",
+    "OrthogonalProjector",
+    "PixelPatchDetailer",
+    "StreamingProcrustes",
+    "TokenDetailHead",
     "build_model",
+    "cumulative_projectors",
     "load_config",
+    "patchify_rgb",
+    "unpatchify_rgb",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
-import shutil
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -11,119 +11,44 @@ import torch
 from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
 
+from .config import CONFIG_SCHEMA_VERSION, ExperimentConfig, load_checkpoint_config
 from .model.compile import clean_state_dict
 
-CHECKPOINT_SCHEMA_VERSION = 2
-TRAINING_STATE_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
+TRAINING_STATE_SCHEMA_VERSION = 3
 
 
-def _contiguous(state: dict[str, object]) -> dict[str, Tensor]:
+def _tensor_state(state: dict[str, object]) -> dict[str, Tensor]:
     return {
-        key: value.detach().contiguous()
-        for key, value in state.items()
+        name: value.detach().contiguous()
+        for name, value in state.items()
         if isinstance(value, Tensor)
     }
 
 
-def _validate_provenance(
-    architecture: str,
-    representation_provenance: dict[str, Any],
-    cache_provenance: dict[str, str],
-) -> None:
-    if architecture not in {"latent", "shared_cascade", "decoupled_cascade"}:
-        raise ValueError("checkpoint architecture is invalid")
-    mage = representation_provenance.get("mage_vae")
-    pixels = representation_provenance.get("pixels")
-    if isinstance(mage, dict) and pixels is None:
-        required = {
-            "repository",
-            "revision",
-            "weight_sha256",
-            "posterior",
-            "image_latent_shape",
-            "encode_preprocessing",
-        }
-        if not required.issubset(mage) or mage.get("posterior") != "mean":
-            raise ValueError("checkpoint Mage-VAE provenance is incomplete")
-    elif isinstance(pixels, dict) and mage is None:
-        required = {"kind", "shape", "range", "data_fingerprint", "preprocessing"}
-        if (
-            not required.issubset(pixels)
-            or pixels.get("kind") != "pixels"
-            or pixels.get("shape") != [3, 256, 256]
-            or pixels.get("range") != [-1.0, 1.0]
-        ):
-            raise ValueError("checkpoint pixel provenance is incomplete")
-    else:
-        raise ValueError("checkpoint requires exactly one image-target provenance")
-    if architecture != "latent":
-        semantic = representation_provenance.get("semantic_encoder")
-        if not isinstance(semantic, dict) or not all(
-            semantic.get(key) for key in ("repository", "revision", "fingerprint")
-        ):
-            raise ValueError("cascade checkpoint requires semantic encoder provenance")
-    expected_caches = {"image_latents", "semantic_tokens"}
-    if set(cache_provenance) != expected_caches or not all(cache_provenance.values()):
-        raise ValueError("checkpoint cache provenance is incomplete")
-
-
-@dataclass
-class ResumeState:
-    schema_version: int
-    epoch: int
-    global_step: int
-    last_completed_validation_epoch: int | None
-    wandb_run_id: str | None
-    architecture: str
-    data_fingerprint: str
-    validation_plan_hash: str
-    optimizer: dict[str, Any]
-    rng_streams: dict[str, Tensor]
-    representation_provenance: dict[str, Any]
-    cache_provenance: dict[str, str]
-
-
-def should_checkpoint(completed_epoch: int, total_epochs: int, interval: int) -> bool:
-    return completed_epoch == total_epochs or (
-        interval > 0 and completed_epoch % interval == 0
-    )
-
-
 class EMA:
-    def __init__(self, model: nn.Module, decay: float = 0.9995) -> None:
+    """State-dict EMA that can safely pass through structural LoRA transitions."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999) -> None:
+        if not 0 < decay < 1:
+            raise ValueError("EMA decay must be in (0,1)")
         self.decay = decay
         self.shadow = {
-            key: value.detach().clone() for key, value in model.state_dict().items()
+            name: value.detach().clone() for name, value in clean_state_dict(model).items()
+            if isinstance(value, Tensor)
         }
-        self._floating_keys = tuple(
-            key for key, value in self.shadow.items() if value.is_floating_point()
-        )
-        self._nonfloating_keys = tuple(
-            key for key, value in self.shadow.items() if not value.is_floating_point()
-        )
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        state = model.state_dict()
+        state = _tensor_state(clean_state_dict(model))
         if state.keys() != self.shadow.keys():
-            raise ValueError("EMA state keys do not match model")
-        groups: dict[
-            tuple[torch.device, torch.dtype], tuple[list[Tensor], list[Tensor]]
-        ] = {}
-        for key in self._floating_keys:
-            target = self.shadow[key]
-            source = state[key].detach()
-            if source.device != target.device or source.dtype != target.dtype:
-                raise ValueError("EMA model device or dtype changed after initialization")
-            targets, sources = groups.setdefault(
-                (target.device, target.dtype), ([], [])
-            )
-            targets.append(target)
-            sources.append(source)
-        for targets, sources in groups.values():
-            torch._foreach_lerp_(targets, sources, 1 - self.decay)
-        for key in self._nonfloating_keys:
-            self.shadow[key].copy_(state[key])
+            raise ValueError("EMA keys changed; complete the stage transition first")
+        for name, source in state.items():
+            target = self.shadow[name]
+            if source.is_floating_point():
+                target.lerp_(source.to(target), 1 - self.decay)
+            else:
+                target.copy_(source.to(target))
 
     def state_dict(self) -> dict[str, Tensor]:
         return self.shadow
@@ -131,152 +56,149 @@ class EMA:
     def load_state_dict(self, state: dict[str, Tensor]) -> None:
         if state.keys() != self.shadow.keys():
             raise ValueError("EMA state keys do not match model")
-        for key, value in state.items():
-            self.shadow[key].copy_(value.to(self.shadow[key].device))
+        for name, value in state.items():
+            self.shadow[name].copy_(value.to(self.shadow[name]))
 
     def copy_to(self, model: nn.Module) -> None:
         model.load_state_dict(self.shadow)
 
+    def to_model(self, template: nn.Module) -> Any:
+        result = copy.deepcopy(template)
+        result.load_state_dict(self.shadow)
+        return result
+
+    def replace_from_model(self, model: nn.Module) -> None:
+        self.shadow = {
+            name: value.detach().clone()
+            for name, value in _tensor_state(clean_state_dict(model)).items()
+        }
+
+
+@dataclass(frozen=True)
+class ResumeState:
+    schema_version: int
+    completed_epoch: int
+    global_step: int
+    stage_index: int
+    stage: str
+    epoch_within_stage: int
+    transition_state: str
+    training_complete: bool
+    images_seen: int
+    estimated_flops: int
+    wall_clock_seconds: float
+    optimizer: dict[str, Any] | None
+    scheduler: dict[str, Any] | None
+    rng_streams: dict[str, Any]
+    data_fingerprint: str
+    representation_fingerprint: str
+
 
 class CheckpointManager:
-    def __init__(self, directory: str | Path, keep_last_n: int = 3) -> None:
+    def __init__(self, directory: str | Path, keep_last_n: int = 8) -> None:
         self.directory = Path(directory)
         self.keep_last_n = keep_last_n
         self.directory.mkdir(parents=True, exist_ok=True)
 
-    def save(
+    def _save_named(
         self,
+        name: str,
         *,
-        completed_epoch: int,
-        global_step: int,
         model: nn.Module,
         ema: EMA,
-        optimizer_state: dict[str, Any],
-        rng_streams: dict[str, Tensor],
-        architecture: str,
-        data_fingerprint: str,
-        validation_plan_hash: str,
-        validation_plan_path: str | Path,
-        last_completed_validation_epoch: int | None,
-        wandb_run_id: str | None,
-        resolved_config: dict[str, Any],
-        representation_provenance: dict[str, Any],
-        cache_provenance: dict[str, str],
-        fid: float | None = None,
+        state: ResumeState,
+        config: ExperimentConfig,
+        idempotent: bool,
     ) -> Path:
-        _validate_provenance(
-            architecture, representation_provenance, cache_provenance
-        )
-        configured_architecture = resolved_config.get("model", {}).get("architecture")
-        if configured_architecture != architecture:
-            raise ValueError("checkpoint architecture and resolved config disagree")
-        configured_target = resolved_config.get("model", {}).get(
-            "image_target", "mage_latents"
-        )
-        has_mage = "mage_vae" in representation_provenance
-        if (configured_target == "mage_latents") != has_mage:
-            raise ValueError("checkpoint image target and provenance disagree")
-        model_architecture = getattr(getattr(model, "config", None), "architecture", None)
-        if model_architecture != architecture:
-            raise ValueError("checkpoint architecture and model disagree")
-        name = f"epoch-{completed_epoch:04d}"
         target = self.directory / name
+        metadata = {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "config_schema_version": CONFIG_SCHEMA_VERSION,
+            "name": name,
+            "completed_epoch": state.completed_epoch,
+            "global_step": state.global_step,
+            "stage_index": state.stage_index,
+            "stage": state.stage,
+            "epoch_within_stage": state.epoch_within_stage,
+            "transition_state": state.transition_state,
+            "training_complete": state.training_complete,
+            "images_seen": state.images_seen,
+            "estimated_flops": state.estimated_flops,
+            "wall_clock_seconds": state.wall_clock_seconds,
+            "data_fingerprint": state.data_fingerprint,
+            "representation_fingerprint": state.representation_fingerprint,
+        }
         if target.exists():
+            existing_path = target / "metadata.json"
+            existing = json.loads(existing_path.read_text()) if existing_path.is_file() else None
+            if idempotent and isinstance(existing, dict):
+                stable_keys = (
+                    "schema_version",
+                    "name",
+                    "completed_epoch",
+                    "global_step",
+                    "stage_index",
+                    "stage",
+                    "transition_state",
+                    "data_fingerprint",
+                    "representation_fingerprint",
+                )
+                if all(existing.get(key) == metadata.get(key) for key in stable_keys):
+                    return target
             raise FileExistsError(f"checkpoint already exists: {target}")
         temporary = self.directory / f".{name}.partial-{os.getpid()}"
         temporary.mkdir()
-        save_file(
-            _contiguous(clean_state_dict(model)), str(temporary / "model.safetensors")
-        )
-        save_file(
-            _contiguous(ema.state_dict()), str(temporary / "ema.safetensors")
-        )
-        training = {
-            "schema_version": TRAINING_STATE_SCHEMA_VERSION,
-            "epoch": completed_epoch,
-            "global_step": global_step,
-            "last_completed_validation_epoch": last_completed_validation_epoch,
-            "wandb_run_id": wandb_run_id,
-            "architecture": architecture,
-            "data_fingerprint": data_fingerprint,
-            "validation_plan_hash": validation_plan_hash,
-            "optimizer": optimizer_state,
-            "rng_streams": rng_streams,
-            "representation_provenance": representation_provenance,
-            "cache_provenance": cache_provenance,
-        }
-        torch.save(training, temporary / "training.pt")
-        (temporary / "config.json").write_text(
-            json.dumps(resolved_config, indent=2, sort_keys=True) + "\n"
-        )
-        plan_path = Path(validation_plan_path)
-        if not plan_path.is_file():
-            raise FileNotFoundError(f"validation plan is missing: {plan_path}")
-        plan_state = torch.load(plan_path, map_location="cpu", weights_only=True)
-        if plan_state.get("plan_hash") != validation_plan_hash:
-            raise ValueError("validation plan file and hash do not match")
-        shutil.copy2(plan_path, temporary / "validation-plan.pt")
-        metadata = {
-            "schema_version": CHECKPOINT_SCHEMA_VERSION,
-            "completed_epoch": completed_epoch,
-            "global_step": global_step,
-            "architecture": architecture,
-            "data_fingerprint": data_fingerprint,
-            "validation_plan_hash": validation_plan_hash,
-            "representation_provenance": representation_provenance,
-            "cache_provenance": cache_provenance,
-        }
-        (temporary / "metadata.json").write_text(
-            json.dumps(metadata, indent=2, sort_keys=True) + "\n"
-        )
-        os.replace(temporary, target)
-        self._point("last", name)
-        if fid is not None:
-            self._update_best_fid(fid, name)
-        self._retain()
+        try:
+            save_file(_tensor_state(clean_state_dict(model)), temporary / "model.safetensors")
+            save_file(_tensor_state(ema.state_dict()), temporary / "ema.safetensors")
+            torch.save(asdict(state), temporary / "training.pt")
+            (temporary / "config.json").write_text(
+                json.dumps(config.as_dict(), indent=2, sort_keys=True) + "\n"
+            )
+            (temporary / "metadata.json").write_text(
+                json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+            )
+            os.replace(temporary, target)
+        except BaseException:
+            # Leave partial directories as evidence; subsequent runs never erase them.
+            raise
+        self._point_last(target.name)
         return target
 
-    def _update_best_fid(self, fid: float, name: str) -> None:
-        best_path = self.directory / "best-fid.json"
-        previous = json.loads(best_path.read_text()) if best_path.exists() else None
-        if previous is None or fid < previous["fid"]:
-            best_path.write_text(json.dumps({"fid": fid, "checkpoint": name}) + "\n")
-            self._point("best-fid", name)
-
-    def _point(self, pointer: str, target: str) -> None:
-        link = self.directory / pointer
-        temporary = self.directory / f".{pointer}-{os.getpid()}"
-        if temporary.exists() or temporary.is_symlink():
-            temporary.unlink()
-        temporary.symlink_to(target, target_is_directory=True)
+    def _point_last(self, name: str) -> None:
+        link = self.directory / "last"
+        temporary = self.directory / f".last-{os.getpid()}"
+        temporary.unlink(missing_ok=True)
+        temporary.symlink_to(name, target_is_directory=True)
         os.replace(temporary, link)
 
-    def _retain(self) -> None:
-        if self.keep_last_n <= 0:
-            return
-        checkpoints = sorted(
-            path
-            for path in self.directory.glob("epoch-[0-9][0-9][0-9][0-9]")
-            if path.is_dir()
-        )
-        protected: set[str] = set()
-        best = self.directory / "best-fid"
-        if best.is_symlink():
-            protected.add(os.readlink(best))
-        protected.update(
-            path.name
-            for path in checkpoints
-            if any(
-                child.is_dir() and child.name.startswith("samples-")
-                for child in path.iterdir()
-            )
-        )
-        for path in (
-            item
-            for item in checkpoints[: -self.keep_last_n]
-            if item.name not in protected
-        ):
-            shutil.rmtree(path)
+    def save(
+        self,
+        *,
+        model: nn.Module,
+        ema: EMA,
+        state: ResumeState,
+        config: ExperimentConfig,
+    ) -> Path:
+        name = f"epoch-{state.completed_epoch:04d}"
+        return self._save_named(name, model=model, ema=ema, state=state, config=config, idempotent=False)
+
+    def save_boundary(
+        self,
+        *,
+        target_stage_index: int,
+        position: str,
+        model: nn.Module,
+        ema: EMA,
+        state: ResumeState,
+        config: ExperimentConfig,
+    ) -> Path:
+        if position not in {"before", "after"}:
+            raise ValueError("boundary position must be before or after")
+        if state.transition_state != position:
+            raise ValueError("boundary state and requested position disagree")
+        name = f"boundary-{target_stage_index:02d}-{position}"
+        return self._save_named(name, model=model, ema=ema, state=state, config=config, idempotent=True)
 
     def load(
         self,
@@ -284,64 +206,60 @@ class CheckpointManager:
         model: nn.Module,
         ema: EMA,
         *,
-        expected_architecture: str | None = None,
         expected_data_fingerprint: str | None = None,
-        expected_validation_plan_hash: str | None = None,
-        expected_representation_provenance: dict[str, Any] | None = None,
-        expected_cache_provenance: dict[str, str] | None = None,
+        expected_representation_fingerprint: str | None = None,
     ) -> ResumeState:
         path = Path(checkpoint)
         if not path.is_absolute():
             path = self.directory / path
+        if path.name == "last" and path.is_symlink():
+            path = path.resolve()
         metadata_path = path / "metadata.json"
         if not metadata_path.is_file():
-            raise ValueError("checkpoint predates Cascade DDT; old checkpoints are unsupported")
+            raise ValueError(
+                "checkpoint predates the progressive LightningDiT schema; DDT/Mage "
+                "checkpoints are not supported"
+            )
         metadata = json.loads(metadata_path.read_text())
         if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
-            raise ValueError("checkpoint schema is incompatible; migration is unsupported")
-        from .config import load_checkpoint_config
-
+            raise ValueError("checkpoint schema is incompatible; old checkpoints cannot be migrated")
         config = load_checkpoint_config(path / "config.json")
-        state = torch.load(path / "training.pt", map_location="cpu", weights_only=False)
-        if state.get("schema_version") != TRAINING_STATE_SCHEMA_VERSION:
+        raw = torch.load(path / "training.pt", map_location="cpu", weights_only=False)
+        if raw.get("schema_version") != TRAINING_STATE_SCHEMA_VERSION:
             raise ValueError("checkpoint training-state schema is incompatible")
-        _validate_provenance(
-            state.get("architecture", ""),
-            state.get("representation_provenance", {}),
-            state.get("cache_provenance", {}),
-        )
-        for key in (
-            "architecture",
+        state = ResumeState(**raw)
+        for name in (
+            "completed_epoch",
+            "global_step",
+            "stage_index",
+            "stage",
+            "transition_state",
+            "training_complete",
             "data_fingerprint",
-            "validation_plan_hash",
-            "representation_provenance",
-            "cache_provenance",
+            "representation_fingerprint",
         ):
-            if metadata.get(key) != state.get(key):
-                raise ValueError(f"checkpoint {key} provenance is inconsistent")
-        if config.model.architecture != state["architecture"]:
-            raise ValueError("checkpoint architecture and config are inconsistent")
-        has_mage = "mage_vae" in state["representation_provenance"]
-        if (config.model.image_target == "mage_latents") != has_mage:
-            raise ValueError("checkpoint image target and provenance are inconsistent")
-        checks = (
-            ("architecture", expected_architecture),
+            if metadata.get(name) != getattr(state, name):
+                raise ValueError(f"checkpoint {name} metadata is inconsistent")
+        if state.stage not in config.curriculum.stages:
+            raise ValueError("checkpoint curriculum stage is invalid")
+        if config.curriculum.stages[state.stage_index] != state.stage:
+            raise ValueError("checkpoint curriculum stage index is invalid")
+        if state.training_complete and (
+            state.stage != "rgb" or state.completed_epoch != config.total_epochs
+        ):
+            raise ValueError("completed checkpoint is not at the end of the RGB stage")
+        for name, expected in (
             ("data_fingerprint", expected_data_fingerprint),
-            ("validation_plan_hash", expected_validation_plan_hash),
-            ("representation_provenance", expected_representation_provenance),
-            ("cache_provenance", expected_cache_provenance),
-        )
-        for key, expected in checks:
-            if expected is not None and state[key] != expected:
-                raise ValueError(f"checkpoint {key} mismatch")
-        model.load_state_dict(load_file(str(path / "model.safetensors")))
-        ema.load_state_dict(load_file(str(path / "ema.safetensors")))
-        return ResumeState(**state)
+            ("representation_fingerprint", expected_representation_fingerprint),
+        ):
+            if expected is not None and getattr(state, name) != expected:
+                raise ValueError(f"checkpoint {name} mismatch")
+        model.load_state_dict(load_file(path / "model.safetensors"))
+        ema.load_state_dict(load_file(path / "ema.safetensors"))
+        return state
 
     def export_ema(self, ema: EMA, path: str | Path) -> None:
-        destination = Path(path)
-        temporary = destination.with_suffix(
-            destination.suffix + f".partial-{os.getpid()}"
-        )
-        save_file(_contiguous(ema.state_dict()), str(temporary))
-        os.replace(temporary, destination)
+        target = Path(path)
+        temporary = target.with_suffix(target.suffix + f".partial-{os.getpid()}")
+        save_file(_tensor_state(ema.state_dict()), temporary)
+        os.replace(temporary, target)

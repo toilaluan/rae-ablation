@@ -8,8 +8,10 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
-from .rng import preserve_global_rng
+from .config import ExperimentConfig
+from .rng import RNGStreams, preserve_global_rng
 from .sampling import class_balanced_labels
+from .training import compute_training_loss
 
 
 @dataclass
@@ -103,3 +105,41 @@ def run_preserving_training_state(model: torch.nn.Module, function: object) -> o
             return function()  # type: ignore[operator]
         finally:
             model.train(was_training)
+
+
+@torch.inference_mode()
+def validate_stage_loss(
+    model: torch.nn.Module,
+    loader: object,
+    config: ExperimentConfig,
+    *,
+    stage: str,
+    epoch: int,
+    device: torch.device,
+) -> tuple[float, Tensor | None, Tensor | None]:
+    """Deterministic loss and feature preview inputs for any curriculum stage."""
+    streams = RNGStreams.create(config.experiment.seed + 1_000_003 + epoch, device)
+    losses: list[float] = []
+    preview: Tensor | None = None
+    preview_labels: Tensor | None = None
+    was_training = model.training
+    model.eval()
+    try:
+        for batch_index, batch in enumerate(loader):  # type: ignore[union-attr]
+            if batch_index >= config.validation.batches:
+                break
+            tokens = batch.tokens.to(device, non_blocking=True)
+            labels = batch.labels.to(device, non_blocking=True)
+            result = compute_training_loss(
+                model, tokens, labels, streams, config, stage=stage
+            )
+            losses.append(float(result.loss.total))
+            if preview is None and stage != "rgb":
+                count = min(config.validation.pca_preview_samples, tokens.shape[0])
+                preview = result.clean_prediction[:count].detach().float().cpu()
+                preview_labels = labels[:count].detach().cpu()
+    finally:
+        model.train(was_training)
+    if not losses:
+        raise ValueError("validation loader produced no batches")
+    return sum(losses) / len(losses), preview, preview_labels

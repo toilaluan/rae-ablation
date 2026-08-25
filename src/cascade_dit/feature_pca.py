@@ -10,7 +10,7 @@ from torch import Tensor
 from .sample_runtime import save_preview
 
 
-def semantic_pca_rgb(features: Tensor, image_size: int) -> Tensor:
+def feature_pca_rgb(features: Tensor, image_size: int) -> Tensor:
     """Project each spatial feature map independently onto three PCA components."""
     if (
         features.ndim != 4
@@ -19,7 +19,7 @@ def semantic_pca_rgb(features: Tensor, image_size: int) -> Tensor:
         or features.shape[2] * features.shape[3] < 3
     ):
         raise ValueError(
-            "semantic features must have shape [B,C,H,W] with at least 3 channels and tokens"
+            "features must have shape [B,C,H,W] with at least 3 channels and tokens"
         )
     if image_size < 1:
         raise ValueError("PCA preview image size must be positive")
@@ -48,7 +48,7 @@ def semantic_pca_rgb(features: Tensor, image_size: int) -> Tensor:
     return F.interpolate(rgb, size=(image_size, image_size), mode="bilinear", align_corners=False)
 
 
-def save_semantic_pca_preview(
+def save_feature_pca_preview(
     features: Tensor,
     labels: Tensor,
     target: str | Path,
@@ -56,6 +56,6 @@ def save_semantic_pca_preview(
 ) -> None:
     if labels.shape != (features.shape[0],):
         raise ValueError("PCA preview labels must have shape [B]")
-    images = semantic_pca_rgb(features, image_size).mul(255).round().byte()
+    images = feature_pca_rgb(features, image_size).mul(255).round().byte()
     arrays = images.permute(0, 2, 3, 1).contiguous().numpy()
     save_preview(np.asarray(arrays), labels.detach().cpu().numpy(), Path(target))

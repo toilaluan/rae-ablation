@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import shutil
 import time
 import zipfile
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,84 +16,33 @@ import torch
 from PIL import Image, ImageDraw
 from torch import Tensor
 
-from .validation import ValidationPlan
+SAMPLING_MANIFEST_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
 class SamplingParameters:
-    batch_size: int = 32
-    semantic_steps: int = 10
-    image_steps: int = 40
+    steps: int = 40
     solver: str = "euler"
-    semantic_timestep_shift: float = 1.0
-    image_timestep_shift: float = 1.0
-    semantic_guidance_scale: float = 1.78
-    semantic_guidance_start: float = 0.1
-    semantic_guidance_end: float = 1.0
-    class_guidance_scale: float = 1.0
-    class_guidance_start: float = 0.0
-    class_guidance_end: float = 1.0
-    log_interval: int = 10
+    timestep_shift: float = 1.0
+    guidance_scale: float = 1.0
+    guidance_start: float = 0.0
+    guidance_end: float = 1.0
+    batch_size: int = 32
+    seed: int = 0
 
     @property
     def sampling_nfe(self) -> int:
-        steps = self.semantic_steps + self.image_steps
-        if self.solver == "euler":
-            return steps
-        if self.solver == "heun":
-            active_routes = 1 + int(self.semantic_steps > 0)
-            return 2 * steps - active_routes
-        raise ValueError("sampling solver must be euler or heun")
+        return self.steps if self.solver == "euler" else 2 * self.steps - 1
 
     def validate(self) -> None:
-        if min(self.batch_size, self.image_steps, self.log_interval) < 1:
-            raise ValueError("sampling batch size, image steps, and log interval must be positive")
-        if self.semantic_steps < 0:
-            raise ValueError("semantic sampling steps cannot be negative")
+        if min(self.steps, self.batch_size) < 1:
+            raise ValueError("sampling steps and batch size must be positive")
         if self.solver not in {"euler", "heun"}:
             raise ValueError("sampling solver must be euler or heun")
-        for name, shift in (
-            ("semantic timestep shift", self.semantic_timestep_shift),
-            ("image timestep shift", self.image_timestep_shift),
-        ):
-            if not math.isfinite(shift) or shift <= 0:
-                raise ValueError(f"{name} must be finite and positive")
-        if not math.isfinite(self.semantic_guidance_scale) or not math.isfinite(self.class_guidance_scale):
-            raise ValueError("guidance scales must be finite")
-        if not 0 <= self.semantic_guidance_start < self.semantic_guidance_end <= 1:
-            raise ValueError("semantic guidance interval must satisfy 0 <= start < end <= 1")
-        if not 0 <= self.class_guidance_start < self.class_guidance_end <= 1:
-            raise ValueError("class guidance interval must satisfy 0 <= start < end <= 1")
-
-
-GenerateBatch = Callable[[Tensor, Tensor, Tensor], Tensor]
-SAMPLING_MANIFEST_SCHEMA_VERSION = 1
-REPRESENTATION_SCHEMA_VERSION = 1
-
-
-def _float_slug(value: float) -> str:
-    return repr(float(value)).replace("-", "m").replace("+", "").replace(".", "p")
-
-
-def sampling_output_name(sample_count: int, parameters: SamplingParameters) -> str:
-    parameters.validate()
-    if sample_count < 1:
-        raise ValueError("sample count must be positive")
-    shift_slug = (
-        f"-shift{_float_slug(parameters.image_timestep_shift)}"
-        if parameters.semantic_timestep_shift == parameters.image_timestep_shift
-        else f"-semantic-shift{_float_slug(parameters.semantic_timestep_shift)}"
-        f"-image-shift{_float_slug(parameters.image_timestep_shift)}"
-    )
-    return (
-        f"samples-{parameters.solver}-n{sample_count}"
-        f"-semantic{parameters.semantic_steps}-image{parameters.image_steps}"
-        f"-semantic-guidance{_float_slug(parameters.semantic_guidance_scale)}"
-        f"-class-guidance{_float_slug(parameters.class_guidance_scale)}"
-        f"{shift_slug}"
-        f"-semantic-window{_float_slug(parameters.semantic_guidance_start)}-{_float_slug(parameters.semantic_guidance_end)}"
-        f"-class-window{_float_slug(parameters.class_guidance_start)}-{_float_slug(parameters.class_guidance_end)}"
-    )
+        if self.timestep_shift <= 0:
+            raise ValueError("sampling timestep shift must be positive")
+        if not 0 <= self.guidance_start < self.guidance_end <= 1:
+            raise ValueError("sampling CFG interval must satisfy 0 <= start < end <= 1")
 
 
 def checkpoint_sha256(path: str | Path) -> str:
@@ -112,388 +60,178 @@ def state_dict_sha256(state: Mapping[str, Tensor]) -> str:
         digest.update(name.encode())
         digest.update(str(value.dtype).encode())
         digest.update(np.asarray(value.shape, dtype=np.int64).tobytes())
-        digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
+        digest.update(value.view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
 
 
-def validate_sampling_plan(
-    plan: ValidationPlan, sample_count: int, num_classes: int
-) -> tuple[Tensor, Tensor, Tensor]:
-    if sample_count < 1 or sample_count % num_classes:
-        raise ValueError("sample count must be positive and divisible by model.num_classes")
-    if min(plan.labels.numel(), plan.sample_ids.numel(), plan.noise_seeds.numel()) < sample_count:
-        raise ValueError(f"sampling plan does not contain {sample_count} samples")
-    labels = plan.labels[:sample_count].to(torch.int64)
-    sample_ids = plan.sample_ids[:sample_count].to(torch.int64)
-    noise_seeds = plan.noise_seeds[:sample_count].to(torch.int64)
-    if torch.any(labels < 0) or torch.any(labels >= num_classes):
-        raise ValueError("sampling plan contains a label outside model.num_classes")
-    counts = torch.bincount(labels, minlength=num_classes)
-    expected = sample_count // num_classes
-    if counts.numel() != num_classes or not torch.all(counts == expected):
-        raise ValueError(f"sampling plan must contain exactly {expected} samples per class")
-    if sample_ids.unique().numel() != sample_count or torch.any(sample_ids < 0):
-        raise ValueError("sampling plan sample IDs must be unique and non-negative")
-    return labels, sample_ids, noise_seeds
+def noise_for_seeds(
+    seeds: Tensor,
+    shape: tuple[int, ...],
+    device: torch.device | str,
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    values = [
+        torch.randn(shape, generator=torch.Generator().manual_seed(int(seed)), dtype=dtype)
+        for seed in seeds.cpu()
+    ]
+    return torch.stack(values).to(device)
 
 
-def _write_json_atomic(path: Path, values: dict[str, Any]) -> None:
+def sampling_plan(num_samples: int, num_classes: int, seed: int) -> tuple[Tensor, Tensor]:
+    if num_samples < 1 or num_samples % num_classes:
+        raise ValueError("sample count must be positive and divisible by num_classes")
+    labels = torch.arange(num_samples, dtype=torch.int64) % num_classes
+    permutation = torch.randperm(num_samples, generator=torch.Generator().manual_seed(seed))
+    labels = labels[permutation]
+    seeds = torch.arange(num_samples, dtype=torch.int64) + seed * 1_000_003
+    return labels, seeds
+
+
+def sampling_plan_hash(labels: Tensor, seeds: Tensor) -> str:
+    digest = hashlib.sha256()
+    digest.update(labels.numpy().tobytes())
+    digest.update(seeds.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def sampling_output_name(num_samples: int, parameters: SamplingParameters) -> str:
+    parameters.validate()
+    return (
+        f"samples-{parameters.solver}-n{num_samples}-steps{parameters.steps}"
+        f"-cfg{parameters.guidance_scale:g}-shift{parameters.timestep_shift:g}"
+    )
+
+
+def _write_json(path: Path, values: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + f".partial-{os.getpid()}")
     temporary.write_text(json.dumps(values, indent=2, sort_keys=True) + "\n")
     os.replace(temporary, path)
 
 
-def _distributed() -> tuple[int, int]:
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(), torch.distributed.get_world_size()
-    return 0, 1
-
-
-def _barrier() -> None:
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        torch.distributed.barrier()
-
-
-def _peak_memory_gib() -> float:
-    return torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
-
-
-def _paths(output_dir: Path) -> dict[str, Path]:
-    return {
-        "archive": output_dir / "samples.npz",
-        "manifest": output_dir / "samples.json",
-        "preview": output_dir / "preview.png",
-        "images": output_dir / ".samples-arr_0.npy",
-        "labels": output_dir / ".samples-arr_1.npy",
-        "completion": output_dir / ".samples-completion.npy",
-    }
-
-
-def _manifest_base(
-    *,
-    checkpoint_hash: str,
-    plan: ValidationPlan,
-    labels: Tensor,
-    sample_ids: Tensor,
-    sample_count: int,
-    num_classes: int,
-    image_size: int,
-    patch_size: int,
-    grid_size: int,
-    architecture: str,
-    representation_schema: dict[str, Any],
-    parameters: SamplingParameters,
-) -> dict[str, Any]:
-    counts = torch.bincount(labels, minlength=num_classes)
-    ids_digest = hashlib.sha256(sample_ids.numpy().tobytes()).hexdigest()
-    sampling: dict[str, Any] = {
-        "solver": parameters.solver,
-        "semantic_steps": parameters.semantic_steps,
-        "image_steps": parameters.image_steps,
-        "sampling_steps": parameters.semantic_steps + parameters.image_steps,
-        "sampling_nfe": parameters.sampling_nfe,
-        "semantic_guidance_scale": parameters.semantic_guidance_scale,
-        "semantic_guidance_interval": [
-            parameters.semantic_guidance_start,
-            parameters.semantic_guidance_end,
-        ],
-        "class_guidance_scale": parameters.class_guidance_scale,
-        "class_guidance_interval": [
-            parameters.class_guidance_start,
-            parameters.class_guidance_end,
-        ],
-    }
-    if parameters.semantic_timestep_shift == parameters.image_timestep_shift:
-        sampling["timestep_shift"] = parameters.image_timestep_shift
-    else:
-        sampling["semantic_timestep_shift"] = parameters.semantic_timestep_shift
-        sampling["image_timestep_shift"] = parameters.image_timestep_shift
-    return {
-        "schema_version": SAMPLING_MANIFEST_SCHEMA_VERSION,
-        "checkpoint_sha256": checkpoint_hash,
-        "validation_plan_hash": plan.plan_hash,
-        "sample_ids_sha256": ids_digest,
-        "image_size": image_size,
-        "patch_size": patch_size,
-        "token_grid_size": grid_size,
-        "architecture": architecture,
-        "representation_schema": representation_schema,
-        "sample_count": sample_count,
-        "num_classes": num_classes,
-        "class_counts": counts.tolist(),
-        "image_shape": [image_size, image_size, 3],
-        "image_dtype": "uint8",
-        "sampling": sampling,
-    }
-
-
-def _load_memmaps(paths: dict[str, Path], mode: str = "r+") -> tuple[np.memmap, ...]:
-    images = np.load(paths["images"], mmap_mode=mode, allow_pickle=False)
-    labels = np.load(paths["labels"], mmap_mode=mode, allow_pickle=False)
-    completion = np.load(paths["completion"], mmap_mode=mode, allow_pickle=False)
-    if not all(isinstance(value, np.memmap) for value in (images, labels, completion)):
-        raise RuntimeError("temporary sampling arrays are not memory mapped")
-    return images, labels, completion
-
-
-def _initialize_or_resume(
-    output_dir: Path,
-    paths: dict[str, Path],
-    base: dict[str, Any],
-    labels: Tensor,
-) -> tuple[bool, int]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if paths["manifest"].exists():
-        existing = json.loads(paths["manifest"].read_text())
-        if existing.get("schema_version") != SAMPLING_MANIFEST_SCHEMA_VERSION:
-            raise ValueError(
-                "sampling manifest uses an incompatible schema; old manifests "
-                "cannot be resumed"
-            )
-        comparable = {key: existing.get(key) for key in base}
-        if comparable != base:
-            raise ValueError("existing sampling manifest does not match this request")
-        if existing.get("complete"):
-            if not paths["archive"].exists() or not paths["preview"].exists():
-                raise ValueError("completed sampling manifest is missing final artifacts")
-            for key in ("images", "labels", "completion"):
-                paths[key].unlink(missing_ok=True)
-            return True, int(base["sample_count"])
-        if not all(paths[key].exists() for key in ("images", "labels", "completion")):
-            raise ValueError("interrupted sampling run is missing temporary storage")
-        images_mm, labels_mm, completion_mm = _load_memmaps(paths)
-        image_size = int(base["image_size"])
-        expected_images = (base["sample_count"], image_size, image_size, 3)
-        if images_mm.shape != expected_images or images_mm.dtype != np.uint8:
-            raise ValueError("temporary image array does not match the sampling manifest")
-        if labels_mm.shape != (base["sample_count"],) or labels_mm.dtype != np.int64:
-            raise ValueError("temporary label array does not match the sampling manifest")
-        if completion_mm.shape != (base["sample_count"],) or completion_mm.dtype != np.uint8:
-            raise ValueError("temporary completion bitmap does not match the sampling manifest")
-        if not np.array_equal(labels_mm, labels.numpy()):
-            raise ValueError("temporary labels do not match the sampling plan")
-        completed = int(np.count_nonzero(completion_mm))
-        if paths["archive"].exists():
-            if completed != int(base["sample_count"]):
-                raise ValueError("final sample archive exists before sampling completed")
-            with zipfile.ZipFile(paths["archive"]) as archive:
-                if set(archive.namelist()) != {"arr_0.npy", "arr_1.npy"}:
-                    raise ValueError("final sample archive has unexpected members")
-                if archive.getinfo("arr_0.npy").file_size != paths["images"].stat().st_size:
-                    raise ValueError("final sample archive image payload has the wrong size")
-                if archive.getinfo("arr_1.npy").file_size != paths["labels"].stat().st_size:
-                    raise ValueError("final sample archive label payload has the wrong size")
-            save_preview(images_mm[:16], labels_mm[:16], paths["preview"])
-            _write_json_atomic(
-                paths["manifest"],
-                {**base, "complete": True, "completed_samples": completed},
-            )
-            del images_mm, labels_mm, completion_mm
-            for key in ("images", "labels", "completion"):
-                paths[key].unlink()
-            return True, completed
-        return False, completed
-
-    if any(paths[key].exists() for key in ("archive", "images", "labels", "completion")):
-        raise ValueError("refusing to sample into untracked existing artifacts")
-    count = int(base["sample_count"])
-    images_mm = np.lib.format.open_memmap(
-        paths["images"],
-        mode="w+",
-        dtype=np.uint8,
-        shape=(count, int(base["image_size"]), int(base["image_size"]), 3),
-    )
-    labels_mm = np.lib.format.open_memmap(
-        paths["labels"], mode="w+", dtype=np.int64, shape=(count,)
-    )
-    completion_mm = np.lib.format.open_memmap(
-        paths["completion"], mode="w+", dtype=np.uint8, shape=(count,)
-    )
-    labels_mm[:] = labels.numpy()
-    completion_mm[:] = 0
-    images_mm.flush()
-    labels_mm.flush()
-    completion_mm.flush()
-    _write_json_atomic(paths["manifest"], {**base, "complete": False, "completed_samples": 0})
-    return False, 0
-
-
-def _as_uint8_nhwc(images: Tensor, expected: int, image_size: int) -> np.ndarray:
-    if images.ndim != 4 or images.shape != (expected, 3, image_size, image_size):
-        raise ValueError(
-            f"generator must return {expected}x3x{image_size}x{image_size} images, "
-            f"received {tuple(images.shape)}"
-        )
-    if not images.is_floating_point():
-        raise ValueError("generator output must be floating point in [0, 1]")
-    pixels = images.detach().float().clamp(0, 1).mul(255).round().byte().cpu()
-    return pixels.permute(0, 2, 3, 1).contiguous().numpy()
-
-
 def _write_zip_member(archive: zipfile.ZipFile, source: Path, name: str) -> None:
-    with (
-        source.open("rb") as input_handle,
-        archive.open(name, mode="w", force_zip64=True) as output_handle,
-    ):
-        shutil.copyfileobj(input_handle, output_handle, length=8 * 1024 * 1024)
+    with source.open("rb") as source_handle, archive.open(
+        name, mode="w", force_zip64=True
+    ) as target_handle:
+        shutil.copyfileobj(source_handle, target_handle, length=8 * 1024 * 1024)
 
 
-def package_npz(images_path: Path, labels_path: Path, target: Path) -> None:
+def _package(images: Path, labels: Path, target: Path) -> None:
     temporary = target.with_suffix(target.suffix + f".partial-{os.getpid()}")
-    try:
-        with zipfile.ZipFile(
-            temporary, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True
-        ) as archive:
-            _write_zip_member(archive, images_path, "arr_0.npy")
-            _write_zip_member(archive, labels_path, "arr_1.npy")
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with zipfile.ZipFile(
+        temporary, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True
+    ) as archive:
+        _write_zip_member(archive, images, "arr_0.npy")
+        _write_zip_member(archive, labels, "arr_1.npy")
+    os.replace(temporary, target)
 
 
-def save_preview(images: np.ndarray, labels: np.ndarray, target: Path) -> None:
+def _save_preview(images: np.ndarray, labels: np.ndarray, target: Path) -> None:
     count = min(16, len(images))
-    if count < 1:
-        raise ValueError("cannot create a preview without samples")
-    height, width = images.shape[1:3]
-    caption_height = 20
-    canvas = Image.new("RGB", (4 * width, 4 * (height + caption_height)), "white")
+    side = images.shape[1]
+    canvas = Image.new("RGB", (4 * side, 4 * (side + 18)), "white")
     draw = ImageDraw.Draw(canvas)
     for index in range(count):
         row, column = divmod(index, 4)
-        x, y = column * width, row * (height + caption_height)
-        canvas.paste(Image.fromarray(np.asarray(images[index]), mode="RGB"), (x, y))
-        draw.text((x + 3, y + height + 3), f"class {int(labels[index])}", fill="black")
-    temporary = target.with_suffix(target.suffix + f".partial-{os.getpid()}")
-    canvas.save(temporary, format="PNG")
-    os.replace(temporary, target)
+        x, y = column * side, row * (side + 18)
+        canvas.paste(Image.fromarray(images[index]), (x, y))
+        draw.text((x + 2, y + side + 1), str(int(labels[index])), fill="black")
+    canvas.save(target)
+
+
+save_preview = _save_preview
+
+
+GenerateBatch = Callable[[Tensor, Tensor], Tensor]
 
 
 def sample_to_archive(
     *,
-    output_dir: str | Path,
-    plan: ValidationPlan,
-    sample_count: int,
+    output_directory: str | Path,
+    num_samples: int,
     num_classes: int,
     image_size: int,
-    patch_size: int,
-    grid_size: int,
-    architecture: str,
-    representation_schema: dict[str, Any],
     checkpoint_hash: str,
     parameters: SamplingParameters,
     generate_batch: GenerateBatch,
 ) -> Path:
-    """Generate a resumable, class-balanced ADM-compatible sample archive."""
     parameters.validate()
-    if image_size < 1 or patch_size < 1 or grid_size < 1:
-        raise ValueError("image size, patch size, and model grid must be positive")
-    if not architecture:
-        raise ValueError("architecture cannot be empty")
-    if representation_schema.get("schema_version") != REPRESENTATION_SCHEMA_VERSION:
-        raise ValueError(
-            f"sampling requires a schema-v{REPRESENTATION_SCHEMA_VERSION} representation description"
+    output = Path(output_directory)
+    output.mkdir(parents=True, exist_ok=True)
+    labels, seeds = sampling_plan(num_samples, num_classes, parameters.seed)
+    plan_hash = sampling_plan_hash(labels, seeds)
+    images_path = output / ".images.npy"
+    labels_path = output / ".labels.npy"
+    completion_path = output / ".completion.npy"
+    archive_path = output / "samples.npz"
+    manifest_path = output / "samples.json"
+    base = {
+        "schema_version": SAMPLING_MANIFEST_SCHEMA_VERSION,
+        "checkpoint_sha256": checkpoint_hash,
+        "sampling_plan_hash": plan_hash,
+        "num_samples": num_samples,
+        "num_classes": num_classes,
+        "image_size": image_size,
+        "parameters": asdict(parameters),
+    }
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+        if {key: manifest.get(key) for key in base} != base:
+            raise ValueError("existing sample manifest does not match this request")
+        if manifest.get("complete"):
+            if not archive_path.is_file():
+                raise ValueError("completed sample manifest is missing its archive")
+            return archive_path
+    elif any(path.exists() for path in (images_path, labels_path, completion_path, archive_path)):
+        raise ValueError("refusing to overwrite untracked sample artifacts")
+    else:
+        images = np.lib.format.open_memmap(
+            images_path, mode="w+", dtype=np.uint8, shape=(num_samples, image_size, image_size, 3)
         )
-    labels, sample_ids, noise_seeds = validate_sampling_plan(plan, sample_count, num_classes)
-    output_dir = Path(output_dir)
-    paths = _paths(output_dir)
-    base = _manifest_base(
-        checkpoint_hash=checkpoint_hash,
-        plan=plan,
-        labels=labels,
-        sample_ids=sample_ids,
-        sample_count=sample_count,
-        num_classes=num_classes,
-        image_size=image_size,
-        patch_size=patch_size,
-        grid_size=grid_size,
-        architecture=architecture,
-        representation_schema=representation_schema,
-        parameters=parameters,
-    )
-    rank, world_size = _distributed()
-    state: list[Any] = [False, 0, None]
-    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
-    if not distributed:
-        state[0], state[1] = _initialize_or_resume(output_dir, paths, base, labels)
-    elif rank == 0:
-        try:
-            state[0], state[1] = _initialize_or_resume(output_dir, paths, base, labels)
-        except Exception as error:  # broadcast rank-zero setup failures before any barrier
-            state[2] = f"{type(error).__name__}: {error}"
-    if distributed:
-        torch.distributed.broadcast_object_list(state, src=0)
-    if state[2] is not None:
-        raise RuntimeError(state[2])
-    if rank == 0:
-        status = "complete" if state[0] else "resuming" if state[1] else "new"
-        print(
-            f"sampling configuration: samples={sample_count} classes={num_classes} "
-            f"batch_size={parameters.batch_size} solver={parameters.solver} "
-            f"semantic_steps={parameters.semantic_steps} "
-            f"image_steps={parameters.image_steps} nfe={parameters.sampling_nfe} "
-            f"semantic_guidance={parameters.semantic_guidance_scale:g} "
-            f"class_guidance={parameters.class_guidance_scale:g} "
-            f"semantic_timestep_shift={parameters.semantic_timestep_shift:g} "
-            f"image_timestep_shift={parameters.image_timestep_shift:g} "
-            f"semantic_guidance_interval=[{parameters.semantic_guidance_start:g}, {parameters.semantic_guidance_end:g}] "
-            f"class_guidance_interval=[{parameters.class_guidance_start:g}, {parameters.class_guidance_end:g}]"
+        saved_labels = np.lib.format.open_memmap(
+            labels_path, mode="w+", dtype=np.int64, shape=(num_samples,)
         )
-        print(f"sampling state: {status}, completed={state[1]}/{sample_count}")
-    if state[0]:
-        if rank == 0:
-            print(f"preview: {paths['preview']}")
-            print(f"sample archive: {paths['archive']}")
-        return paths["archive"]
-
-    _barrier()
-    images_mm, _labels_mm, completion_mm = _load_memmaps(paths)
-    local_positions = torch.arange(rank, sample_count, world_size, dtype=torch.int64)
-    pending = local_positions[
-        torch.from_numpy(np.asarray(completion_mm[local_positions.numpy()] == 0))
-    ]
+        completion = np.lib.format.open_memmap(
+            completion_path, mode="w+", dtype=np.uint8, shape=(num_samples,)
+        )
+        saved_labels[:] = labels.numpy()
+        completion[:] = 0
+        images.flush()
+        saved_labels.flush()
+        completion.flush()
+        _write_json(manifest_path, base | {"complete": False, "completed_samples": 0})
+    images = np.load(images_path, mmap_mode="r+")
+    saved_labels = np.load(labels_path, mmap_mode="r+")
+    completion = np.load(completion_path, mmap_mode="r+")
+    if not np.array_equal(saved_labels, labels.numpy()):
+        raise ValueError("saved labels differ from the deterministic sampling plan")
     started = time.perf_counter()
-    completed_at_start = int(state[1])
-    for batch_index, begin in enumerate(range(0, pending.numel(), parameters.batch_size), start=1):
-        positions = pending[begin : begin + parameters.batch_size]
-        decoded = generate_batch(positions, labels[positions], noise_seeds[positions])
-        images_mm[positions.numpy()] = _as_uint8_nhwc(decoded, positions.numel(), image_size)
-        images_mm.flush()
-        completion_mm[positions.numpy()] = 1
-        completion_mm.flush()
-        if rank == 0 and batch_index % parameters.log_interval == 0:
-            complete = int(np.count_nonzero(completion_mm))
-            elapsed = max(time.perf_counter() - started, 1e-9)
-            rate = (complete - completed_at_start) / elapsed
-            eta = (sample_count - complete) / rate if rate > 0 else float("inf")
-            _write_json_atomic(
-                paths["manifest"],
-                {**base, "complete": False, "completed_samples": complete},
-            )
-            print(
-                f"sampling progress: {complete}/{sample_count} images, {rate:.2f} images/s, "
-                f"ETA={eta:.0f}s, peak_memory={_peak_memory_gib():.2f} GiB"
-            )
-
-    images_mm.flush()
-    completion_mm.flush()
-    del images_mm, _labels_mm, completion_mm
-    _barrier()
-    if rank == 0:
-        images_mm, labels_mm, completion_mm = _load_memmaps(paths)
-        complete = int(np.count_nonzero(completion_mm))
-        if complete != sample_count or not np.all(completion_mm == 1):
-            raise RuntimeError(f"sampling finished with {sample_count - complete} missing images")
-        package_npz(paths["images"], paths["labels"], paths["archive"])
-        save_preview(images_mm[:16], labels_mm[:16], paths["preview"])
-        _write_json_atomic(
-            paths["manifest"],
-            {**base, "complete": True, "completed_samples": sample_count},
+    for beginning in range(0, num_samples, parameters.batch_size):
+        end = min(beginning + parameters.batch_size, num_samples)
+        if np.all(completion[beginning:end] == 1):
+            continue
+        generated = generate_batch(labels[beginning:end], seeds[beginning:end])
+        if generated.shape != (end - beginning, 3, image_size, image_size):
+            raise ValueError("sample generator returned an invalid image shape")
+        pixels = generated.detach().float().clamp(0, 1).mul(255).round().byte()
+        images[beginning:end] = pixels.permute(0, 2, 3, 1).cpu().numpy()
+        images.flush()
+        completion[beginning:end] = 1
+        completion.flush()
+        _write_json(
+            manifest_path,
+            base | {"complete": False, "completed_samples": int(np.count_nonzero(completion))},
         )
-        del images_mm, labels_mm, completion_mm
-        for key in ("images", "labels", "completion"):
-            paths[key].unlink()
-        print(f"preview: {paths['preview']}")
-        print(f"sample archive: {paths['archive']}")
-    _barrier()
-    return paths["archive"]
+    _package(images_path, labels_path, archive_path)
+    _save_preview(images[:16], saved_labels[:16], output / "preview.png")
+    elapsed = time.perf_counter() - started
+    _write_json(
+        manifest_path,
+        base
+        | {
+            "complete": True,
+            "completed_samples": num_samples,
+            "wall_clock_seconds": elapsed,
+        },
+    )
+    return archive_path

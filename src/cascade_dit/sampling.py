@@ -1,269 +1,109 @@
 from __future__ import annotations
 
-import math
+from collections.abc import Callable
 from itertools import pairwise
-from typing import Literal, NamedTuple
 
 import torch
 from torch import Tensor, nn
 
 from .objective import shift_timestep, x0_to_velocity
 
-Solver = Literal["euler", "heun"]
-
-
-class GeneratedRepresentations(NamedTuple):
-    semantic_tokens: Tensor | None
-    image_latents: Tensor
-
 
 def class_balanced_labels(sample_count: int, num_classes: int) -> Tensor:
     if sample_count < 1 or num_classes < 1 or sample_count % num_classes:
-        raise ValueError("sample count must be positive and class balanced")
-    return torch.arange(sample_count, dtype=torch.int64).remainder(num_classes)
+        raise ValueError("sample count must be positive and divisible by num_classes")
+    return torch.arange(sample_count, dtype=torch.int64) % num_classes
 
 
-def _owner(model: nn.Module) -> nn.Module:
-    return getattr(model, "module", model)
+def _prediction(output: object) -> Tensor:
+    if isinstance(output, Tensor):
+        return output
+    value = getattr(output, "prediction", None)
+    if not isinstance(value, Tensor):
+        raise TypeError("model output must be a tensor or expose .prediction")
+    return value
 
 
-def _schedule(steps: int, timestep_shift: float, device: torch.device) -> Tensor:
-    if steps < 1:
-        raise ValueError("sampling steps must be positive")
-    return shift_timestep(
-        torch.linspace(1, 0, steps + 1, device=device), timestep_shift
+def _model_x0(
+    model: nn.Module,
+    values: Tensor,
+    timestep: Tensor,
+    labels: Tensor,
+    *,
+    num_classes: int,
+    guidance_scale: float,
+    guidance_start: float,
+    guidance_end: float,
+) -> Tensor:
+    progress = float(1 - timestep[0].item())
+    active = guidance_scale != 1 and guidance_start <= progress <= guidance_end
+    if not active:
+        return _prediction(model(values, timestep, labels, stage="rgb"))
+    combined_values = torch.cat((values, values))
+    combined_time = torch.cat((timestep, timestep))
+    unconditional = torch.full_like(labels, num_classes)
+    combined_labels = torch.cat((labels, unconditional))
+    conditional, unconditional_prediction = _prediction(
+        model(combined_values, combined_time, combined_labels, stage="rgb")
+    ).chunk(2)
+    return unconditional_prediction + guidance_scale * (
+        conditional - unconditional_prediction
     )
 
 
-def _validate_common(
+@torch.no_grad()
+def sample_tokens(
+    model: nn.Module,
     noise: Tensor,
     labels: Tensor,
     *,
-    timestep_shift: float,
-    solver: Solver,
-) -> None:
-    if labels.shape != (noise.shape[0],):
-        raise ValueError("labels must have shape [B]")
-    if solver not in {"euler", "heun"}:
-        raise ValueError("sampling solver must be euler or heun")
-    if not math.isfinite(timestep_shift) or timestep_shift <= 0:
-        raise ValueError("timestep shift must be finite and positive")
-
-
-def _integrate(
-    state: Tensor,
-    schedule: Tensor,
-    predict_x0: object,
-    solver: Solver,
-    velocity_denominator_floor: float,
-) -> Tensor:
-    prediction_function = predict_x0
-    for step_index, (current, following) in enumerate(pairwise(schedule), start=1):
-        prediction = prediction_function(state, current)  # type: ignore[operator]
-        velocity = x0_to_velocity(
-            state,
-            prediction,
-            current.expand(state.shape[0]),
-            velocity_denominator_floor,
-        )
-        step_size = following - current
-        proposed = state + step_size * velocity
-        if solver == "heun" and step_index < schedule.numel() - 1:
-            corrected_prediction = prediction_function(  # type: ignore[operator]
-                proposed, following
-            )
-            corrected_velocity = x0_to_velocity(
-                proposed,
-                corrected_prediction,
-                following.expand(state.shape[0]),
-                velocity_denominator_floor,
-            )
-            state = state + 0.5 * step_size * (velocity + corrected_velocity)
-        else:
-            state = proposed
-    return state
-
-
-@torch.inference_mode()
-def sample_semantic_tokens(
-    model: nn.Module,
-    semantic_noise: Tensor,
-    labels: Tensor,
-    *,
-    steps: int = 10,
-    timestep_shift: float = 1.0,
-    semantic_guidance_scale: float = 1.78,
-    semantic_guidance_interval: tuple[float, float] = (0.1, 1.0),
-    solver: Solver = "euler",
-    velocity_denominator_floor: float = 0.05,
-) -> Tensor:
-    _validate_common(
-        semantic_noise, labels, timestep_shift=timestep_shift, solver=solver
-    )
-    if not math.isfinite(semantic_guidance_scale):
-        raise ValueError("semantic guidance scale must be finite")
-    if not 0 <= semantic_guidance_interval[0] < semantic_guidance_interval[1] <= 1:
-        raise ValueError("semantic guidance interval must satisfy 0 <= start < end <= 1")
-    method = getattr(_owner(model), "forward_semantic_predictions", None)
-    if not callable(method):
-        raise TypeError("model does not provide semantic prediction")
-
-    def predict(state: Tensor, timestep: Tensor) -> Tensor:
-        model_timestep = timestep.expand(state.shape[0])
-        predictions = method(state.to(semantic_noise.dtype), model_timestep, labels)
-        full, base = predictions.full.float(), predictions.base.float()
-        active = (
-            (model_timestep >= semantic_guidance_interval[0])
-            & (model_timestep <= semantic_guidance_interval[1])
-        ).reshape(-1, 1, 1, 1)
-        guided = base + semantic_guidance_scale * (full - base)
-        return torch.where(active, guided, full)
-
-    return _integrate(
-        semantic_noise.float(),
-        _schedule(steps, timestep_shift, semantic_noise.device),
-        predict,
-        solver,
-        velocity_denominator_floor,
-    )
-
-
-@torch.inference_mode()
-def sample_image_latents(
-    model: nn.Module,
-    image_noise: Tensor,
-    labels: Tensor,
-    semantic_tokens: Tensor | None = None,
-    *,
     steps: int = 40,
+    solver: str = "euler",
     timestep_shift: float = 1.0,
-    class_guidance_scale: float = 1.0,
-    class_guidance_interval: tuple[float, float] = (0.0, 1.0),
-    solver: Solver = "euler",
-    num_classes: int | None = None,
-    velocity_denominator_floor: float = 0.05,
+    guidance_scale: float = 1.0,
+    guidance_start: float = 0.0,
+    guidance_end: float = 1.0,
+    denominator_floor: float = 0.05,
+    num_classes: int = 1000,
+    callback: Callable[[int, Tensor], None] | None = None,
 ) -> Tensor:
-    _validate_common(image_noise, labels, timestep_shift=timestep_shift, solver=solver)
-    if not math.isfinite(class_guidance_scale):
-        raise ValueError("class guidance scale must be finite")
-    if not 0 <= class_guidance_interval[0] < class_guidance_interval[1] <= 1:
-        raise ValueError("class guidance interval must satisfy 0 <= start < end <= 1")
-    owner = _owner(model)
-    if num_classes is None:
-        num_classes = getattr(getattr(owner, "config", None), "num_classes", None)
-    if not isinstance(num_classes, int) or num_classes < 1:
-        raise ValueError("num_classes is required")
-    method = getattr(owner, "forward_image_prediction", None)
-    if not callable(method):
-        raise TypeError("model does not provide image-latent prediction")
-    if semantic_tokens is not None and semantic_tokens.shape[0] != image_noise.shape[0]:
-        raise ValueError("semantic tokens and image noise batch sizes must match")
-    null_labels = torch.full_like(labels, num_classes)
+    """Integrate one RGB Gaussian-flow trajectory from t=1 to t=0."""
+    if steps < 1 or solver not in {"euler", "heun"}:
+        raise ValueError("sampling requires positive steps and the euler or heun solver")
+    if not 0 <= guidance_start < guidance_end <= 1:
+        raise ValueError("CFG interval must satisfy 0 <= start < end <= 1")
+    if labels.shape != (noise.shape[0],):
+        raise ValueError("sampling labels must have shape [B]")
+    base_grid = torch.linspace(1, 0, steps + 1, device=noise.device, dtype=torch.float32)
+    grid = shift_timestep(base_grid, timestep_shift)
+    values = noise
 
-    def predict(state: Tensor, timestep: Tensor) -> Tensor:
-        use_guidance = class_guidance_scale != 1.0
-        copies = 2 if use_guidance else 1
-        model_state = torch.cat((state, state)) if use_guidance else state
-        model_timestep = timestep.expand(copies * state.shape[0])
-        model_labels = torch.cat((labels, null_labels)) if use_guidance else labels
-        if semantic_tokens is None:
-            prediction = method(
-                model_state.to(image_noise.dtype), model_timestep, model_labels
-            ).float()
-        else:
-            condition = (
-                torch.cat((semantic_tokens, torch.zeros_like(semantic_tokens)))
-                if use_guidance
-                else semantic_tokens
-            )
-            condition = torch.where(
-                (model_labels == num_classes)[:, None, None, None],
-                torch.zeros_like(condition),
-                condition,
-            )
-            prediction = method(
-                model_state.to(image_noise.dtype),
-                model_timestep,
-                model_labels,
-                condition.to(image_noise.dtype),
-            ).float()
-        if not use_guidance:
-            return prediction
-        conditional, unconditional = prediction.chunk(2)
-        active = (
-            (model_timestep[: state.shape[0]] >= class_guidance_interval[0])
-            & (model_timestep[: state.shape[0]] <= class_guidance_interval[1])
-        ).reshape(-1, 1, 1, 1)
-        guided = unconditional + class_guidance_scale * (
-            conditional - unconditional
+    def velocity(state: Tensor, scalar_time: Tensor) -> Tensor:
+        time = scalar_time.expand(state.shape[0])
+        clean = _model_x0(
+            model,
+            state,
+            time,
+            labels,
+            num_classes=num_classes,
+            guidance_scale=guidance_scale,
+            guidance_start=guidance_start,
+            guidance_end=guidance_end,
         )
-        return torch.where(active, guided, conditional)
+        return x0_to_velocity(state, clean, time, denominator_floor)
 
-    return _integrate(
-        image_noise.float(),
-        _schedule(steps, timestep_shift, image_noise.device),
-        predict,
-        solver,
-        velocity_denominator_floor,
-    )
-
-
-@torch.inference_mode()
-def sample_cascade(
-    model: nn.Module,
-    semantic_noise: Tensor,
-    image_noise: Tensor,
-    labels: Tensor,
-    *,
-    semantic_steps: int = 10,
-    image_steps: int = 40,
-    semantic_timestep_shift: float = 1.0,
-    image_timestep_shift: float = 1.0,
-    semantic_guidance_scale: float = 1.78,
-    semantic_guidance_interval: tuple[float, float] = (0.1, 1.0),
-    class_guidance_scale: float = 1.0,
-    class_guidance_interval: tuple[float, float] = (0.0, 1.0),
-    solver: Solver = "euler",
-    num_classes: int | None = None,
-    velocity_denominator_floor: float = 0.05,
-) -> GeneratedRepresentations:
-    if semantic_noise.data_ptr() == image_noise.data_ptr():
-        raise ValueError("semantic and image-latent sampling require independent noise tensors")
-    semantic_tokens = sample_semantic_tokens(
-        model,
-        semantic_noise,
-        labels,
-        steps=semantic_steps,
-        timestep_shift=semantic_timestep_shift,
-        semantic_guidance_scale=semantic_guidance_scale,
-        semantic_guidance_interval=semantic_guidance_interval,
-        solver=solver,
-        velocity_denominator_floor=velocity_denominator_floor,
-    )
-    image_latents = sample_image_latents(
-        model,
-        image_noise,
-        labels,
-        semantic_tokens,
-        steps=image_steps,
-        timestep_shift=image_timestep_shift,
-        class_guidance_scale=class_guidance_scale,
-        class_guidance_interval=class_guidance_interval,
-        solver=solver,
-        num_classes=num_classes,
-        velocity_denominator_floor=velocity_denominator_floor,
-    )
-    return GeneratedRepresentations(semantic_tokens, image_latents)
+    for index, (current, following) in enumerate(pairwise(grid)):
+        delta = following - current
+        current_velocity = velocity(values, current)
+        if solver == "heun" and index < steps - 1:
+            proposal = values + delta * current_velocity
+            next_velocity = velocity(proposal, following)
+            values = values + delta * (current_velocity + next_velocity) / 2
+        else:
+            values = values + delta * current_velocity
+        if callback is not None:
+            callback(index + 1, values)
+    return values
 
 
-@torch.inference_mode()
-def sample_latent(
-    model: nn.Module,
-    image_noise: Tensor,
-    labels: Tensor,
-    **kwargs: object,
-) -> GeneratedRepresentations:
-    image_latents = sample_image_latents(
-        model, image_noise, labels, None, **kwargs  # type: ignore[arg-type]
-    )
-    return GeneratedRepresentations(None, image_latents)
+sample_rgb_tokens = sample_tokens

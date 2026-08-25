@@ -9,7 +9,7 @@ from cascade_dit.compare import compare_runs
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compare matched Cascade DDT results")
+    parser = argparse.ArgumentParser(description="Compare matched progressive and pixel runs")
     parser.add_argument("first", type=Path)
     parser.add_argument("second", type=Path)
     parser.add_argument("--output", type=Path)

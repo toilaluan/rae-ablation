@@ -9,7 +9,9 @@ from cascade_dit.validation import ValidationPlan
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compute FID for an ADM-compatible sample NPZ")
+    parser = argparse.ArgumentParser(
+        description="Compute FID and Inception Score for an ADM-compatible sample NPZ"
+    )
     parser.add_argument("--samples", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -27,7 +29,7 @@ def _plan_hash(samples: Path, plan_path: Path | None, parser: argparse.ArgumentP
         manifest = json.loads(manifest_path.read_text())
         if not manifest.get("complete"):
             parser.error(f"adjacent sample manifest is incomplete: {manifest_path}")
-        value = manifest.get("validation_plan_hash")
+        value = manifest.get("sampling_plan_hash", manifest.get("validation_plan_hash"))
         if not isinstance(value, str) or not value:
             parser.error(f"adjacent sample manifest has no plan hash: {manifest_path}")
         manifest_hash = value
