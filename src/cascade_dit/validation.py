@@ -50,7 +50,7 @@ def _plan_digest(values: dict[str, Tensor]) -> str:
 
 def create_validation_plan(
     final_samples: int = 50_000,
-    periodic_samples: int = 5_000,
+    periodic_samples: int = 10_000,
     num_classes: int = 1_000,
     seed: int = 44_721,
 ) -> ValidationPlan:
@@ -139,7 +139,13 @@ def validate_stage_loss(
             weights = batch.representation_weights
             modes = batch.modes
             result = compute_training_loss(
-                model, tokens, labels, weights, streams, config
+                model,
+                tokens,
+                labels,
+                weights,
+                streams,
+                config,
+                timestep_shift=config.stages[stage_index].timestep_shift,
             )
             losses.append(float(result.loss.total))
             for mode in mode_losses:
@@ -152,6 +158,7 @@ def validate_stage_loss(
                         weights[selected],
                         streams,
                         config,
+                        timestep_shift=config.stages[stage_index].timestep_shift,
                     )
                     mode_losses[mode].append(float(mode_result.loss.total))
             if preview is None and stage_index != config.num_representation_levels - 1:

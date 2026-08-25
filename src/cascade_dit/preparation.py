@@ -166,9 +166,9 @@ def _collect_statistics(
     }
     rgb_name = config.stages[-1].name
     indices = torch.arange(rank, len(dataset), world_size)
-    i = 0
-    for pixels, _labels, batch_indices in _loader(dataset, indices, config):
-        i+=1
+    for i, (pixels, _labels, batch_indices) in enumerate(
+        _loader(dataset, indices, config), start=1
+    ):
         print(i)
         if i >= 100:
             break

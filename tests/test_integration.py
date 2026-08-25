@@ -57,7 +57,14 @@ def test_tiny_dynamic_curriculum_and_matched_baseline(levels: int) -> None:
         weights = torch.zeros(1, levels)
         weights[:, position.index] = 1
         result = train_one_step(
-            model, optimizer, targets, labels, weights, streams, config
+            model,
+            optimizer,
+            targets,
+            labels,
+            weights,
+            streams,
+            config,
+            stage_index=position.index,
         )
         assert torch.isfinite(result.loss.total)
         ema.update(model)
@@ -76,6 +83,7 @@ def test_tiny_dynamic_curriculum_and_matched_baseline(levels: int) -> None:
         baseline_weights,
         RNGStreams.create(8),
         config,
+        stage_index=levels - 1,
     )
     assert torch.isfinite(baseline_result.loss.total)
 

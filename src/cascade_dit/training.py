@@ -26,6 +26,7 @@ def compute_training_loss(
     rng: RNGStreams,
     config: ExperimentConfig,
     *,
+    timestep_shift: float,
     source_prediction: Tensor | None = None,
     source_model: nn.Module | None = None,
 ) -> TrainingStep:
@@ -35,7 +36,7 @@ def compute_training_loss(
         clean_tokens.device,
         loc=config.objective.timestep_loc,
         scale=config.objective.timestep_scale,
-        shift=config.objective.timestep_shift,
+        shift=timestep_shift,
     )
     noise = torch.randn(
         clean_tokens.shape,
@@ -85,10 +86,18 @@ def train_one_step(
     representation_weights: Tensor,
     rng: RNGStreams,
     config: ExperimentConfig,
+    *,
+    stage_index: int,
 ) -> TrainingStep:
     optimizer.zero_grad(set_to_none=True)
     result = compute_training_loss(
-        model, clean_tokens, labels, representation_weights, rng, config
+        model,
+        clean_tokens,
+        labels,
+        representation_weights,
+        rng,
+        config,
+        timestep_shift=config.stages[stage_index].timestep_shift,
     )
     result.loss.total.backward()
     torch.nn.utils.clip_grad_norm_(

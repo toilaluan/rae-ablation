@@ -49,7 +49,12 @@ def main() -> None:
             print(json.dumps(metrics, sort_keys=True), flush=True)
 
     runner = ExperimentRunner(
-        config, rank=rank, world_size=world_size, device=device, log=log
+        config,
+        rank=rank,
+        world_size=world_size,
+        device=device,
+        log=log,
+        log_image=logger.log_grid,
     )
     resume = arguments.resume or (
         Path(config.checkpoint.resume) if config.checkpoint.resume else None

@@ -216,13 +216,14 @@ class RepresentationEmbedder(nn.Module):
         self.embedding = nn.Parameter(torch.randn(levels, width) / width**0.5)
 
     def forward(self, weights: Tensor) -> Tensor:
-        # if weights.ndim != 2 or weights.shape[1] != self.levels:
-        #     raise ValueError(f"R must have shape [B,{self.levels}]")
-        # if not torch.isfinite(weights).all() or torch.any(weights < 0):
-        #     raise ValueError("R must be finite and non-negative")
-        # sums = weights.float().sum(dim=-1)
-        # if not torch.allclose(sums, torch.ones_like(sums), atol=1e-5, rtol=1e-5):
-        #     raise ValueError("every R row must sum to one")
+        if weights.ndim != 2 or weights.shape[1] != self.levels:
+            raise ValueError(f"R must have shape [B,{self.levels}]")
+        if not torch.compiler.is_compiling():
+            if not torch.isfinite(weights).all() or torch.any(weights < 0):
+                raise ValueError("R must be finite and non-negative")
+            sums = weights.float().sum(dim=-1)
+            if not torch.allclose(sums, torch.ones_like(sums), atol=1e-5, rtol=1e-5):
+                raise ValueError("every R row must sum to one")
         return weights.to(self.embedding) @ self.embedding
 
 

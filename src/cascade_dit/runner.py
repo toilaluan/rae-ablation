@@ -9,7 +9,13 @@ import torch
 from torch import nn
 
 from .checkpoint import EMA, CheckpointManager, ResumeState
-from .config import ExperimentConfig, load_checkpoint_config
+from .config import (
+    IMAGE_SIZE,
+    TOKEN_COUNT,
+    TOKEN_DIM,
+    ExperimentConfig,
+    load_checkpoint_config,
+)
 from .curriculum import configure_trainability, stage_at_epoch
 from .data import (
     MIXTURE_MODE_NAMES,
@@ -17,6 +23,8 @@ from .data import (
     data_fingerprint,
     make_stage_loader,
 )
+from .distributed import broadcast_string
+from .evaluation import evaluate_npz, save_evaluation
 from .feature_pca import save_feature_pca_preview
 from .flops import model_flops_per_step
 from .model import DDT, build_model
@@ -27,11 +35,25 @@ from .optim import (
     parameter_count,
     trainable_parameter_count,
 )
-from .preparation import preparation_fingerprint, representation_manifest_fingerprint
-from .representations import RepresentationManifest
+from .preparation import (
+    preparation_fingerprint,
+    representation_manifest_fingerprint,
+    statistics_from_manifest,
+)
+from .representations import RepresentationManifest, unpatchify_rgb
 from .rng import RNGStreams
+from .sample_runtime import (
+    SamplingParameters,
+    noise_for_seeds,
+    prune_sample_archive,
+    sample_to_archive,
+    state_dict_sha256,
+)
+from .sampling import sample_tokens
 from .training import compute_training_loss
-from .validation import validate_stage_loss
+from .validation import ValidationPlan, create_validation_plan, validate_stage_loss
+
+ImageLog = Callable[[str, str, int, str], None]
 
 
 def load_representation_manifest(
@@ -58,13 +80,16 @@ class ExperimentRunner:
         world_size: int = 1,
         device: torch.device | str = "cpu",
         log: Callable[[dict[str, float | int | str]], None] | None = None,
+        log_image: ImageLog | None = None,
     ) -> None:
         self.config = config
         self.rank = rank
         self.world_size = world_size
         self.device = torch.device(device)
         self.log = log or (lambda _metrics: None)
+        self.log_image = log_image or (lambda _path, _caption, _step, _key: None)
         manifest, self.representation_fingerprint = load_representation_manifest(config)
+        self.rgb_statistics = statistics_from_manifest(manifest, config.stage_names[-1])
         self.data_fingerprint = data_fingerprint(config.data)
         self.batch_preprocessor = RepresentationBatchPreprocessor(
             config, manifest, self.device
@@ -98,6 +123,197 @@ class ExperimentRunner:
         self.estimated_flops = 0
         self.started_at = time.perf_counter()
         self.elapsed_before_resume = 0.0
+        self.validation_plan = self._initialize_validation_plan()
+
+    def _initialize_validation_plan(self) -> ValidationPlan:
+        plan = create_validation_plan(
+            final_samples=self.config.evaluation.num_samples,
+            periodic_samples=self.config.validation.periodic_samples,
+            num_classes=self.config.model.num_classes,
+            seed=self.config.sampling.seed,
+        )
+        error: list[str | None] = [None]
+        if self.rank == 0:
+            try:
+                plan.save(
+                    Path(self.config.experiment.output_directory)
+                    / "validation"
+                    / "sampling-plan.pt"
+                )
+            except Exception as exception:
+                error[0] = f"{type(exception).__name__}: {exception}"
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast_object_list(error, src=0)
+        if error[0] is not None:
+            raise RuntimeError(error[0])
+        return plan
+
+    def _sampling_parameters(self) -> SamplingParameters:
+        values = self.config.sampling
+        return SamplingParameters(
+            steps=values.steps,
+            solver=values.solver,
+            timestep_shift=values.timestep_shift,
+            guidance_scale=values.guidance_scale,
+            guidance_start=values.guidance_start,
+            guidance_end=values.guidance_end,
+            batch_size=values.batch_size,
+            seed=values.seed,
+        )
+
+    def _cached_pixel_evaluation(
+        self,
+        output: Path,
+        sample_count: int,
+        checkpoint_hash: str,
+        parameters: SamplingParameters,
+    ) -> dict[str, float] | None:
+        payload: list[object | None] = [None, None]
+        if self.rank == 0:
+            try:
+                evaluation_path = output / "evaluation.json"
+                preview_path = output / "preview.png"
+                manifest_path = output / "samples.json"
+                if evaluation_path.is_file() and preview_path.is_file() and manifest_path.is_file():
+                    evaluation = json.loads(evaluation_path.read_text())
+                    manifest = json.loads(manifest_path.read_text())
+                    if (
+                        evaluation.get("sampling_plan_hash") != self.validation_plan.plan_hash
+                        or evaluation.get("num_samples") != sample_count
+                        or manifest.get("num_samples") != sample_count
+                        or manifest.get("checkpoint_sha256") != checkpoint_hash
+                        or manifest.get("parameters") != vars(parameters)
+                    ):
+                        raise ValueError("cached pixel evaluation does not match this validation")
+                    metrics = evaluation.get("metrics")
+                    if not isinstance(metrics, dict):
+                        raise ValueError("cached pixel evaluation metrics are invalid")
+                    if manifest.get("archive_retained", True):
+                        prune_sample_archive(output)
+                    payload[0] = {str(name): float(value) for name, value in metrics.items()}
+            except Exception as exception:
+                payload[1] = f"{type(exception).__name__}: {exception}"
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast_object_list(payload, src=0)
+        if payload[1] is not None:
+            raise RuntimeError(str(payload[1]))
+        return payload[0] if isinstance(payload[0], dict) else None
+
+    def _generate_pixel_evaluation(
+        self,
+        model: nn.Module,
+        *,
+        completed_epoch: int,
+        training_complete: bool,
+    ) -> tuple[Path | None, Path, int, dict[str, float] | None]:
+        sample_count = (
+            self.config.evaluation.num_samples
+            if training_complete
+            else self.config.validation.periodic_samples
+        )
+        output = (
+            Path(self.config.experiment.output_directory)
+            / "validation"
+            / f"epoch-{completed_epoch:04d}"
+        )
+        parameters = self._sampling_parameters()
+        digest = state_dict_sha256(self.ema.state_dict()) if self.rank == 0 else None
+        digest = broadcast_string(digest, self.rank)
+        cached = self._cached_pixel_evaluation(output, sample_count, digest, parameters)
+        if cached is not None:
+            return None, output, sample_count, cached
+        labels, _sample_ids, seeds = self.validation_plan.prefix(sample_count)
+        execution = compile_model_regions(model, self.config.compile)
+        execution_holder = {"model": execution}
+        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+
+        @torch.inference_mode()
+        def generate(batch_labels: torch.Tensor, batch_seeds: torch.Tensor) -> torch.Tensor:
+            noise = noise_for_seeds(
+                batch_seeds,
+                (TOKEN_COUNT, TOKEN_DIM),
+                self.device,
+                dtype=dtype,
+            )
+            weights = torch.zeros(
+                batch_labels.shape[0],
+                self.config.num_representation_levels,
+                device=self.device,
+            )
+            weights[:, -1] = 1
+            with torch.autocast(
+                device_type=self.device.type,
+                dtype=torch.bfloat16,
+                enabled=self.device.type == "cuda",
+            ):
+                normalized = sample_tokens(
+                    execution_holder["model"],
+                    noise,
+                    batch_labels.to(self.device),
+                    weights,
+                    steps=parameters.steps,
+                    solver=parameters.solver,
+                    timestep_shift=parameters.timestep_shift,
+                    guidance_scale=parameters.guidance_scale,
+                    guidance_start=parameters.guidance_start,
+                    guidance_end=parameters.guidance_end,
+                    denominator_floor=self.config.objective.denominator_floor,
+                    num_classes=self.config.model.num_classes,
+                )
+            tokens = self.rgb_statistics.denormalize(normalized.float())
+            return unpatchify_rgb(tokens).clamp(0, 1)
+
+        archive = sample_to_archive(
+            output_directory=output,
+            num_samples=sample_count,
+            num_classes=self.config.model.num_classes,
+            image_size=IMAGE_SIZE,
+            checkpoint_hash=digest,
+            parameters=parameters,
+            generate_batch=generate,
+            labels=labels,
+            seeds=seeds,
+            plan_hash=self.validation_plan.plan_hash,
+        )
+        execution_holder.clear()
+        del execution
+        return archive, output, sample_count, None
+
+    def _evaluate_pixel_archive(
+        self,
+        archive: Path | None,
+        output: Path,
+        sample_count: int,
+        cached: dict[str, float] | None,
+    ) -> dict[str, float]:
+        payload: list[object | None] = [cached, None]
+        if self.rank == 0 and cached is None:
+            try:
+                if archive is None:
+                    raise RuntimeError("new pixel evaluation has no sample archive")
+                metrics = evaluate_npz(
+                    archive,
+                    self.config.evaluation.reference_npz,
+                    batch_size=self.config.evaluation.batch_size,
+                    device=self.config.evaluation.device,
+                )
+                save_evaluation(
+                    output / "evaluation.json",
+                    metrics,
+                    self.validation_plan.plan_hash,
+                    num_samples=sample_count,
+                )
+                prune_sample_archive(output)
+                payload[0] = metrics
+            except Exception as exception:
+                payload[1] = f"{type(exception).__name__}: {exception}"
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast_object_list(payload, src=0)
+        if payload[1] is not None:
+            raise RuntimeError(str(payload[1]))
+        if not isinstance(payload[0], dict):
+            raise RuntimeError("pixel evaluation did not produce metrics")
+        return {str(name): float(value) for name, value in payload[0].items()}
 
     @property
     def stage_name(self) -> str:
@@ -268,6 +484,7 @@ class ExperimentRunner:
                         weights,
                         self.rng,
                         self.config,
+                        timestep_shift=self.config.stages[stage_index].timestep_shift,
                         source_model=source_model,
                     )
                 result.loss.total.backward()
@@ -292,6 +509,7 @@ class ExperimentRunner:
                     "lr": self.optimizer.param_groups[0]["lr"],
                     "gradient_norm": float(gradient_norm),
                     "load_time": float(load_time),
+                    "timestep_shift": self.config.stages[stage_index].timestep_shift,
                 }
                 for mode, name in enumerate(MIXTURE_MODE_NAMES):
                     metrics[f"mode/{name}"] = int((modes == mode).sum())
@@ -299,9 +517,11 @@ class ExperimentRunner:
                 if max_steps is not None and self.global_step >= max_steps:
                     self._write_run_metrics(complete=False)
                     return
+            del source_model
             self.completed_epoch = epoch + 1
             complete = self.completed_epoch == self.config.total_epochs
             interval = self.config.validation.interval_epochs
+            final_evaluation: tuple[dict[str, float], int] | None = None
             if complete or (interval > 0 and self.completed_epoch % interval == 0):
                 ema_model = self.ema.to_model(self.model).to(self.device)
                 validation, preview, preview_labels = validate_stage_loss(
@@ -328,25 +548,82 @@ class ExperimentRunner:
                     )
                     preview_directory.mkdir(parents=True, exist_ok=True)
                     features = preview.transpose(1, 2).reshape(-1, 768, 8, 8)
+                    pca_path = (
+                        preview_directory
+                        / f"epoch-{self.completed_epoch:04d}-feature-pca.png"
+                    )
                     save_feature_pca_preview(
                         features,
                         preview_labels,
-                        preview_directory
-                        / f"epoch-{self.completed_epoch:04d}-feature-pca.png",
+                        pca_path,
                         128,
                     )
+                    self.log_image(
+                        str(pca_path),
+                        f"stage={stage_name}, epoch={self.completed_epoch}",
+                        self.global_step,
+                        "validation/feature_pca",
+                    )
+                archive, evaluation_output, sample_count, cached = (
+                    self._generate_pixel_evaluation(
+                        ema_model,
+                        completed_epoch=self.completed_epoch,
+                        training_complete=complete,
+                    )
+                )
+                del ema_model
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                pixel_metrics = self._evaluate_pixel_archive(
+                    archive, evaluation_output, sample_count, cached
+                )
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                if self.rank == 0:
+                    qualified = {
+                        f"validation/pixel_{name.lower()}_{sample_count}": value
+                        for name, value in pixel_metrics.items()
+                    }
+                    self.log(
+                        {
+                            "stage": stage_name,
+                            "epoch": epoch,
+                            "step": self.global_step,
+                            "validation/pixel_sample_count": sample_count,
+                        }
+                        | qualified
+                    )
+                    self.log_image(
+                        str(evaluation_output / "preview.png"),
+                        (
+                            f"RGB EMA samples, stage={stage_name}, "
+                            f"epoch={self.completed_epoch}, n={sample_count}"
+                        ),
+                        self.global_step,
+                        "validation/pixel_samples",
+                    )
+                if complete:
+                    final_evaluation = (pixel_metrics, sample_count)
             checkpoint_interval = self.config.checkpoint.interval_epochs
             periodic = (
                 checkpoint_interval
                 and self.completed_epoch % checkpoint_interval == 0
             )
             if self.rank == 0 and (complete or periodic):
-                self.manager.save(
+                checkpoint_path = self.manager.save(
                     model=self.model,
                     ema=self.ema,
                     state=self._resume_state("stable", training_complete=complete),
                     config=self.config,
                 )
+                if complete and final_evaluation is not None:
+                    metrics, sample_count = final_evaluation
+                    save_evaluation(
+                        checkpoint_path / "evaluation.json",
+                        metrics,
+                        self.validation_plan.plan_hash,
+                        num_samples=sample_count,
+                    )
             if self.world_size > 1:
                 torch.distributed.barrier()
         self._write_run_metrics(complete=True)

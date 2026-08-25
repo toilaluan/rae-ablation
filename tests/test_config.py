@@ -15,10 +15,10 @@ from cascade_dit.config import (
 
 def test_checked_in_nested_config_and_baseline_override() -> None:
     config = load_config("configs/experiment.yaml")
-    assert config.total_epochs == 80
-    assert config.stage_names == ["dino12", "dino8", "dino4", "rgb"]
-    assert config.dino_layers == [12, 8, 4]
-    assert (config.model.encoder.width, config.model.encoder.depth) == (768, 12)
+    assert config.total_epochs == 50
+    assert config.stage_names == ["dino12", "dino8", "rgb"]
+    assert config.dino_layers == [12, 8]
+    assert (config.model.encoder.width, config.model.encoder.depth) == (1152, 12)
     assert (config.model.decoder.width, config.model.decoder.depth) == (2048, 2)
     assert config.curriculum.mixing.pure_current_probability == pytest.approx(0.85)
     baseline = load_config(
@@ -48,7 +48,7 @@ def test_dynamic_stage_list_controls_R_width_and_epochs() -> None:
 
 def test_schema_stage_and_probability_validation(tmp_path) -> None:
     path = tmp_path / "old.json"
-    path.write_text(json.dumps({"schema_version": 3, "alignment": {}}))
+    path.write_text(json.dumps({"schema_version": 4}))
     with pytest.raises(ValueError, match="Alignment-era"):
         load_config(path)
 
@@ -62,3 +62,19 @@ def test_schema_stage_and_probability_validation(tmp_path) -> None:
     with pytest.raises(ValueError, match="final stage"):
         config.validate()
     assert ExperimentConfig().schema_version == CONFIG_SCHEMA_VERSION
+
+
+def test_stage_timestep_shifts_and_evaluation_sample_counts_are_validated() -> None:
+    config = ExperimentConfig()
+    config.representations.stages[1].timestep_shift = 0
+    with pytest.raises(ValueError, match="timestep shifts"):
+        config.validate()
+
+    config = ExperimentConfig()
+    config.validation.periodic_samples = 1_500
+    with pytest.raises(ValueError, match="class balanced"):
+        config.validate()
+
+    config.validation.periodic_samples = 51_000
+    with pytest.raises(ValueError, match="cannot exceed"):
+        config.validate()

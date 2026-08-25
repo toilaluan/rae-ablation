@@ -263,14 +263,18 @@ def evaluate_npz(
     return metrics
 
 
-def save_evaluation(path: str | Path, metrics: dict[str, Any], plan_hash: str) -> None:
+def save_evaluation(
+    path: str | Path,
+    metrics: dict[str, Any],
+    plan_hash: str,
+    *,
+    num_samples: int | None = None,
+) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".partial")
-    temporary.write_text(
-        json.dumps(
-            {"sampling_plan_hash": plan_hash, "metrics": metrics}, indent=2, sort_keys=True
-        )
-        + "\n"
-    )
+    values: dict[str, Any] = {"sampling_plan_hash": plan_hash, "metrics": metrics}
+    if num_samples is not None:
+        values["num_samples"] = num_samples
+    temporary.write_text(json.dumps(values, indent=2, sort_keys=True) + "\n")
     temporary.replace(target)

@@ -1,4 +1,4 @@
-schema_version: 4
+schema_version: 5
 
 experiment:
   mode: progressive
@@ -32,12 +32,15 @@ representations:
     - name: dino12
       epochs: 15
       source: {kind: dino, layer: 12}
+      timestep_shift: 4.0
     - name: dino8
       epochs: 5
       source: {kind: dino, layer: 8}
+      timestep_shift: 4.0
     - name: rgb
       epochs: 30
       source: {kind: rgb, layer: null}
+      timestep_shift: 4.0
   dtype: bfloat16
   cache_batch_size: 256
   asynchronous_writes: true
@@ -90,7 +93,6 @@ objective:
   timestep_distribution: shifted_logit_normal
   timestep_loc: 0.0
   timestep_scale: 1.0
-  timestep_shift: 4.0
   denominator_floor: 0.05
   cosine_loss_weight: 0.0
   cosine_loss_epsilon: 1.0e-8
@@ -123,6 +125,7 @@ validation:
   interval_epochs: 5
   batches: 32
   pca_preview_samples: 16
+  periodic_samples: 10000
 
 checkpoint:
   directory: checkpoints

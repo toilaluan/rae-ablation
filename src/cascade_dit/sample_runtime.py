@@ -16,7 +16,7 @@ import torch
 from PIL import Image, ImageDraw
 from torch import Tensor
 
-SAMPLING_MANIFEST_SCHEMA_VERSION = 2
+SAMPLING_MANIFEST_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -109,6 +109,117 @@ def _write_json(path: Path, values: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _distributed() -> tuple[int, int, bool]:
+    active = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if not active:
+        return 0, 1, False
+    return torch.distributed.get_rank(), torch.distributed.get_world_size(), True
+
+
+def _barrier() -> None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def _paths(output: Path) -> dict[str, Path]:
+    return {
+        "images": output / ".images.npy",
+        "labels": output / ".labels.npy",
+        "completion": output / ".completion.npy",
+        "archive": output / "samples.npz",
+        "manifest": output / "samples.json",
+        "preview": output / "preview.png",
+    }
+
+
+def _load_memmaps(paths: dict[str, Path], mode: str = "r+") -> tuple[np.memmap, ...]:
+    arrays = tuple(
+        np.load(paths[name], mmap_mode=mode, allow_pickle=False)
+        for name in ("images", "labels", "completion")
+    )
+    if not all(isinstance(array, np.memmap) for array in arrays):
+        raise RuntimeError("temporary sampling arrays are not memory mapped")
+    return arrays  # type: ignore[return-value]
+
+
+def _validate_plan(
+    labels: Tensor,
+    seeds: Tensor,
+    num_samples: int,
+    num_classes: int,
+) -> tuple[Tensor, Tensor]:
+    labels = labels.detach().to(device="cpu", dtype=torch.int64).contiguous()
+    seeds = seeds.detach().to(device="cpu", dtype=torch.int64).contiguous()
+    if labels.shape != (num_samples,) or seeds.shape != (num_samples,):
+        raise ValueError("sampling labels and seeds must have shape [num_samples]")
+    if torch.any(labels < 0) or torch.any(labels >= num_classes):
+        raise ValueError("sampling labels are outside the configured class range")
+    return labels, seeds
+
+
+def _initialize_or_resume(
+    output: Path,
+    paths: dict[str, Path],
+    base: dict[str, Any],
+    labels: Tensor,
+) -> tuple[bool, int]:
+    output.mkdir(parents=True, exist_ok=True)
+    sample_count = int(base["num_samples"])
+    image_size = int(base["image_size"])
+    temporary_names = ("images", "labels", "completion")
+    if paths["manifest"].is_file():
+        manifest = json.loads(paths["manifest"].read_text())
+        if manifest.get("schema_version") != SAMPLING_MANIFEST_SCHEMA_VERSION:
+            raise ValueError("sampling manifest schema is incompatible")
+        if {key: manifest.get(key) for key in base} != base:
+            raise ValueError("existing sample manifest does not match this request")
+        if manifest.get("complete"):
+            if not manifest.get("archive_retained", True):
+                raise ValueError("completed sample archive was pruned after evaluation")
+            if not paths["archive"].is_file() or not paths["preview"].is_file():
+                raise ValueError("completed sample manifest is missing final artifacts")
+            return True, sample_count
+        if not all(paths[name].is_file() for name in temporary_names):
+            raise ValueError("interrupted sampling run is missing temporary storage")
+        images, saved_labels, completion = _load_memmaps(paths)
+        if images.shape != (sample_count, image_size, image_size, 3) or images.dtype != np.uint8:
+            raise ValueError("temporary sample images do not match their manifest")
+        if saved_labels.shape != (sample_count,) or saved_labels.dtype != np.int64:
+            raise ValueError("temporary sample labels do not match their manifest")
+        if completion.shape != (sample_count,) or completion.dtype != np.uint8:
+            raise ValueError("temporary completion map does not match its manifest")
+        if not np.array_equal(saved_labels, labels.numpy()):
+            raise ValueError("saved labels differ from the deterministic sampling plan")
+        completed = int(np.count_nonzero(completion))
+        del images, saved_labels, completion
+        return False, completed
+    if any(paths[name].exists() for name in (*temporary_names, "archive", "preview")):
+        raise ValueError("refusing to overwrite untracked sample artifacts")
+    images = np.lib.format.open_memmap(
+        paths["images"],
+        mode="w+",
+        dtype=np.uint8,
+        shape=(sample_count, image_size, image_size, 3),
+    )
+    saved_labels = np.lib.format.open_memmap(
+        paths["labels"], mode="w+", dtype=np.int64, shape=(sample_count,)
+    )
+    completion = np.lib.format.open_memmap(
+        paths["completion"], mode="w+", dtype=np.uint8, shape=(sample_count,)
+    )
+    saved_labels[:] = labels.numpy()
+    completion[:] = 0
+    images.flush()
+    saved_labels.flush()
+    completion.flush()
+    del images, saved_labels, completion
+    _write_json(
+        paths["manifest"],
+        base | {"complete": False, "completed_samples": 0, "archive_retained": False},
+    )
+    return False, 0
+
+
 def _write_zip_member(archive: zipfile.ZipFile, source: Path, name: str) -> None:
     with source.open("rb") as source_handle, archive.open(
         name, mode="w", force_zip64=True
@@ -118,16 +229,21 @@ def _write_zip_member(archive: zipfile.ZipFile, source: Path, name: str) -> None
 
 def _package(images: Path, labels: Path, target: Path) -> None:
     temporary = target.with_suffix(target.suffix + f".partial-{os.getpid()}")
-    with zipfile.ZipFile(
-        temporary, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True
-    ) as archive:
-        _write_zip_member(archive, images, "arr_0.npy")
-        _write_zip_member(archive, labels, "arr_1.npy")
-    os.replace(temporary, target)
+    try:
+        with zipfile.ZipFile(
+            temporary, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True
+        ) as archive:
+            _write_zip_member(archive, images, "arr_0.npy")
+            _write_zip_member(archive, labels, "arr_1.npy")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _save_preview(images: np.ndarray, labels: np.ndarray, target: Path) -> None:
     count = min(16, len(images))
+    if count < 1:
+        raise ValueError("cannot save a preview without samples")
     side = images.shape[1]
     canvas = Image.new("RGB", (4 * side, 4 * (side + 18)), "white")
     draw = ImageDraw.Draw(canvas)
@@ -154,84 +270,122 @@ def sample_to_archive(
     checkpoint_hash: str,
     parameters: SamplingParameters,
     generate_batch: GenerateBatch,
+    labels: Tensor | None = None,
+    seeds: Tensor | None = None,
+    plan_hash: str | None = None,
 ) -> Path:
+    """Generate one deterministic, resumable archive across all initialized ranks."""
     parameters.validate()
+    if num_samples < 1 or num_classes < 1 or image_size < 1:
+        raise ValueError("sample, class, and image counts must be positive")
+    if (labels is None) != (seeds is None):
+        raise ValueError("explicit sampling labels and seeds must be supplied together")
+    if labels is None or seeds is None:
+        labels, seeds = sampling_plan(num_samples, num_classes, parameters.seed)
+    labels, seeds = _validate_plan(labels, seeds, num_samples, num_classes)
+    resolved_plan_hash = plan_hash or sampling_plan_hash(labels, seeds)
+    if not resolved_plan_hash:
+        raise ValueError("sampling plan hash cannot be empty")
     output = Path(output_directory)
-    output.mkdir(parents=True, exist_ok=True)
-    labels, seeds = sampling_plan(num_samples, num_classes, parameters.seed)
-    plan_hash = sampling_plan_hash(labels, seeds)
-    images_path = output / ".images.npy"
-    labels_path = output / ".labels.npy"
-    completion_path = output / ".completion.npy"
-    archive_path = output / "samples.npz"
-    manifest_path = output / "samples.json"
+    paths = _paths(output)
     base = {
         "schema_version": SAMPLING_MANIFEST_SCHEMA_VERSION,
         "checkpoint_sha256": checkpoint_hash,
-        "sampling_plan_hash": plan_hash,
+        "sampling_plan_hash": resolved_plan_hash,
         "num_samples": num_samples,
         "num_classes": num_classes,
         "image_size": image_size,
         "parameters": asdict(parameters),
     }
-    if manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text())
-        if {key: manifest.get(key) for key in base} != base:
-            raise ValueError("existing sample manifest does not match this request")
-        if manifest.get("complete"):
-            if not archive_path.is_file():
-                raise ValueError("completed sample manifest is missing its archive")
-            return archive_path
-    elif any(path.exists() for path in (images_path, labels_path, completion_path, archive_path)):
-        raise ValueError("refusing to overwrite untracked sample artifacts")
-    else:
-        images = np.lib.format.open_memmap(
-            images_path, mode="w+", dtype=np.uint8, shape=(num_samples, image_size, image_size, 3)
-        )
-        saved_labels = np.lib.format.open_memmap(
-            labels_path, mode="w+", dtype=np.int64, shape=(num_samples,)
-        )
-        completion = np.lib.format.open_memmap(
-            completion_path, mode="w+", dtype=np.uint8, shape=(num_samples,)
-        )
-        saved_labels[:] = labels.numpy()
-        completion[:] = 0
-        images.flush()
-        saved_labels.flush()
-        completion.flush()
-        _write_json(manifest_path, base | {"complete": False, "completed_samples": 0})
-    images = np.load(images_path, mmap_mode="r+")
-    saved_labels = np.load(labels_path, mmap_mode="r+")
-    completion = np.load(completion_path, mmap_mode="r+")
-    if not np.array_equal(saved_labels, labels.numpy()):
-        raise ValueError("saved labels differ from the deterministic sampling plan")
+    rank, world_size, distributed = _distributed()
+    setup: list[Any] = [False, 0, None]
+    if rank == 0:
+        try:
+            setup[0], setup[1] = _initialize_or_resume(output, paths, base, labels)
+        except Exception as error:
+            setup[2] = f"{type(error).__name__}: {error}"
+    if distributed:
+        torch.distributed.broadcast_object_list(setup, src=0)
+    if setup[2] is not None:
+        raise RuntimeError(str(setup[2]))
+    if setup[0]:
+        return paths["archive"]
+
+    _barrier()
+    images, saved_labels, completion = _load_memmaps(paths)
+    positions = torch.arange(rank, num_samples, world_size, dtype=torch.int64)
+    pending = positions[
+        torch.from_numpy(np.asarray(completion[positions.numpy()] == 0))
+    ]
     started = time.perf_counter()
-    for beginning in range(0, num_samples, parameters.batch_size):
-        end = min(beginning + parameters.batch_size, num_samples)
-        if np.all(completion[beginning:end] == 1):
-            continue
-        generated = generate_batch(labels[beginning:end], seeds[beginning:end])
-        if generated.shape != (end - beginning, 3, image_size, image_size):
+    for beginning in range(0, pending.numel(), parameters.batch_size):
+        batch_positions = pending[beginning : beginning + parameters.batch_size]
+        generated = generate_batch(labels[batch_positions], seeds[batch_positions])
+        expected = batch_positions.numel()
+        if generated.shape != (expected, 3, image_size, image_size):
             raise ValueError("sample generator returned an invalid image shape")
         pixels = generated.detach().float().clamp(0, 1).mul(255).round().byte()
-        images[beginning:end] = pixels.permute(0, 2, 3, 1).cpu().numpy()
+        numpy_positions = batch_positions.numpy()
+        images[numpy_positions] = pixels.permute(0, 2, 3, 1).cpu().numpy()
         images.flush()
-        completion[beginning:end] = 1
+        completion[numpy_positions] = 1
         completion.flush()
-        _write_json(
-            manifest_path,
-            base | {"complete": False, "completed_samples": int(np.count_nonzero(completion))},
-        )
-    _package(images_path, labels_path, archive_path)
-    _save_preview(images[:16], saved_labels[:16], output / "preview.png")
-    elapsed = time.perf_counter() - started
-    _write_json(
-        manifest_path,
-        base
-        | {
-            "complete": True,
-            "completed_samples": num_samples,
-            "wall_clock_seconds": elapsed,
-        },
-    )
-    return archive_path
+        if rank == 0:
+            _write_json(
+                paths["manifest"],
+                base
+                | {
+                    "complete": False,
+                    "completed_samples": int(np.count_nonzero(completion)),
+                    "archive_retained": False,
+                },
+            )
+    images.flush()
+    completion.flush()
+    del images, saved_labels, completion
+    _barrier()
+    finalization: list[str | None] = [None]
+    if rank == 0:
+        try:
+            images, saved_labels, completion = _load_memmaps(paths)
+            completed = int(np.count_nonzero(completion))
+            if completed != num_samples or not np.all(completion == 1):
+                raise RuntimeError(
+                    f"sampling finished with {num_samples - completed} missing images"
+                )
+            _package(paths["images"], paths["labels"], paths["archive"])
+            _save_preview(images[:16], saved_labels[:16], paths["preview"])
+            _write_json(
+                paths["manifest"],
+                base
+                | {
+                    "complete": True,
+                    "completed_samples": num_samples,
+                    "archive_retained": True,
+                    "wall_clock_seconds": time.perf_counter() - started,
+                },
+            )
+            del images, saved_labels, completion
+        except Exception as error:
+            finalization[0] = f"{type(error).__name__}: {error}"
+    if distributed:
+        torch.distributed.broadcast_object_list(finalization, src=0)
+    if finalization[0] is not None:
+        raise RuntimeError(finalization[0])
+    return paths["archive"]
+
+
+def prune_sample_archive(output_directory: str | Path) -> None:
+    """Remove large generated arrays after a successful in-training evaluation."""
+    output = Path(output_directory)
+    paths = _paths(output)
+    if not (output / "evaluation.json").is_file():
+        raise ValueError("sample archives can be pruned only after evaluation is saved")
+    manifest = json.loads(paths["manifest"].read_text())
+    if manifest.get("schema_version") != SAMPLING_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("sampling manifest schema is incompatible")
+    if not manifest.get("complete"):
+        raise ValueError("cannot prune an incomplete sampling run")
+    for name in ("archive", "images", "labels", "completion"):
+        paths[name].unlink(missing_ok=True)
+    _write_json(paths["manifest"], manifest | {"archive_retained": False})

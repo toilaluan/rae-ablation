@@ -9,6 +9,7 @@ from safetensors.torch import load_file
 
 from cascade_dit.checkpoint_bundle import load_checkpoint_bundle
 from cascade_dit.config import IMAGE_SIZE, TOKEN_COUNT, TOKEN_DIM
+from cascade_dit.distributed import broadcast_string, initialize_distributed
 from cascade_dit.evaluation import evaluate_npz, save_evaluation
 from cascade_dit.model import build_model
 from cascade_dit.model.compile import compile_model_regions
@@ -47,6 +48,7 @@ def _pick(explicit: object | None, inherited: object) -> object:
 
 def main() -> None:
     arguments = build_parser().parse_args()
+    rank, _world_size, device = initialize_distributed()
     bundle = load_checkpoint_bundle(arguments.checkpoint_dir, require_rgb_complete=True)
     config, defaults = bundle.config, bundle.config.sampling
     parameters = SamplingParameters(
@@ -60,12 +62,12 @@ def main() -> None:
         seed=int(_pick(arguments.seed, defaults.seed)),
     )
     num_samples = int(_pick(arguments.num_samples, config.evaluation.num_samples))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     model = build_model(config.model, config.num_representation_levels).to(device)
     model.load_state_dict(load_file(bundle.weights, device=str(device)))
     model.eval()
     execution = compile_model_regions(model, config.compile)
+    execution_holder = {"model": execution}
     root = Path(config.representations.directory)
     manifest = RepresentationManifest.load(root / config.representations.manifest)
     rgb_statistics = statistics_from_manifest(manifest, config.stage_names[-1])
@@ -79,35 +81,47 @@ def main() -> None:
             labels.shape[0], config.num_representation_levels, device=device
         )
         weights[:, -1] = 1
-        normalized = sample_tokens(
-            execution,
-            noise,
-            labels.to(device),
-            weights,
-            steps=parameters.steps,
-            solver=parameters.solver,
-            timestep_shift=parameters.timestep_shift,
-            guidance_scale=parameters.guidance_scale,
-            guidance_start=parameters.guidance_start,
-            guidance_end=parameters.guidance_end,
-            denominator_floor=config.objective.denominator_floor,
-            num_classes=config.model.num_classes,
-        )
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda",
+        ):
+            normalized = sample_tokens(
+                execution_holder["model"],
+                noise,
+                labels.to(device),
+                weights,
+                steps=parameters.steps,
+                solver=parameters.solver,
+                timestep_shift=parameters.timestep_shift,
+                guidance_scale=parameters.guidance_scale,
+                guidance_start=parameters.guidance_start,
+                guidance_end=parameters.guidance_end,
+                denominator_floor=config.objective.denominator_floor,
+                num_classes=config.model.num_classes,
+            )
         tokens = rgb_statistics.denormalize(normalized.float())
         return unpatchify_rgb(tokens).clamp(0, 1)
 
     output = bundle.directory / sampling_output_name(num_samples, parameters)
+    checkpoint_hash = checkpoint_sha256(bundle.weights) if rank == 0 else None
+    checkpoint_hash = broadcast_string(checkpoint_hash, rank)
     archive = sample_to_archive(
         output_directory=output,
         num_samples=num_samples,
         num_classes=config.model.num_classes,
         image_size=IMAGE_SIZE,
-        checkpoint_hash=checkpoint_sha256(bundle.weights),
+        checkpoint_hash=checkpoint_hash,
         parameters=parameters,
         generate_batch=generate,
     )
-    print(archive)
-    if arguments.evaluate:
+    if rank == 0:
+        print(archive)
+    execution_holder.clear()
+    del execution, model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    if arguments.evaluate and rank == 0:
         reference = arguments.reference_npz or Path(config.evaluation.reference_npz)
         metrics = evaluate_npz(
             archive,
@@ -117,7 +131,10 @@ def main() -> None:
         )
         sample_manifest = json.loads((output / "samples.json").read_text())
         save_evaluation(
-            output / "evaluation.json", metrics, str(sample_manifest["sampling_plan_hash"])
+            output / "evaluation.json",
+            metrics,
+            str(sample_manifest["sampling_plan_hash"]),
+            num_samples=num_samples,
         )
         print(metrics)
 

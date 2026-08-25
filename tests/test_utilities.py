@@ -10,6 +10,7 @@ from cascade_dit.compare import compare_runs
 from cascade_dit.evaluation import inception_score
 from cascade_dit.feature_pca import feature_pca_rgb
 from cascade_dit.rng import RNGStreams
+from cascade_dit.validation import ValidationPlan, create_validation_plan
 
 
 def test_feature_pca_is_deterministic_and_bounded() -> None:
@@ -47,3 +48,22 @@ def test_rng_checkpoint_includes_global_dropout_state() -> None:
     expected = torch.rand(4)
     streams.load_state_dict(state)
     assert torch.equal(torch.rand(4), expected)
+
+
+def test_validation_plan_is_immutable_and_uses_a_class_balanced_prefix(tmp_path) -> None:
+    plan = create_validation_plan(
+        final_samples=20, periodic_samples=10, num_classes=5, seed=7
+    )
+    labels, sample_ids, seeds = plan.prefix(10)
+    assert torch.bincount(labels, minlength=5).tolist() == [2, 2, 2, 2, 2]
+    assert sample_ids.tolist() == list(range(10))
+    assert seeds.shape == (10,)
+
+    path = tmp_path / "plan.pt"
+    plan.save(path)
+    assert ValidationPlan.load(path).plan_hash == plan.plan_hash
+    different = create_validation_plan(
+        final_samples=20, periodic_samples=10, num_classes=5, seed=8
+    )
+    with pytest.raises(ValueError, match="immutable"):
+        different.save(path)

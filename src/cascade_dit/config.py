@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 4
+CONFIG_SCHEMA_VERSION = 5
 
 IMAGE_SIZE = 128
 PATCH_SIZE = 16
@@ -69,14 +69,15 @@ class RepresentationStageConfig:
     name: str = ""
     epochs: int = 20
     source: RepresentationSourceConfig = field(default_factory=RepresentationSourceConfig)
+    timestep_shift: float = 4.0
 
 
 def _default_stages() -> list[RepresentationStageConfig]:
     return [
-        RepresentationStageConfig("dino12", 20, RepresentationSourceConfig("dino", 12)),
-        RepresentationStageConfig("dino8", 20, RepresentationSourceConfig("dino", 8)),
-        RepresentationStageConfig("dino4", 20, RepresentationSourceConfig("dino", 4)),
-        RepresentationStageConfig("rgb", 20, RepresentationSourceConfig("rgb", None)),
+        RepresentationStageConfig("dino12", 20, RepresentationSourceConfig("dino", 12), 4.0),
+        RepresentationStageConfig("dino8", 20, RepresentationSourceConfig("dino", 8), 4.0),
+        RepresentationStageConfig("dino4", 20, RepresentationSourceConfig("dino", 4), 4.0),
+        RepresentationStageConfig("rgb", 20, RepresentationSourceConfig("rgb", None), 4.0),
     ]
 
 
@@ -186,7 +187,6 @@ class ObjectiveConfig:
     timestep_distribution: str = "shifted_logit_normal"
     timestep_loc: float = 0.0
     timestep_scale: float = 1.0
-    timestep_shift: float = 4.0
     denominator_floor: float = 0.05
     cosine_loss_weight: float = 0.0
     cosine_loss_epsilon: float = 1e-8
@@ -233,6 +233,7 @@ class ValidationConfig:
     interval_epochs: int = 5
     batches: int = 32
     pca_preview_samples: int = 16
+    periodic_samples: int = 10_000
 
 
 @dataclass
@@ -368,7 +369,6 @@ class ExperimentConfig:
         _positive(
             "objective settings",
             self.objective.timestep_scale,
-            self.objective.timestep_shift,
             self.objective.denominator_floor,
         )
         self._validate_optimizer()
@@ -392,6 +392,18 @@ class ExperimentConfig:
             raise ValueError("evaluation.metrics must contain fid and is")
         if self.evaluation.num_samples % self.model.num_classes:
             raise ValueError("evaluation.num_samples must be class balanced")
+        if self.validation.periodic_samples % self.model.num_classes:
+            raise ValueError("validation.periodic_samples must be class balanced")
+        _positive(
+            "validation settings",
+            self.validation.batches,
+            self.validation.pca_preview_samples,
+            self.validation.periodic_samples,
+            self.evaluation.num_samples,
+            self.evaluation.batch_size,
+        )
+        if self.validation.periodic_samples > self.evaluation.num_samples:
+            raise ValueError("periodic validation samples cannot exceed final evaluation samples")
 
     def _validate_stages(self) -> None:
         if len(self.stages) < 2:
@@ -401,6 +413,7 @@ class ExperimentConfig:
             raise ValueError("representation stage names must be non-empty and unique")
         if any(stage.epochs < 1 for stage in self.stages):
             raise ValueError("every representation stage must have positive epochs")
+        _positive("representation stage timestep shifts", *(stage.timestep_shift for stage in self.stages))
         rgb = [index for index, stage in enumerate(self.stages) if stage.source.kind == "rgb"]
         if rgb != [len(self.stages) - 1]:
             raise ValueError("exactly one RGB representation is required as the final stage")
