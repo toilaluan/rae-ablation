@@ -5,7 +5,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -30,7 +30,7 @@ def prepare_pixels(
     non_blocking: bool = False,
 ) -> Tensor:
     source_is_uint8 = pixels.dtype == torch.uint8
-    prepared = pixels.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
+    prepared = pixels.to(device=device, non_blocking=non_blocking).float()
     if source_is_uint8:
         prepared.div_(255)
     return prepared
@@ -197,7 +197,16 @@ def sample_representation_weights(
     return MixtureChoice(torch.from_numpy(weights), mode)
 
 
-class MixedRepresentationDataset(Dataset[tuple[Tensor, Tensor, int, int, int]]):
+RawRepresentationSample = tuple[
+    tuple[Tensor | None, ...],
+    Tensor,
+    int,
+    int,
+    int,
+]
+
+
+class MixedRepresentationDataset(Dataset[RawRepresentationSample]):
     def __init__(
         self,
         dataset: ImageNetDataset,
@@ -215,9 +224,6 @@ class MixedRepresentationDataset(Dataset[tuple[Tensor, Tensor, int, int, int]]):
         self.config = config
         self.manifest = manifest
         self.pixel_baseline = pixel_baseline
-        self.statistics = {
-            name: _statistics(manifest, name) for name in manifest.stage_names
-        }
         self.caches: dict[str, np.memmap] = {}
         for stage in config.stages:
             if stage.source.kind != "dino":
@@ -240,16 +246,11 @@ class MixedRepresentationDataset(Dataset[tuple[Tensor, Tensor, int, int, int]]):
         if stage.source.kind == "rgb":
             if pixels is None:
                 raise ValueError("RGB pixels were not loaded for a nonzero RGB weight")
-            import time
-            start = time.time()
-            raw = patchify_rgb(pixels[None].float().div(255))[0]
-            print(f"patchify_rgb time: {time.time() - start:.4f}s")
-        else:
-            values = np.asarray(self.caches[stage.name][source_index]).copy()
-            raw = torch.from_numpy(values).view(torch.bfloat16).float()
-        return self.statistics[stage.name].normalize(raw)
+            return pixels
+        values = np.asarray(self.caches[stage.name][source_index]).copy()
+        return torch.from_numpy(values).view(torch.bfloat16)
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, int, int, int]:
+    def __getitem__(self, index: int) -> RawRepresentationSample:
         choice = sample_representation_weights(
             self.config,
             self.stage_index,
@@ -261,17 +262,26 @@ class MixedRepresentationDataset(Dataset[tuple[Tensor, Tensor, int, int, int]]):
         pixels, label, source_index = self.dataset.get_item(
             index, load_pixels=rgb_required
         )
-        target = torch.zeros(TOKEN_COUNT, TOKEN_DIM, dtype=torch.float32)
+        levels: list[Tensor | None] = [None] * self.config.num_representation_levels
         for level in torch.nonzero(choice.weights, as_tuple=False).flatten().tolist():
-            target.add_(
-                self._load_level(level, source_index, pixels),
-                alpha=float(choice.weights[level]),
-            )
-        return target, choice.weights, label, source_index, choice.mode
+            levels[level] = self._load_level(level, source_index, pixels)
+        return tuple(levels), choice.weights, label, source_index, choice.mode
 
 
-@dataclass(frozen=True)
-class RepresentationBatch:
+class RawLevelBatch(NamedTuple):
+    batch_indices: Tensor
+    values: Tensor
+
+
+class RepresentationBatch(NamedTuple):
+    levels: tuple[RawLevelBatch | None, ...]
+    representation_weights: Tensor
+    labels: Tensor
+    indices: Tensor
+    modes: Tensor
+
+
+class PreparedRepresentationBatch(NamedTuple):
     tokens: Tensor
     representation_weights: Tensor
     labels: Tensor
@@ -280,16 +290,84 @@ class RepresentationBatch:
 
 
 def representation_collator(
-    samples: Sequence[tuple[Tensor, Tensor, int, int, int]],
+    samples: Sequence[RawRepresentationSample],
 ) -> RepresentationBatch:
-    tokens, weights, labels, indices, modes = zip(*samples, strict=True)
+    raw_levels, weights, labels, indices, modes = zip(*samples, strict=True)
+    level_count = len(raw_levels[0])
+    if any(len(levels) != level_count for levels in raw_levels):
+        raise ValueError("representation samples have inconsistent level counts")
+    levels: list[RawLevelBatch | None] = []
+    for level_index in range(level_count):
+        selected = [
+            (batch_index, sample_levels[level_index])
+            for batch_index, sample_levels in enumerate(raw_levels)
+            if sample_levels[level_index] is not None
+        ]
+        if not selected:
+            levels.append(None)
+            continue
+        levels.append(
+            RawLevelBatch(
+                torch.tensor(
+                    [batch_index for batch_index, _values in selected],
+                    dtype=torch.int64,
+                ),
+                torch.stack([values for _batch_index, values in selected]),
+            )
+        )
     return RepresentationBatch(
-        torch.stack(tokens),
+        tuple(levels),
         torch.stack(weights),
         torch.tensor(labels, dtype=torch.int64),
         torch.tensor(indices, dtype=torch.int64),
         torch.tensor(modes, dtype=torch.int64),
     )
+
+
+class RepresentationBatchPreprocessor:
+    """Convert, normalize, and mix sparse raw representations on one device."""
+
+    def __init__(
+        self,
+        config: ExperimentConfig,
+        manifest: RepresentationManifest,
+        device: torch.device | str,
+    ) -> None:
+        self.device = torch.device(device)
+        self.source_kinds = tuple(stage.source.kind for stage in config.stages)
+        statistics = [_statistics(manifest, stage.name) for stage in config.stages]
+        self.means = torch.stack([values.mean for values in statistics]).to(self.device)
+        self.stds = torch.stack([values.std for values in statistics]).to(self.device)
+
+    @torch.no_grad()
+    def __call__(self, batch: RepresentationBatch) -> PreparedRepresentationBatch:
+        if len(batch.levels) != len(self.source_kinds):
+            raise ValueError("representation batch level count differs from configuration")
+        weights = batch.representation_weights.to(self.device, non_blocking=True)
+        labels = batch.labels.to(self.device, non_blocking=True)
+        indices = batch.indices.to(self.device, non_blocking=True)
+        modes = batch.modes.to(self.device, non_blocking=True)
+        tokens = torch.zeros(
+            weights.shape[0],
+            TOKEN_COUNT,
+            TOKEN_DIM,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        for level_index, level in enumerate(batch.levels):
+            if level is None:
+                continue
+            batch_indices = level.batch_indices.to(self.device, non_blocking=True)
+            raw = level.values.to(self.device, non_blocking=True)
+            if self.source_kinds[level_index] == "rgb":
+                values = patchify_rgb(prepare_pixels(raw, self.device))
+            else:
+                values = raw.float()
+            level_weights = weights[batch_indices, level_index, None, None]
+            values.sub_(self.means[level_index]).div_(self.stds[level_index])
+            values.mul_(level_weights)
+            tokens.index_add_(0, batch_indices, values)
+        return PreparedRepresentationBatch(tokens, weights, labels, indices, modes)
 
 
 def make_stage_loader(

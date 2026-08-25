@@ -11,7 +11,12 @@ from torch import nn
 from .checkpoint import EMA, CheckpointManager, ResumeState
 from .config import ExperimentConfig, load_checkpoint_config
 from .curriculum import configure_trainability, stage_at_epoch
-from .data import MIXTURE_MODE_NAMES, data_fingerprint, make_stage_loader
+from .data import (
+    MIXTURE_MODE_NAMES,
+    RepresentationBatchPreprocessor,
+    data_fingerprint,
+    make_stage_loader,
+)
 from .feature_pca import save_feature_pca_preview
 from .flops import model_flops_per_step
 from .model import DDT, build_model
@@ -59,8 +64,11 @@ class ExperimentRunner:
         self.world_size = world_size
         self.device = torch.device(device)
         self.log = log or (lambda _metrics: None)
-        _manifest, self.representation_fingerprint = load_representation_manifest(config)
+        manifest, self.representation_fingerprint = load_representation_manifest(config)
         self.data_fingerprint = data_fingerprint(config.data)
+        self.batch_preprocessor = RepresentationBatchPreprocessor(
+            config, manifest, self.device
+        )
         self.rng = RNGStreams.create(config.experiment.seed, self.device)
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self.rng.initialization.initial_seed())
@@ -234,18 +242,19 @@ class ExperimentRunner:
             if self.config.curriculum.source_consistency_weight:
                 source_model = self.ema.to_model(self.model).to(self.device).eval()
 
-            t0 = time.time()
-            for batch in loader:
-                t1 = time.time()
-                load_time = t1 - t0
-                t0 = t1
-                   
-                tokens = batch.tokens.to(self.device, non_blocking=True)
-                labels = batch.labels.to(self.device, non_blocking=True)
-                weights = batch.representation_weights.to(
-                    self.device, non_blocking=True
-                )
-                modes = batch.modes.to(self.device, non_blocking=True)
+            loader_iterator = iter(loader)
+            while True:
+                load_started_at = time.perf_counter()
+                try:
+                    raw_batch = next(loader_iterator)
+                except StopIteration:
+                    break
+                load_time = time.perf_counter() - load_started_at
+                batch = self.batch_preprocessor(raw_batch)
+                tokens = batch.tokens
+                labels = batch.labels
+                weights = batch.representation_weights
+                modes = batch.modes
                 self.optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(
                     device_type=self.device.type,
@@ -298,6 +307,7 @@ class ExperimentRunner:
                 validation, preview, preview_labels = validate_stage_loss(
                     ema_model,
                     loader,
+                    self.batch_preprocessor,
                     self.config,
                     stage_index=stage_index,
                     epoch=epoch,

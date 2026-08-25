@@ -9,7 +9,7 @@ import torch
 from torch import Tensor
 
 from .config import ExperimentConfig
-from .data import MIXTURE_MODE_NAMES
+from .data import MIXTURE_MODE_NAMES, RepresentationBatchPreprocessor
 from .rng import RNGStreams, preserve_global_rng
 from .sampling import class_balanced_labels
 from .training import compute_training_loss
@@ -112,6 +112,7 @@ def run_preserving_training_state(model: torch.nn.Module, function: object) -> o
 def validate_stage_loss(
     model: torch.nn.Module,
     loader: object,
+    batch_preprocessor: RepresentationBatchPreprocessor,
     config: ExperimentConfig,
     *,
     stage_index: int,
@@ -129,13 +130,14 @@ def validate_stage_loss(
     was_training = model.training
     model.eval()
     try:
-        for batch_index, batch in enumerate(loader):  # type: ignore[union-attr]
+        for batch_index, raw_batch in enumerate(loader):  # type: ignore[union-attr]
             if batch_index >= config.validation.batches:
                 break
-            tokens = batch.tokens.to(device, non_blocking=True)
-            labels = batch.labels.to(device, non_blocking=True)
-            weights = batch.representation_weights.to(device, non_blocking=True)
-            modes = batch.modes.to(device, non_blocking=True)
+            batch = batch_preprocessor(raw_batch)
+            tokens = batch.tokens
+            labels = batch.labels
+            weights = batch.representation_weights
+            modes = batch.modes
             result = compute_training_loss(
                 model, tokens, labels, weights, streams, config
             )
