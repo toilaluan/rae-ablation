@@ -135,7 +135,16 @@ def _extract_caches(
     )
     if not pending:
         return
+    processed = 0
     for pixels, _labels, indices in _loader(dataset, torch.tensor(pending), config):
+        if rank == 0:
+            processed += len(indices)
+            step = processed // config.representations.cache_batch_size
+            print(
+                f"representation preparation: {processed}/{len(pending)} "
+                f"({step})",
+                flush=True,
+            )
         outputs = encoder(pixels.to(device, non_blocking=True))
         for name, layer in layers.items():
             cache = caches[name]
@@ -157,7 +166,12 @@ def _collect_statistics(
     }
     rgb_name = config.stages[-1].name
     indices = torch.arange(rank, len(dataset), world_size)
+    i = 0
     for pixels, _labels, batch_indices in _loader(dataset, indices, config):
+        i+=1
+        print(i)
+        if i >= 100:
+            break
         for name, cache in caches.items():
             accumulators[name].update(cache.lookup(batch_indices))
         rgb = patchify_rgb(prepare_pixels(pixels, device)).cpu()

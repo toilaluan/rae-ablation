@@ -12,7 +12,7 @@ data:
   split: train
   validation_split: validation
   image_size: 128
-  workers: 16
+  workers: 8
   prefetch_factor: 4
   max_samples: null
   shuffle: true
@@ -35,14 +35,11 @@ representations:
     - name: dino8
       epochs: 20
       source: {kind: dino, layer: 8}
-    - name: dino4
-      epochs: 20
-      source: {kind: dino, layer: 4}
     - name: rgb
       epochs: 20
       source: {kind: rgb, layer: null}
   dtype: bfloat16
-  cache_batch_size: 128
+  cache_batch_size: 256
   asynchronous_writes: true
   statistics_dtype: float64
   normalization_epsilon: 1.0e-6
@@ -110,13 +107,13 @@ optimizer:
     min_lr_ratio: 0.0
   gradient_clip: 1.0
   global_batch_size: 1024
-  ema_decay: 0.9999
+  ema_decay: 0.9995
 
 sampling:
-  steps: 40
+  steps: 50
   solver: euler
   timestep_shift: 1.0
-  guidance_scale: 1.0
+  guidance_scale: 3.0
   guidance_start: 0.0
   guidance_end: 1.0
   batch_size: 32
@@ -138,11 +135,11 @@ compile:
   enabled: true
   backend: inductor
   mode: default
-  fullgraph: true
+  fullgraph: false
   dynamic: false
 
 wandb:
-  enabled: false
+  enabled: true
   entity: null
   project: adjacent-flow-ddt
   name: null
