@@ -50,10 +50,10 @@ class CleanOracle(nn.Module):
         values: torch.Tensor,
         timestep: torch.Tensor,
         labels: torch.Tensor,
-        stage: str,
+        representation_weights: torch.Tensor,
     ) -> SimpleNamespace:
         del timestep, labels
-        assert stage == "rgb"
+        assert torch.all(representation_weights[:, -1] == 1)
         self.batch_sizes.append(values.shape[0])
         return SimpleNamespace(prediction=self.clean.expand_as(values))
 
@@ -62,12 +62,16 @@ def test_one_step_x0_sampling_recovers_clean_and_cfg_is_interval_gated() -> None
     clean = torch.full((1, 3, 4), 2.0)
     noise = torch.randn_like(clean)
     model = CleanOracle(clean)
-    sampled = sample_tokens(model, noise, torch.tensor([2]), steps=1, num_classes=10)
+    weights = torch.tensor([[0.0, 0.0, 0.0, 1.0]])
+    sampled = sample_tokens(
+        model, noise, torch.tensor([2]), weights, steps=1, num_classes=10
+    )
     assert torch.allclose(sampled, clean)
     sample_tokens(
         model,
         noise,
         torch.tensor([2]),
+        weights,
         steps=2,
         guidance_scale=2,
         guidance_start=0,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 
 import torch
@@ -15,9 +15,10 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def encoder_fingerprint(config: EncoderConfig) -> str:
+def encoder_fingerprint(config: EncoderConfig, layers: Sequence[int]) -> str:
     payload = {
         **asdict(config),
+        "layers": list(layers),
         "input_normalization": {"mean": IMAGENET_MEAN, "std": IMAGENET_STD},
         "view": "128px-bicubic-no-augmentation",
         "selection": "one-indexed-intermediate-layers-after-block",
@@ -31,11 +32,15 @@ def encoder_fingerprint(config: EncoderConfig) -> str:
 class DINOMultiLayerEncoder(nn.Module):
     """Frozen DINOv3 encoder that obtains several layers in a single pass."""
 
-    def __init__(self, model: nn.Module, config: EncoderConfig) -> None:
+    def __init__(
+        self, model: nn.Module, config: EncoderConfig, layers: Sequence[int]
+    ) -> None:
         super().__init__()
         self.model = model.eval()
         self.config = config
-        self.layers = tuple(config.layers)
+        self.layers = tuple(layers)
+        if not self.layers or len(self.layers) != len(set(self.layers)):
+            raise ValueError("DINO layers must be a non-empty unique sequence")
         self.register_buffer(
             "pixel_mean",
             torch.tensor(IMAGENET_MEAN).reshape(1, 3, 1, 1),
@@ -137,6 +142,7 @@ class DINOMultiLayerEncoder(nn.Module):
 
 def load_dino_encoder(
     config: EncoderConfig,
+    layers: Sequence[int],
     device: torch.device | str,
     *,
     compile_config: CompileConfig | None = None,
@@ -159,7 +165,7 @@ def load_dino_encoder(
     for name, value in expected.items():
         if getattr(actual, name, None) != value:
             raise ValueError(f"pinned DINO config mismatch for {name}")
-    encoder = DINOMultiLayerEncoder(model, config).to(target)
+    encoder = DINOMultiLayerEncoder(model, config, layers).to(target)
     if compile_config is not None:
         encoder.compile(compile_config)
     return encoder

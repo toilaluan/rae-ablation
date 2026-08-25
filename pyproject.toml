@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cascade-dit"
-version = "0.2.0"
-description = "Progressive DINO-to-pixel LightningDiT experiments"
+version = "0.3.0"
+description = "Adjacent-flow DINO-to-pixel DDT experiments"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

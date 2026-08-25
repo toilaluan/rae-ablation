@@ -36,7 +36,7 @@ class FakeDINO(nn.Module):
 
 def test_dino_layers_are_one_indexed_final_normed_and_extracted_once() -> None:
     model = FakeDINO()
-    encoder = DINOMultiLayerEncoder(model, EncoderConfig())
+    encoder = DINOMultiLayerEncoder(model, EncoderConfig(), [12, 8, 4])
     outputs = encoder(torch.zeros(2, 3, 128, 128, dtype=torch.uint8))
     assert list(outputs) == [12, 8, 4]
     assert all(value.shape == (2, 64, 768) for value in outputs.values())

@@ -2,36 +2,38 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import shutil
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from safetensors.torch import load_file
 from torch import Tensor
 from torch.nn import functional as F
 
 from .config import IMAGE_SIZE, PATCH_SIZE, TOKEN_COUNT, TOKEN_DIM
 
-REPRESENTATION_SCHEMA_VERSION = 2
-REPRESENTATION_NAMES = ("dino12", "dino8", "dino4", "rgb")
+REPRESENTATION_SCHEMA_VERSION = 3
 
 
-def required_representation_bytes(dataset_size: int) -> int:
-    if dataset_size < 1:
-        raise ValueError("dataset size must be positive")
-    return 3 * dataset_size * (TOKEN_COUNT * TOKEN_DIM * 2 + 1)
+def required_representation_bytes(dataset_size: int, dino_levels: int = 3) -> int:
+    if dataset_size < 1 or dino_levels < 1:
+        raise ValueError("dataset size and DINO level count must be positive")
+    return dino_levels * dataset_size * (TOKEN_COUNT * TOKEN_DIM * 2 + 1)
 
 
-def preflight_representation_capacity(root: str | Path, dataset_size: int) -> int:
+def preflight_representation_capacity(
+    root: str | Path, dataset_size: int, dino_names: Iterable[str]
+) -> int:
     directory = Path(root)
     directory.mkdir(parents=True, exist_ok=True)
     per_layer_values = dataset_size * TOKEN_COUNT * TOKEN_DIM * 2
     needed = 0
-    for name in ("dino12", "dino8", "dino4"):
+    for name in dino_names:
         for path, expected in (
             (directory / f"{name}.bf16", per_layer_values),
             (directory / f"{name}.completion.u8", dataset_size),
@@ -78,8 +80,6 @@ class ChannelStatistics:
 
 
 class ChannelStatisticsAccumulator:
-    """Streaming, mergeable float64 channel statistics for [..., C] tokens."""
-
     def __init__(self, channels: int = TOKEN_DIM) -> None:
         self.channels = channels
         self.count = 0
@@ -107,7 +107,9 @@ class ChannelStatisticsAccumulator:
         if other.count == 0:
             return
         if self.count == 0:
-            self.count, self.mean, self.m2 = other.count, other.mean.clone(), other.m2.clone()
+            self.count = other.count
+            self.mean = other.mean.clone()
+            self.m2 = other.m2.clone()
             return
         delta = other.mean - self.mean
         total = self.count + other.count
@@ -143,14 +145,17 @@ class RepresentationManifest:
     dataset_fingerprint: str
     encoder_fingerprint: str
     preparation_fingerprint: str
+    stages: list[dict[str, Any]]
     statistics: dict[str, dict[str, Any]]
     cache_files: dict[str, str]
     completion_files: dict[str, str]
-    alignments: dict[str, dict[str, Any]]
-    cumulative_projectors: dict[str, str]
-    tensor_file: str = "representations.safetensors"
+    tensor_file: str = "statistics.safetensors"
     complete: bool = False
     schema_version: int = REPRESENTATION_SCHEMA_VERSION
+
+    @property
+    def stage_names(self) -> list[str]:
+        return [str(stage["name"]) for stage in self.stages]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -163,101 +168,94 @@ class RepresentationManifest:
         os.replace(temporary, target)
 
     @classmethod
-    def load(cls, path: str | Path, *, require_complete: bool = True) -> RepresentationManifest:
+    def load(
+        cls, path: str | Path, *, require_complete: bool = True
+    ) -> RepresentationManifest:
         target = Path(path)
         try:
             values = json.loads(target.read_text())
         except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
             raise ValueError(f"representation manifest is missing or corrupt: {target}") from error
         if values.get("schema_version") != REPRESENTATION_SCHEMA_VERSION:
-            raise ValueError("representation manifest schema is incompatible")
+            raise ValueError(
+                "representation manifest schema is incompatible; alignment-era caches "
+                "are not reused by this experiment"
+            )
         manifest = cls(**values)
-        if require_complete and not manifest.complete:
+        manifest._validate(target, require_complete=require_complete)
+        return manifest
+
+    def _validate(self, path: Path, *, require_complete: bool) -> None:
+        if require_complete and not self.complete:
             raise ValueError("representation manifest is incomplete")
-        root = target.parent
-        if not all(
+        if self.dataset_size < 1 or not all(
             (
-                manifest.dataset_fingerprint,
-                manifest.encoder_fingerprint,
-                manifest.preparation_fingerprint,
+                self.dataset_fingerprint,
+                self.encoder_fingerprint,
+                self.preparation_fingerprint,
             )
         ):
             raise ValueError("representation manifest fingerprints are incomplete")
-        for name in REPRESENTATION_NAMES:
+        names = self.stage_names
+        if len(names) < 2 or len(names) != len(set(names)):
+            raise ValueError("representation manifest stages are invalid")
+        root = path.parent
+        tensors_path = root / self.tensor_file
+        if not tensors_path.is_file():
+            raise ValueError("representation statistics tensor file is missing")
+        tensors = load_file(tensors_path)
+        for name in names:
             try:
-                statistics = manifest.statistics[name]
-                mean, std = statistics["mean"], statistics["std"]
-                count = int(statistics["count"])
+                recorded = self.statistics[name]
+                mean = torch.tensor(recorded["mean"])
+                std = torch.tensor(recorded["std"])
+                count = int(recorded["count"])
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError(f"representation statistics are corrupt: {name}") from error
-            if len(mean) != TOKEN_DIM or len(std) != TOKEN_DIM or count < 2:
+            if mean.shape != (TOKEN_DIM,) or std.shape != (TOKEN_DIM,) or count < 2:
                 raise ValueError(f"representation statistics have the wrong shape: {name}")
-            if any(float(value) <= 0 for value in std):
-                raise ValueError(f"representation standard deviations are invalid: {name}")
-        expected_bytes = manifest.dataset_size * TOKEN_COUNT * TOKEN_DIM * 2
-        for name in ("dino12", "dino8", "dino4"):
-            cache = root / manifest.cache_files[name]
-            completion = root / manifest.completion_files[name]
-            if not cache.is_file() or cache.stat().st_size != expected_bytes:
-                raise ValueError(f"representation cache is missing or has the wrong size: {cache}")
-            if not completion.is_file() or completion.stat().st_size != manifest.dataset_size:
-                raise ValueError(f"representation completion bitmap is invalid: {completion}")
-            bitmap = np.memmap(completion, mode="r", dtype=np.uint8, shape=(manifest.dataset_size,))
-            if np.any((bitmap != 0) & (bitmap != 1)) or (require_complete and np.any(bitmap != 1)):
-                raise ValueError(f"representation cache is incomplete or corrupt: {name}")
-        tensor_path = root / manifest.tensor_file
-        if not tensor_path.is_file():
-            raise ValueError(f"representation tensor bundle is missing: {tensor_path}")
-        from safetensors.torch import load_file
-
-        tensors = load_file(tensor_path)
-        if set(manifest.cumulative_projectors) != set(REPRESENTATION_NAMES):
-            raise ValueError("cumulative projectors do not cover all stages")
-        try:
-            matrix_keys = tuple(values["matrix"] for values in manifest.alignments.values())
-            if any(
-                values.get("parameterization")
-                != "full-rank orthogonal initialization alignment"
-                or not math.isfinite(float(values["heldout_mse"]))
-                or not math.isfinite(float(values["orthogonality_error"]))
-                for values in manifest.alignments.values()
-            ):
-                raise ValueError("invalid alignment diagnostics")
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError("representation alignment diagnostics are corrupt") from error
-        keys = {
-            *matrix_keys,
-            *manifest.cumulative_projectors.values(),
-            *(f"statistics.{name}.mean" for name in REPRESENTATION_NAMES),
-            *(f"statistics.{name}.std" for name in REPRESENTATION_NAMES),
-        }
-        if not keys.issubset(tensors):
-            raise ValueError("representation tensor bundle is incomplete")
-        for key in (*manifest.cumulative_projectors.values(), *matrix_keys):
-            matrix = tensors[key]
-            if matrix.shape != (TOKEN_DIM, TOKEN_DIM) or not torch.isfinite(matrix).all():
-                raise ValueError(f"alignment tensor has the wrong shape: {key}")
-            identity = torch.eye(TOKEN_DIM, dtype=matrix.dtype, device=matrix.device)
-            if torch.linalg.matrix_norm(matrix.T @ matrix - identity) > 1e-3:
-                raise ValueError(f"alignment tensor is not orthogonal: {key}")
-        for name in REPRESENTATION_NAMES:
-            for statistic in ("mean", "std"):
+            if not torch.isfinite(mean).all() or not torch.isfinite(std).all() or torch.any(std <= 0):
+                raise ValueError(f"representation statistics are invalid: {name}")
+            for statistic, expected in (("mean", mean), ("std", std)):
                 key = f"statistics.{name}.{statistic}"
-                recorded = torch.tensor(manifest.statistics[name][statistic])
-                if tensors[key].shape != (TOKEN_DIM,) or not torch.equal(tensors[key], recorded):
+                if key not in tensors or not torch.equal(tensors[key], expected):
                     raise ValueError(f"manifest and tensor statistics disagree: {key}")
-        return manifest
+        for stage in self.stages:
+            name = str(stage["name"])
+            source = stage.get("source")
+            if not isinstance(source, dict):
+                raise ValueError(f"representation source is corrupt: {name}")
+            if source.get("kind") != "dino":
+                continue
+            try:
+                values_path = root / self.cache_files[name]
+                completion_path = root / self.completion_files[name]
+            except KeyError as error:
+                raise ValueError(f"representation cache entry is missing: {name}") from error
+            expected = self.dataset_size * TOKEN_COUNT * TOKEN_DIM * 2
+            if not values_path.is_file() or not completion_path.is_file():
+                raise ValueError(f"representation cache file is missing: {name}")
+            if values_path.stat().st_size != expected:
+                raise ValueError(f"representation cache has the wrong size: {name}")
+            if completion_path.stat().st_size != self.dataset_size:
+                raise ValueError(f"representation completion map has the wrong size: {name}")
+            completion = np.memmap(
+                completion_path, mode="r", dtype=np.uint8, shape=(self.dataset_size,)
+            )
+            if require_complete and np.any(completion != 1):
+                raise ValueError(f"representation cache is incomplete: {name}")
 
 
 class LayerMemmap:
-    """A resumable raw BF16 cache with a per-image completion bitmap."""
-
     def __init__(self, values_path: str | Path, completion_path: str | Path, size: int) -> None:
         self.values_path = Path(values_path)
         self.completion_path = Path(completion_path)
         self.size = size
         self.values = np.memmap(
-            self.values_path, mode="r+", dtype=np.uint16, shape=(size, TOKEN_COUNT, TOKEN_DIM)
+            self.values_path,
+            mode="r+",
+            dtype=np.uint16,
+            shape=(size, TOKEN_COUNT, TOKEN_DIM),
         )
         self.completion = np.memmap(
             self.completion_path, mode="r+", dtype=np.uint8, shape=(size,)
@@ -274,9 +272,14 @@ class LayerMemmap:
             raise ValueError(f"incomplete cache file pair for {name}")
         if not values_path.exists():
             values = np.memmap(
-                values_path, mode="w+", dtype=np.uint16, shape=(size, TOKEN_COUNT, TOKEN_DIM)
+                values_path,
+                mode="w+",
+                dtype=np.uint16,
+                shape=(size, TOKEN_COUNT, TOKEN_DIM),
             )
-            completion = np.memmap(completion_path, mode="w+", dtype=np.uint8, shape=(size,))
+            completion = np.memmap(
+                completion_path, mode="w+", dtype=np.uint8, shape=(size,)
+            )
             completion[:] = 0
             values.flush()
             completion.flush()
@@ -308,7 +311,3 @@ class LayerMemmap:
         if np.any(self.completion[positions] != 1):
             raise ValueError("requested representation has not been cached")
         return torch.from_numpy(np.asarray(self.values[positions]).copy()).view(torch.bfloat16)
-
-    def finalize(self) -> None:
-        if np.any(np.asarray(self.completion) != 1):
-            raise ValueError("cannot finalize an incomplete representation cache")

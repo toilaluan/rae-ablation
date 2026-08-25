@@ -22,10 +22,10 @@ def compute_training_loss(
     model: nn.Module,
     clean_tokens: Tensor,
     labels: Tensor,
+    representation_weights: Tensor,
     rng: RNGStreams,
     config: ExperimentConfig,
     *,
-    stage: str,
     source_prediction: Tensor | None = None,
     source_model: nn.Module | None = None,
 ) -> TrainingStep:
@@ -53,8 +53,8 @@ def compute_training_loss(
                 path.noisy,
                 timesteps,
                 labels,
+                representation_weights,
                 force_class_drop=drop,
-                stage=stage,
             )
             source_prediction = (
                 source_output if isinstance(source_output, Tensor) else source_output.prediction
@@ -63,8 +63,8 @@ def compute_training_loss(
         path.noisy,
         timesteps,
         labels,
+        representation_weights,
         force_class_drop=drop,
-        stage=stage,
     )
     prediction = output if isinstance(output, Tensor) else output.prediction
     loss = clean_prediction_loss(
@@ -82,13 +82,14 @@ def train_one_step(
     optimizer: torch.optim.Optimizer,
     clean_tokens: Tensor,
     labels: Tensor,
+    representation_weights: Tensor,
     rng: RNGStreams,
     config: ExperimentConfig,
-    *,
-    stage: str,
 ) -> TrainingStep:
     optimizer.zero_grad(set_to_none=True)
-    result = compute_training_loss(model, clean_tokens, labels, rng, config, stage=stage)
+    result = compute_training_loss(
+        model, clean_tokens, labels, representation_weights, rng, config
+    )
     result.loss.total.backward()
     torch.nn.utils.clip_grad_norm_(
         (parameter for parameter in model.parameters() if parameter.requires_grad),

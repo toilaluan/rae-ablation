@@ -25,7 +25,7 @@ from cascade_dit.sampling import sample_tokens
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Sample a completed RGB LightningDiT checkpoint")
+    parser = argparse.ArgumentParser(description="Sample a completed RGB DDT checkpoint")
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--num-samples", type=int)
     parser.add_argument("--batch-size", type=int)
@@ -62,24 +62,28 @@ def main() -> None:
     num_samples = int(_pick(arguments.num_samples, config.evaluation.num_samples))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    model = build_model(config.model, config.detail_heads).to(device)
-    model.set_stage("rgb", torch.eye(TOKEN_DIM))
+    model = build_model(config.model, config.num_representation_levels).to(device)
     model.load_state_dict(load_file(bundle.weights, device=str(device)))
     model.eval()
     execution = compile_model_regions(model, config.compile)
     root = Path(config.representations.directory)
     manifest = RepresentationManifest.load(root / config.representations.manifest)
-    rgb_statistics = statistics_from_manifest(manifest, "rgb")
+    rgb_statistics = statistics_from_manifest(manifest, config.stage_names[-1])
 
     @torch.inference_mode()
     def generate(labels: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:
         noise = noise_for_seeds(
             seeds, (TOKEN_COUNT, TOKEN_DIM), device, dtype=dtype
         )
+        weights = torch.zeros(
+            labels.shape[0], config.num_representation_levels, device=device
+        )
+        weights[:, -1] = 1
         normalized = sample_tokens(
             execution,
             noise,
             labels.to(device),
+            weights,
             steps=parameters.steps,
             solver=parameters.solver,
             timestep_shift=parameters.timestep_shift,

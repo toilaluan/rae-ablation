@@ -1,211 +1,271 @@
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-from ..alignment import OrthogonalProjector
-from ..config import GRID_SIZE, TOKEN_COUNT, TOKEN_DIM, DetailHeadsConfig, ModelConfig
-from .detail import PixelPatchDetailer, TokenDetailHead
-from .lora import attach_lora, has_lora, merge_lora
+from ..config import GRID_SIZE, TOKEN_COUNT, ModelConfig
 from .rope import apply_rope_cos_sin, precompute_rope_tables
 
 
-def modulate(values: Tensor, shift: Tensor | None, scale: Tensor) -> Tensor:
-    result = values * (1 + scale.unsqueeze(1))
-    return result if shift is None else result + shift.unsqueeze(1)
+def _modulate(values: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
+    return values * (1 + scale) + shift
 
 
-class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256) -> None:
+class RMSNorm(nn.Module):
+    def __init__(self, width: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.frequency_embedding_size = frequency_embedding_size
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(width))
+
+    def forward(self, values: Tensor) -> Tensor:
+        normalized = values.float() * torch.rsqrt(
+            values.float().square().mean(-1, keepdim=True) + self.eps
         )
-
-    @staticmethod
-    def sinusoidal(timestep: Tensor, dimension: int, max_period: int = 10_000) -> Tensor:
-        half = dimension // 2
-        frequencies = torch.exp(
-            -math.log(max_period)
-            * torch.arange(half, dtype=torch.float32, device=timestep.device)
-            / half
-        )
-        arguments = timestep[:, None].float() * frequencies[None]
-        embedding = torch.cat((arguments.cos(), arguments.sin()), dim=-1)
-        if dimension % 2:
-            embedding = torch.cat((embedding, torch.zeros_like(embedding[:, :1])), dim=-1)
-        return embedding
-
-    def forward(self, timestep: Tensor) -> Tensor:
-        return self.mlp(self.sinusoidal(timestep, self.frequency_embedding_size))
+        return normalized.to(values.dtype) * self.weight
 
 
-class LabelEmbedder(nn.Module):
-    def __init__(self, num_classes: int, hidden_size: int, dropout_probability: float) -> None:
+class SwiGLU(nn.Module):
+    def __init__(self, width: int, ratio: float) -> None:
         super().__init__()
-        self.num_classes = num_classes
-        self.dropout_probability = dropout_probability
-        self.embedding = nn.Embedding(num_classes + 1, hidden_size)
+        hidden = max(1, int(2 / 3 * width * ratio))
+        self.gate = nn.Linear(width, hidden)
+        self.value = nn.Linear(width, hidden)
+        self.output = nn.Linear(hidden, width)
 
-    def forward(self, labels: Tensor, force_drop: Tensor | None = None) -> Tensor:
-        if labels.ndim != 1 or torch.any(labels < 0) or torch.any(labels > self.num_classes):
-            raise ValueError("class labels are outside the configured range")
-        if force_drop is None and self.training and self.dropout_probability > 0:
-            force_drop = torch.rand(labels.shape, device=labels.device) < self.dropout_probability
-        if force_drop is not None:
-            labels = torch.where(force_drop.bool(), self.num_classes, labels)
-        return self.embedding(labels)
+    def forward(self, values: Tensor) -> Tensor:
+        return self.output(F.silu(self.gate(values)) * self.value(values))
 
 
 class Attention(nn.Module):
     def __init__(
         self,
-        hidden_size: int,
-        num_heads: int,
+        width: int,
+        heads: int,
         *,
-        qk_norm: bool = True,
-        sdpa: bool = True,
+        token_count: int,
+        spatial_tokens: int,
+        qk_norm: bool,
+        rope: bool,
+        sdpa: bool,
     ) -> None:
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
+        self.width = width
+        self.heads = heads
+        self.head_width = width // heads
         self.sdpa = sdpa
-        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
-        self.q_norm = nn.RMSNorm(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = nn.RMSNorm(self.head_dim) if qk_norm else nn.Identity()
-        self.proj = nn.Linear(hidden_size, hidden_size)
+        self.query = nn.Linear(width, width)
+        self.key = nn.Linear(width, width)
+        self.value = nn.Linear(width, width)
+        self.output = nn.Linear(width, width)
+        self.query_norm = RMSNorm(self.head_width) if qk_norm else nn.Identity()
+        self.key_norm = RMSNorm(self.head_width) if qk_norm else nn.Identity()
+        if rope:
+            cosine, sine = precompute_rope_tables(
+                GRID_SIZE, GRID_SIZE, self.head_width, dtype=torch.float32
+            )
+            suffix = token_count - spatial_tokens
+            if suffix:
+                cosine = torch.cat((cosine, torch.ones(suffix, self.head_width)))
+                sine = torch.cat((sine, torch.zeros(suffix, self.head_width)))
+        else:
+            cosine = sine = torch.empty(0)
+        self.register_buffer("rope_cosine", cosine, persistent=False)
+        self.register_buffer("rope_sine", sine, persistent=False)
 
-    def forward(self, values: Tensor, rope: tuple[Tensor, Tensor] | None) -> Tensor:
-        batch, tokens, width = values.shape
-        qkv = self.qkv(values).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
-        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-        query, key = self.q_norm(query), self.k_norm(key)
-        if rope is not None:
-            query, key = apply_rope_cos_sin(query, key, rope[0], rope[1])
+    def forward(self, values: Tensor) -> Tensor:
+        batch, token_count, _ = values.shape
+        shape = (batch, token_count, self.heads, self.head_width)
+        query = self.query(values).reshape(shape).transpose(1, 2)
+        key = self.key(values).reshape(shape).transpose(1, 2)
+        value = self.value(values).reshape(shape).transpose(1, 2)
+        query, key = self.query_norm(query), self.key_norm(key)
+        if self.rope_cosine.numel():
+            query, key = apply_rope_cos_sin(
+                query,
+                key,
+                self.rope_cosine.to(query),
+                self.rope_sine.to(query),
+            )
         if self.sdpa:
             attended = F.scaled_dot_product_attention(query, key, value)
         else:
-            weights = (query * self.head_dim**-0.5) @ key.transpose(-2, -1)
+            weights = (query * self.head_width**-0.5) @ key.transpose(-2, -1)
             attended = weights.softmax(dim=-1) @ value
-        return self.proj(attended.transpose(1, 2).reshape(batch, tokens, width))
+        return self.output(
+            attended.transpose(1, 2).reshape(batch, token_count, self.width)
+        )
 
 
-class SwiGLU(nn.Module):
-    def __init__(self, hidden_size: int, ratio: float) -> None:
+class DDTEncoderBlock(nn.Module):
+    def __init__(self, config: ModelConfig, global_tokens: int) -> None:
         super().__init__()
-        intermediate = int((2 / 3) * hidden_size * ratio)
-        self.w1 = nn.Linear(hidden_size, intermediate)
-        self.w3 = nn.Linear(hidden_size, intermediate)
-        self.w2 = nn.Linear(intermediate, hidden_size)
+        path = config.encoder
+        self.norm_attention = RMSNorm(path.width)
+        self.attention = Attention(
+            path.width,
+            path.heads,
+            token_count=TOKEN_COUNT + global_tokens,
+            spatial_tokens=TOKEN_COUNT,
+            qk_norm=config.attention.qk_norm,
+            rope=config.attention.rope,
+            sdpa=config.attention.sdpa,
+        )
+        self.norm_mlp = RMSNorm(path.width)
+        self.mlp = SwiGLU(path.width, config.feedforward.mlp_ratio)
 
     def forward(self, values: Tensor) -> Tensor:
-        return self.w2(F.silu(self.w1(values)) * self.w3(values))
+        values = values + self.attention(self.norm_attention(values))
+        return values + self.mlp(self.norm_mlp(values))
 
 
-class LightningDiTBlock(nn.Module):
+class DDTDecoderBlock(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        self.norm1 = nn.RMSNorm(config.hidden_size)
-        self.norm2 = nn.RMSNorm(config.hidden_size)
-        self.attn = Attention(
-            config.hidden_size,
-            config.num_heads,
-            qk_norm=config.qk_norm,
-            sdpa=config.sdpa,
+        path = config.decoder
+        self.norm_attention = RMSNorm(path.width)
+        self.attention = Attention(
+            path.width,
+            path.heads,
+            token_count=TOKEN_COUNT,
+            spatial_tokens=TOKEN_COUNT,
+            qk_norm=config.attention.qk_norm,
+            rope=config.attention.rope,
+            sdpa=config.attention.sdpa,
         )
-        self.mlp = SwiGLU(config.hidden_size, config.mlp_ratio)
-        chunks = 6 if config.adaln_shift else 4
-        self.adaln = nn.Sequential(
-            nn.SiLU(), nn.Linear(config.hidden_size, chunks * config.hidden_size)
-        )
-        self.with_shift = config.adaln_shift
+        self.norm_mlp = RMSNorm(path.width)
+        self.mlp = SwiGLU(path.width, config.feedforward.mlp_ratio)
+        self.adaln = nn.Sequential(nn.SiLU(), nn.Linear(path.width, 6 * path.width))
 
-    def forward(
-        self,
-        values: Tensor,
-        conditioning: Tensor,
-        rope_cos: Tensor | None,
-        rope_sin: Tensor | None,
-    ) -> Tensor:
-        if self.with_shift:
-            shift_attention, scale_attention, gate_attention, shift_mlp, scale_mlp, gate_mlp = (
-                self.adaln(conditioning).chunk(6, dim=-1)
-            )
-        else:
-            scale_attention, gate_attention, scale_mlp, gate_mlp = self.adaln(
-                conditioning
-            ).chunk(4, dim=-1)
-            shift_attention = shift_mlp = None
-        rope = None if rope_cos is None or rope_sin is None else (rope_cos, rope_sin)
-        values = values + gate_attention.unsqueeze(1) * self.attn(
-            modulate(self.norm1(values), shift_attention, scale_attention), rope
+    def forward(self, values: Tensor, conditioning: Tensor) -> Tensor:
+        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = self.adaln(
+            conditioning
+        ).chunk(6, dim=-1)
+        values = values + gate_a * self.attention(
+            _modulate(self.norm_attention(values), shift_a, scale_a)
         )
-        return values + gate_mlp.unsqueeze(1) * self.mlp(
-            modulate(self.norm2(values), shift_mlp, scale_mlp)
+        return values + gate_m * self.mlp(
+            _modulate(self.norm_mlp(values), shift_m, scale_m)
         )
 
 
-class FinalLayer(nn.Module):
-    def __init__(self, hidden_size: int, output_size: int) -> None:
+class DDTFinalLayer(nn.Module):
+    def __init__(self, width: int, output_width: int) -> None:
         super().__init__()
-        self.norm = nn.RMSNorm(hidden_size)
-        self.adaln = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
-        self.linear = nn.Linear(hidden_size, output_size)
+        self.norm = RMSNorm(width)
+        self.adaln = nn.Sequential(nn.SiLU(), nn.Linear(width, 2 * width))
+        self.projection = nn.Linear(width, output_width)
 
-    def forward(self, values: Tensor, conditioning: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, values: Tensor, conditioning: Tensor) -> Tensor:
         shift, scale = self.adaln(conditioning).chunk(2, dim=-1)
-        context = modulate(self.norm(values), shift, scale)
-        return self.linear(context), context
+        return self.projection(_modulate(self.norm(values), shift, scale))
 
 
-@dataclass
-class LightningDiTOutput:
-    prediction: Tensor
-    canonical_prediction: Tensor
-    context: Tensor
-    token_residual: Tensor
-    pixel_residual: Tensor | None
-
-
-class LightningDiT(nn.Module):
-    """Class-conditional LightningDiT over a universal 8x8x768 token grid."""
-
-    def __init__(self, config: ModelConfig, detail_config: DetailHeadsConfig | None = None) -> None:
+class TimestepEmbedder(nn.Module):
+    def __init__(self, width: int, token_count: int, frequency_width: int = 256) -> None:
         super().__init__()
+        self.register_buffer(
+            "frequencies", torch.randn(frequency_width), persistent=True
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * frequency_width, width),
+            nn.SiLU(),
+            nn.Linear(width, width),
+        )
+        self.tokens = nn.Parameter(torch.randn(token_count, width) / width**0.5)
+
+    def forward(self, timestep: Tensor) -> tuple[Tensor, Tensor]:
+        angles = timestep.float()[:, None] * self.frequencies[None] * (2 * torch.pi)
+        base = self.mlp(torch.cat((angles.sin(), angles.cos()), dim=-1))[:, None]
+        return base, base + self.tokens
+
+
+class LabelEmbedder(nn.Module):
+    def __init__(
+        self,
+        width: int,
+        num_classes: int,
+        token_count: int,
+        dropout_probability: float,
+    ) -> None:
+        super().__init__()
+        self.num_classes = num_classes
+        self.dropout_probability = dropout_probability
+        self.embedding = nn.Embedding(num_classes + 1, width)
+        self.tokens = nn.Parameter(torch.randn(token_count, width) / width**0.5)
+
+    def forward(self, labels: Tensor, force_drop: Tensor | None = None) -> Tensor:
+        if labels.ndim != 1 or torch.any(labels < 0) or torch.any(labels > self.num_classes):
+            raise ValueError("class labels are outside the configured range")
+        if force_drop is None and self.training and self.dropout_probability:
+            force_drop = torch.rand(labels.shape, device=labels.device) < self.dropout_probability
+        if force_drop is not None:
+            if force_drop.shape != labels.shape:
+                raise ValueError("force_class_drop must have shape [B]")
+            labels = torch.where(force_drop.bool(), self.num_classes, labels)
+        return self.embedding(labels)[:, None] + self.tokens
+
+
+class RepresentationEmbedder(nn.Module):
+    def __init__(self, levels: int, width: int) -> None:
+        super().__init__()
+        self.levels = levels
+        self.embedding = nn.Parameter(torch.randn(levels, width) / width**0.5)
+
+    def forward(self, weights: Tensor) -> Tensor:
+        if weights.ndim != 2 or weights.shape[1] != self.levels:
+            raise ValueError(f"R must have shape [B,{self.levels}]")
+        if not torch.isfinite(weights).all() or torch.any(weights < 0):
+            raise ValueError("R must be finite and non-negative")
+        sums = weights.float().sum(dim=-1)
+        if not torch.allclose(sums, torch.ones_like(sums), atol=1e-5, rtol=1e-5):
+            raise ValueError("every R row must sum to one")
+        return weights.to(self.embedding) @ self.embedding
+
+
+class DDT(nn.Module):
+    """Universal class-conditional DDT over an 8x8x768 representation grid."""
+
+    def __init__(self, config: ModelConfig, representation_levels: int) -> None:
+        super().__init__()
+        if representation_levels < 2:
+            raise ValueError("DDT requires at least two representation levels")
         self.config = config
-        self.detail_config = detail_config or DetailHeadsConfig()
-        self.input_projection = nn.Linear(config.token_dim, config.hidden_size)
-        self.timestep_embedding = TimestepEmbedder(config.hidden_size)
-        self.class_embedding = LabelEmbedder(
-            config.num_classes, config.hidden_size, config.class_dropout_probability
+        self.representation_levels = representation_levels
+        encoder_width = config.encoder.width
+        decoder_width = config.decoder.width
+        conditioning = config.conditioning
+        global_tokens = conditioning.timestep_tokens + conditioning.class_tokens + 1
+
+        self.source_projection = nn.Linear(config.token_dim, encoder_width)
+        self.target_projection = nn.Linear(config.token_dim, decoder_width)
+        self.timestep_embedder = TimestepEmbedder(
+            encoder_width, conditioning.timestep_tokens
         )
-        self.blocks = nn.ModuleList(LightningDiTBlock(config) for _ in range(config.depth))
-        self.final_layer = FinalLayer(config.hidden_size, config.token_dim)
-        self.token_detail = TokenDetailHead(
-            config.token_dim,
-            config.hidden_size,
-            depth=self.detail_config.token_depth,
-            expansion=self.detail_config.token_expansion,
+        self.class_embedder = LabelEmbedder(
+            encoder_width,
+            conditioning.num_classes,
+            conditioning.class_tokens,
+            conditioning.class_dropout_probability,
         )
-        self.pixel_detail: PixelPatchDetailer | None = None
-        if config.rope:
-            cos, sin = precompute_rope_tables(
-                GRID_SIZE, GRID_SIZE, config.hidden_size // config.num_heads
-            )
-        else:
-            cos = sin = torch.empty(0)
-        self.register_buffer("rope_cos", cos, persistent=False)
-        self.register_buffer("rope_sin", sin, persistent=False)
-        self.projector = OrthogonalProjector(torch.eye(config.token_dim))
-        self.stage = "dino12"
+        self.representation_embedder = RepresentationEmbedder(
+            representation_levels, encoder_width
+        )
+        self.encoder_blocks = nn.ModuleList(
+            DDTEncoderBlock(config, global_tokens) for _ in range(config.encoder.depth)
+        )
+        self.encoder_to_decoder = (
+            nn.Linear(encoder_width, decoder_width)
+            if encoder_width != decoder_width
+            else nn.Identity()
+        )
+        self.decoder_blocks = nn.ModuleList(
+            DDTDecoderBlock(config) for _ in range(config.decoder.depth)
+        )
+        self.final_layer = DDTFinalLayer(decoder_width, config.token_dim)
         self.gradient_checkpointing = config.gradient_checkpointing
         self.initialize_weights()
 
@@ -217,126 +277,74 @@ class LightningDiT(nn.Module):
                     nn.init.zeros_(module.bias)
 
         self.apply(initialize)
-        nn.init.normal_(self.class_embedding.embedding.weight, std=0.02)
-        nn.init.normal_(self.timestep_embedding.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.timestep_embedding.mlp[2].weight, std=0.02)
-        for block in self.blocks:
+        nn.init.normal_(self.class_embedder.embedding.weight, std=0.02)
+        for layer in (self.timestep_embedder.mlp[0], self.timestep_embedder.mlp[2]):
+            nn.init.normal_(layer.weight, std=0.02)
+        for block in self.decoder_blocks:
             nn.init.zeros_(block.adaln[-1].weight)
             nn.init.zeros_(block.adaln[-1].bias)
         nn.init.zeros_(self.final_layer.adaln[-1].weight)
         nn.init.zeros_(self.final_layer.adaln[-1].bias)
-        nn.init.zeros_(self.final_layer.linear.weight)
-        nn.init.zeros_(self.final_layer.linear.bias)
-        nn.init.zeros_(self.token_detail.output_projection.weight)
-        nn.init.zeros_(self.token_detail.output_projection.bias)
+        nn.init.zeros_(self.final_layer.projection.weight)
+        nn.init.zeros_(self.final_layer.projection.bias)
 
-    def _introduce_pixel_detail(self) -> None:
-        if self.pixel_detail is not None or not self.detail_config.pixel_enabled:
-            return
-        self.pixel_detail = PixelPatchDetailer(
-            self.config.hidden_size, tuple(self.detail_config.pixel_channels)
-        ).to(
-            device=self.input_projection.weight.device,
-            dtype=self.input_projection.weight.dtype,
-        )
+    def _encoder_block(self, block: DDTEncoderBlock, values: Tensor) -> Tensor:
+        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+            return checkpoint(block, values, use_reentrant=False)
+        return block(values)
 
-    def set_stage(self, stage: str, projector: Tensor) -> None:
-        if stage not in {"dino12", "dino8", "dino4", "rgb"}:
-            raise ValueError(f"unknown curriculum stage {stage}")
-        if projector.shape != self.projector.matrix.shape:
-            raise ValueError("stage projector has an incompatible shape")
-        if stage == "rgb":
-            self._introduce_pixel_detail()
-        self.projector.matrix.copy_(projector.to(self.projector.matrix))
-        self.stage = stage
+    def _decoder_block(
+        self, block: DDTDecoderBlock, values: Tensor, conditioning: Tensor
+    ) -> Tensor:
+        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+            return checkpoint(block, values, conditioning, use_reentrant=False)
+        return block(values, conditioning)
 
-    def _backbone(
-        self,
-        canonical_noisy: Tensor,
-        timestep: Tensor,
-        labels: Tensor,
-        force_class_drop: Tensor | None,
-    ) -> tuple[Tensor, Tensor]:
-        values = self.input_projection(canonical_noisy)
-        conditioning = self.timestep_embedding(timestep) + self.class_embedding(
-            labels, force_class_drop
-        )
-        rope_cos = self.rope_cos if self.rope_cos.numel() else None
-        rope_sin = self.rope_sin if self.rope_sin.numel() else None
-        for block in self.blocks:
-            if self.gradient_checkpointing and self.training:
-                values = checkpoint(
-                    block, values, conditioning, rope_cos, rope_sin, use_reentrant=False
-                )
-            else:
-                values = block(values, conditioning, rope_cos, rope_sin)
-        return self.final_layer(values, conditioning)
+    @staticmethod
+    def _autocast(values: Tensor):
+        if values.device.type == "cuda" and not torch.is_autocast_enabled():
+            return torch.autocast("cuda", dtype=torch.bfloat16)
+        return nullcontext()
 
     def forward(
         self,
         noisy_tokens: Tensor,
         timestep: Tensor,
         labels: Tensor,
+        representation_weights: Tensor,
         *,
         force_class_drop: Tensor | None = None,
-        stage: str | None = None,
-    ) -> LightningDiTOutput:
-        if noisy_tokens.ndim != 3 or noisy_tokens.shape[1:] != (TOKEN_COUNT, TOKEN_DIM):
-            raise ValueError("LightningDiT input must have shape [B,64,768]")
-        active_stage = self.stage if stage is None else stage
-        if active_stage != self.stage:
-            raise ValueError("forward stage disagrees with the installed projector")
-        canonical_noisy = self.projector.to_canonical(noisy_tokens)
-        linear_prediction, context = self._backbone(
-            canonical_noisy, timestep, labels, force_class_drop
-        )
-        token_residual = self.token_detail(canonical_noisy, context)
-        canonical_prediction = linear_prediction + token_residual
-        prediction = self.projector.from_canonical(canonical_prediction)
-        pixel_residual = None
-        if active_stage == "rgb" and self.pixel_detail is not None:
-            pixel_residual = self.pixel_detail(noisy_tokens, context)
-            prediction = prediction + pixel_residual
-        return LightningDiTOutput(
-            prediction, canonical_prediction, context, token_residual, pixel_residual
-        )
+    ) -> Tensor:
+        if noisy_tokens.ndim != 3 or noisy_tokens.shape[1:] != (
+            TOKEN_COUNT,
+            self.config.token_dim,
+        ):
+            raise ValueError("DDT input must have shape [B,64,768]")
+        batch = noisy_tokens.shape[0]
+        if timestep.shape != (batch,) or labels.shape != (batch,):
+            raise ValueError("timestep and labels must have shape [B]")
+        if representation_weights.shape[0] != batch:
+            raise ValueError("R batch dimension must match noisy tokens")
 
-    def attach_lora(
-        self,
-        block_indices: list[int],
-        rank: int = 16,
-        alpha: float = 16.0,
-        dropout: float = 0.05,
-    ) -> None:
-        attach_lora(
-            self.blocks, block_indices, rank=rank, alpha=alpha, dropout=dropout
-        )
-
-    def merge_lora(self) -> int:
-        return merge_lora(self.blocks)
-
-    @torch.no_grad()
-    def fold_projector(self) -> None:
-        """Fold the active projector into linear I/O and token-detail weights."""
-        if has_lora(self):
-            raise ValueError("merge LoRA adapters before folding the projector")
-        matrix = self.projector.matrix.to(self.input_projection.weight)
-        self.input_projection.weight.copy_(self.input_projection.weight @ matrix)
-        noisy = self.token_detail.noisy_projection
-        noisy.weight.copy_(noisy.weight @ matrix.to(noisy.weight))
-        for output in (self.final_layer.linear, self.token_detail.output_projection):
-            transform = matrix.T.to(output.weight)
-            output.weight.copy_(transform @ output.weight)
-            if output.bias is not None:
-                output.bias.copy_(transform @ output.bias)
-        self.projector.matrix.copy_(torch.eye(matrix.shape[0], device=matrix.device))
+        with self._autocast(noisy_tokens):
+            representation = self.representation_embedder(representation_weights)[:, None]
+            timestep_base, timestep_tokens = self.timestep_embedder(timestep)
+            class_tokens = self.class_embedder(labels, force_class_drop)
+            source = self.source_projection(noisy_tokens) + representation
+            states = torch.cat(
+                (source, timestep_tokens, class_tokens, representation), dim=1
+            )
+            for block in self.encoder_blocks:
+                states = self._encoder_block(block, states)
+            spatial = states[:, :TOKEN_COUNT]
+            conditioning = self.encoder_to_decoder(
+                F.silu(spatial + timestep_base + representation)
+            )
+            decoded = self.target_projection(noisy_tokens)
+            for block in self.decoder_blocks:
+                decoded = self._decoder_block(block, decoded, conditioning)
+            return self.final_layer(decoded, conditioning)
 
 
-def build_model(
-    config: ModelConfig, detail_config: DetailHeadsConfig | None = None
-) -> LightningDiT:
-    return LightningDiT(config, detail_config)
-
-
-def LightningDiT_B_1(**overrides: object) -> LightningDiT:
-    return LightningDiT(ModelConfig(**overrides))
+def build_model(config: ModelConfig, representation_levels: int) -> DDT:
+    return DDT(config, representation_levels)

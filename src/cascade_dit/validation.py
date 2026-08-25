@@ -9,6 +9,7 @@ import torch
 from torch import Tensor
 
 from .config import ExperimentConfig
+from .data import MIXTURE_MODE_NAMES
 from .rng import RNGStreams, preserve_global_rng
 from .sampling import class_balanced_labels
 from .training import compute_training_loss
@@ -113,13 +114,16 @@ def validate_stage_loss(
     loader: object,
     config: ExperimentConfig,
     *,
-    stage: str,
+    stage_index: int,
     epoch: int,
     device: torch.device,
-) -> tuple[float, Tensor | None, Tensor | None]:
+) -> tuple[dict[str, float], Tensor | None, Tensor | None]:
     """Deterministic loss and feature preview inputs for any curriculum stage."""
     streams = RNGStreams.create(config.experiment.seed + 1_000_003 + epoch, device)
     losses: list[float] = []
+    mode_losses: dict[int, list[float]] = {
+        index: [] for index in range(len(MIXTURE_MODE_NAMES))
+    }
     preview: Tensor | None = None
     preview_labels: Tensor | None = None
     was_training = model.training
@@ -130,11 +134,25 @@ def validate_stage_loss(
                 break
             tokens = batch.tokens.to(device, non_blocking=True)
             labels = batch.labels.to(device, non_blocking=True)
+            weights = batch.representation_weights.to(device, non_blocking=True)
+            modes = batch.modes.to(device, non_blocking=True)
             result = compute_training_loss(
-                model, tokens, labels, streams, config, stage=stage
+                model, tokens, labels, weights, streams, config
             )
             losses.append(float(result.loss.total))
-            if preview is None and stage != "rgb":
+            for mode in mode_losses:
+                selected = modes == mode
+                if selected.any():
+                    mode_result = compute_training_loss(
+                        model,
+                        tokens[selected],
+                        labels[selected],
+                        weights[selected],
+                        streams,
+                        config,
+                    )
+                    mode_losses[mode].append(float(mode_result.loss.total))
+            if preview is None and stage_index != config.num_representation_levels - 1:
                 count = min(config.validation.pca_preview_samples, tokens.shape[0])
                 preview = result.clean_prediction[:count].detach().float().cpu()
                 preview_labels = labels[:count].detach().cpu()
@@ -142,4 +160,12 @@ def validate_stage_loss(
         model.train(was_training)
     if not losses:
         raise ValueError("validation loader produced no batches")
-    return sum(losses) / len(losses), preview, preview_labels
+    metrics = {"overall": sum(losses) / len(losses)}
+    metrics.update(
+        {
+            MIXTURE_MODE_NAMES[mode]: sum(values) / len(values)
+            for mode, values in mode_losses.items()
+            if values
+        }
+    )
+    return metrics, preview, preview_labels

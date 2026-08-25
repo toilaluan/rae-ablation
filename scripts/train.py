@@ -12,7 +12,7 @@ from cascade_dit.wandb_utils import RunLogger
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train the progressive DINO-to-pixel experiment or matched pixel baseline"
+        description="Train adjacent-flow DDT or its matched RGB baseline"
     )
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
@@ -38,8 +38,12 @@ def main() -> None:
 
     def log(metrics: dict[str, float | int | str]) -> None:
         step = int(metrics["step"])
-        prefix = "validation" if "validation_loss" in metrics else "train"
-        logged = {f"{prefix}/{key}": value for key, value in metrics.items()}
+        validation = any(key.startswith("validation/") for key in metrics)
+        prefix = "validation" if validation else "train"
+        logged = {
+            key if validation and key.startswith("validation/") else f"{prefix}/{key}": value
+            for key, value in metrics.items()
+        }
         logger.log(logged, step=step)
         if rank == 0 and step % arguments.log_interval == 0:
             print(json.dumps(metrics, sort_keys=True), flush=True)

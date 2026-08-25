@@ -14,8 +14,8 @@ from torch import Tensor, nn
 from .config import CONFIG_SCHEMA_VERSION, ExperimentConfig, load_checkpoint_config
 from .model.compile import clean_state_dict
 
-CHECKPOINT_SCHEMA_VERSION = 3
-TRAINING_STATE_SCHEMA_VERSION = 3
+CHECKPOINT_SCHEMA_VERSION = 4
+TRAINING_STATE_SCHEMA_VERSION = 4
 
 
 def _tensor_state(state: dict[str, object]) -> dict[str, Tensor]:
@@ -27,7 +27,7 @@ def _tensor_state(state: dict[str, object]) -> dict[str, Tensor]:
 
 
 class EMA:
-    """State-dict EMA that can safely pass through structural LoRA transitions."""
+    """State-dict EMA for the canonical uncompiled DDT."""
 
     def __init__(self, model: nn.Module, decay: float = 0.9999) -> None:
         if not 0 < decay < 1:
@@ -217,8 +217,8 @@ class CheckpointManager:
         metadata_path = path / "metadata.json"
         if not metadata_path.is_file():
             raise ValueError(
-                "checkpoint predates the progressive LightningDiT schema; DDT/Mage "
-                "checkpoints are not supported"
+                "checkpoint predates the adjacent-flow DDT schema; alignment-era "
+                "LightningDiT and legacy DDT/Mage checkpoints are unsupported"
             )
         metadata = json.loads(metadata_path.read_text())
         if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
@@ -240,12 +240,13 @@ class CheckpointManager:
         ):
             if metadata.get(name) != getattr(state, name):
                 raise ValueError(f"checkpoint {name} metadata is inconsistent")
-        if state.stage not in config.curriculum.stages:
+        if state.stage not in config.stage_names:
             raise ValueError("checkpoint curriculum stage is invalid")
-        if config.curriculum.stages[state.stage_index] != state.stage:
+        if config.stage_names[state.stage_index] != state.stage:
             raise ValueError("checkpoint curriculum stage index is invalid")
         if state.training_complete and (
-            state.stage != "rgb" or state.completed_epoch != config.total_epochs
+            state.stage != config.stage_names[-1]
+            or state.completed_epoch != config.total_epochs
         ):
             raise ValueError("completed checkpoint is not at the end of the RGB stage")
         for name, expected in (

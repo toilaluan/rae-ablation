@@ -1,8 +1,8 @@
-schema_version: 3
+schema_version: 4
 
 experiment:
   mode: progressive
-  name: dino-to-pixel-lightningdit-b1
+  name: adjacent-flow-ddt
   seed: 0
   output_directory: runs/experiment
 
@@ -20,15 +20,27 @@ data:
 encoder:
   repository: facebook/dinov3-vitb16-pretrain-lvd1689m
   revision: 5931719e67bbdb9737e363e781fb0c67687896bc
-  layers: [12, 8, 4]
   patch_size: 16
   hidden_size: 768
   num_register_tokens: 4
   apply_final_norm: true
 
 representations:
-  directory: data/representations
+  directory: data/direct-representations
   manifest: manifest.json
+  stages:
+    - name: dino12
+      epochs: 20
+      source: {kind: dino, layer: 12}
+    - name: dino8
+      epochs: 20
+      source: {kind: dino, layer: 8}
+    - name: dino4
+      epochs: 20
+      source: {kind: dino, layer: 4}
+    - name: rgb
+      epochs: 20
+      source: {kind: rgb, layer: null}
   dtype: bfloat16
   cache_batch_size: 128
   asynchronous_writes: true
@@ -36,51 +48,43 @@ representations:
   normalization_epsilon: 1.0e-6
   require_complete: true
 
-alignment:
-  enabled: true
-  subset_size: 50000
-  subset_seed: 17
-  heldout_size: 10000
-  pairs: [dino12->dino8, dino8->dino4, dino4->rgb]
-  identity: false
-  direct_layer12_to_rgb: false
-  svd_driver: gesvd
-
 model:
+  architecture: ddt
   token_dim: 768
-  hidden_size: 768
-  depth: 12
-  num_heads: 12
-  mlp_ratio: 4.0
-  num_classes: 1000
-  class_dropout_probability: 0.1
-  qk_norm: true
-  rms_norm: true
-  rope: true
-  swiglu: true
-  adaln_shift: true
+  encoder:
+    width: 768
+    depth: 12
+    heads: 12
+  decoder:
+    width: 2048
+    depth: 2
+    heads: 16
+  feedforward:
+    mlp_ratio: 4.0
+  attention:
+    qk_norm: true
+    rope: true
+    sdpa: true
+  conditioning:
+    num_classes: 1000
+    class_dropout_probability: 0.1
+    timestep_tokens: 4
+    class_tokens: 8
   gradient_checkpointing: false
-  sdpa: true
-
-detail_heads:
-  token_enabled: true
-  token_depth: 2
-  token_expansion: 2.0
-  pixel_enabled: true
-  pixel_channels: [64, 128, 256, 512]
-  pixel_bottleneck_context: 768
-  zero_initialize: true
 
 curriculum:
-  stages: [dino12, dino8, dino4, rgb]
-  epochs: [20, 20, 20, 20]
-  transition_warmup_epochs: 1
-  fully_train_blocks: [0, 1, 10, 11]
-  lora_blocks: [2, 3, 4, 5, 6, 7, 8, 9]
-  lora_rank: 16
-  lora_alpha: 16.0
-  lora_dropout: 0.05
-  later_stage_full_finetune: false
+  mixing:
+    adjacent:
+      probability: 0.10
+      distribution: uniform
+      minimum: 0.0
+      maximum: 1.0
+    pure_next_probability: 0.025
+    all_levels:
+      probability: 0.025
+      distribution: uniform_simplex
+      concentration: 1.0
+    final_stage: pure
   source_consistency_weight: 0.0
 
 objective:
@@ -96,16 +100,17 @@ objective:
 
 optimizer:
   kind: adamw
-  initial_lr: 2.0e-4
-  transition_lr: 5.0e-5
-  beta1: 0.9
-  beta2: 0.95
-  weight_decay: 0.0
+  adamw:
+    lr: 2.0e-4
+    betas: [0.9, 0.95]
+    weight_decay: 0.0
+  scheduler:
+    kind: cosine
+    warmup_epochs: 0
+    min_lr_ratio: 0.0
   gradient_clip: 1.0
   global_batch_size: 1024
   ema_decay: 0.9999
-  schedule: cosine
-  min_lr_ratio: 0.0
 
 sampling:
   steps: 40
@@ -125,8 +130,8 @@ validation:
 checkpoint:
   directory: checkpoints
   interval_epochs: 5
-  save_boundary_before: true
-  save_boundary_after: true
+  save_stage_boundaries: true
+  keep_last_n: 8
   resume: null
 
 compile:
@@ -139,7 +144,7 @@ compile:
 wandb:
   enabled: false
   entity: null
-  project: dino-to-pixel-lightningdit
+  project: adjacent-flow-ddt
   name: null
   group: null
   tags: []

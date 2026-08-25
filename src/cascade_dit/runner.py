@@ -6,20 +6,19 @@ from collections.abc import Callable
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file
-from torch import Tensor, nn
+from torch import nn
 
 from .checkpoint import EMA, CheckpointManager, ResumeState
 from .config import ExperimentConfig, load_checkpoint_config
-from .curriculum import configure_trainability, stage_at_epoch, transition_to_stage
-from .data import data_fingerprint, make_stage_loader
+from .curriculum import configure_trainability, stage_at_epoch
+from .data import MIXTURE_MODE_NAMES, data_fingerprint, make_stage_loader
 from .feature_pca import save_feature_pca_preview
 from .flops import model_flops_per_step
-from .model import LightningDiT, build_model
+from .model import DDT, build_model
 from .model.compile import compile_model_regions
 from .optim import (
     build_optimizer,
-    build_stage_scheduler,
+    build_training_scheduler,
     parameter_count,
     trainable_parameter_count,
 )
@@ -30,50 +29,21 @@ from .training import compute_training_loss
 from .validation import validate_stage_loss
 
 
-def load_cumulative_projectors(config: ExperimentConfig) -> tuple[dict[str, Tensor], str]:
+def load_representation_manifest(
+    config: ExperimentConfig,
+) -> tuple[RepresentationManifest, str]:
     root = Path(config.representations.directory)
     manifest = RepresentationManifest.load(
         root / config.representations.manifest,
         require_complete=config.representations.require_complete,
     )
     if manifest.preparation_fingerprint != preparation_fingerprint(config):
-        raise ValueError("prepared representation settings do not match the experiment config")
-    tensors = load_file(root / manifest.tensor_file)
-    projectors = {
-        stage: tensors[key].float()
-        for stage, key in manifest.cumulative_projectors.items()
-    }
-    if set(projectors) != set(config.curriculum.stages):
-        raise ValueError("prepared cumulative projectors do not cover the curriculum")
-    return projectors, representation_manifest_fingerprint(manifest)
-
-
-def configure_model_for_resume(
-    model: LightningDiT,
-    metadata: dict[str, object],
-    projectors: dict[str, Tensor],
-    config: ExperimentConfig,
-) -> None:
-    stage = str(metadata["stage"])
-    stage_index = int(metadata["stage_index"])
-    training_complete = bool(metadata.get("training_complete"))
-    projector = torch.eye(model.config.token_dim) if training_complete else projectors[stage]
-    model.set_stage(stage, projector)
-    if config.experiment.mode == "pixel_baseline":
-        configure_trainability(model, 3, config.curriculum, pixel_baseline=True)
-    else:
-        if stage_index > 0 and not training_complete:
-            model.attach_lora(
-                config.curriculum.lora_blocks,
-                config.curriculum.lora_rank,
-                config.curriculum.lora_alpha,
-                config.curriculum.lora_dropout,
-            )
-        configure_trainability(model, stage_index, config.curriculum)
+        raise ValueError("prepared representation settings do not match experiment config")
+    return manifest, representation_manifest_fingerprint(manifest)
 
 
 class ExperimentRunner:
-    """Four-stage progressive runner, or the matched 80-epoch pixel baseline."""
+    """Dynamic adjacent-flow curriculum or architecture-matched RGB baseline."""
 
     def __init__(
         self,
@@ -89,31 +59,30 @@ class ExperimentRunner:
         self.world_size = world_size
         self.device = torch.device(device)
         self.log = log or (lambda _metrics: None)
-        self.projectors, self.representation_fingerprint = load_cumulative_projectors(config)
+        _manifest, self.representation_fingerprint = load_representation_manifest(config)
         self.data_fingerprint = data_fingerprint(config.data)
         self.rng = RNGStreams.create(config.experiment.seed, self.device)
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self.rng.initialization.initial_seed())
-            self.model = build_model(config.model, config.detail_heads).to(self.device)
+            self.model: DDT = build_model(
+                config.model, config.num_representation_levels
+            ).to(self.device)
+        configure_trainability(self.model)
         torch.manual_seed(config.experiment.seed + 90_000)
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(config.experiment.seed + 90_000)
-        if config.experiment.mode == "pixel_baseline":
-            self.model.set_stage("rgb", torch.eye(config.model.token_dim))
-            configure_trainability(
-                self.model, 3, config.curriculum, pixel_baseline=True
-            )
-            self.stage_index = 3
-        else:
-            self.model.set_stage("dino12", self.projectors["dino12"])
-            configure_trainability(self.model, 0, config.curriculum)
-            self.stage_index = 0
         self.ema = EMA(self.model, config.optimizer.ema_decay)
         self.manager = CheckpointManager(
-            Path(config.experiment.output_directory) / config.checkpoint.directory
+            Path(config.experiment.output_directory) / config.checkpoint.directory,
+            keep_last_n=config.checkpoint.keep_last_n,
         )
         self.completed_epoch = 0
         self.global_step = 0
+        self.stage_index = (
+            config.num_representation_levels - 1
+            if config.experiment.mode == "pixel_baseline"
+            else 0
+        )
         self.optimizer = build_optimizer(self.model, config.optimizer)
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self._pending_scheduler_state: dict[str, object] | None = None
@@ -122,23 +91,37 @@ class ExperimentRunner:
         self.started_at = time.perf_counter()
         self.elapsed_before_resume = 0.0
 
-    def _resume_state(self, transition_state: str, *, training_complete: bool) -> ResumeState:
-        stage_epochs = self.config.curriculum.epochs[self.stage_index]
-        stage_begin = sum(self.config.curriculum.epochs[: self.stage_index])
-        within = min(max(self.completed_epoch - stage_begin, 0), stage_epochs)
+    @property
+    def stage_name(self) -> str:
+        return self.config.stage_names[self.stage_index]
+
+    def _epoch_within_stage(self) -> int:
+        if self.config.experiment.mode == "pixel_baseline":
+            return self.completed_epoch
+        beginning = sum(stage.epochs for stage in self.config.stages[: self.stage_index])
+        return min(
+            max(self.completed_epoch - beginning, 0),
+            self.config.stages[self.stage_index].epochs,
+        )
+
+    def _resume_state(
+        self, transition_state: str, *, training_complete: bool
+    ) -> ResumeState:
         return ResumeState(
-            schema_version=3,
+            schema_version=4,
             completed_epoch=self.completed_epoch,
             global_step=self.global_step,
             stage_index=self.stage_index,
-            stage=self.model.stage,
-            epoch_within_stage=within,
+            stage=self.stage_name,
+            epoch_within_stage=self._epoch_within_stage(),
             transition_state=transition_state,
             training_complete=training_complete,
             images_seen=self.images_seen,
             estimated_flops=self.estimated_flops,
-            wall_clock_seconds=self.elapsed_before_resume + time.perf_counter() - self.started_at,
-            optimizer=self.optimizer.state_dict() if self.optimizer is not None else None,
+            wall_clock_seconds=(
+                self.elapsed_before_resume + time.perf_counter() - self.started_at
+            ),
+            optimizer=self.optimizer.state_dict(),
             scheduler=self.scheduler.state_dict() if self.scheduler is not None else None,
             rng_streams=self.rng.state_dict(),
             data_fingerprint=self.data_fingerprint,
@@ -152,32 +135,21 @@ class ExperimentRunner:
                 path = (path / "last").resolve()
             elif path.name == "last":
                 path = path.resolve()
-        metadata = json.loads((path / "metadata.json").read_text())
         saved_config = load_checkpoint_config(path / "config.json")
         for name in (
-            "experiment",
             "data",
             "encoder",
             "representations",
-            "alignment",
             "model",
-            "detail_heads",
             "curriculum",
             "objective",
             "optimizer",
         ):
-            current_value = getattr(self.config, name)
-            saved_value = getattr(saved_config, name)
-            if name == "experiment":
-                if current_value.mode != saved_value.mode:
-                    raise ValueError("checkpoint experiment mode mismatch")
-            elif current_value != saved_value:
+            if getattr(self.config, name) != getattr(saved_config, name):
                 raise ValueError(f"checkpoint {name} configuration mismatch")
-        configure_model_for_resume(self.model, metadata, self.projectors, self.config)
+        if self.config.experiment.mode != saved_config.experiment.mode:
+            raise ValueError("checkpoint experiment mode mismatch")
         self.ema = EMA(self.model, self.config.optimizer.ema_decay)
-        self.optimizer = build_optimizer(
-            self.model, self.config.optimizer, transitioned=int(metadata["stage_index"]) > 0
-        )
         state = self.manager.load(
             path,
             self.model,
@@ -197,49 +169,9 @@ class ExperimentRunner:
             self.optimizer.load_state_dict(state.optimizer)
         self._pending_scheduler_state = state.scheduler
 
-    def _finalize_export(self) -> None:
-        if self.config.experiment.mode != "progressive":
-            return
-        ema_model = self.ema.to_model(self.model)
-        self.model.merge_lora()
-        ema_model.merge_lora()
-        self.model.fold_projector()
-        ema_model.fold_projector()
-        configure_trainability(
-            self.model, 3, self.config.curriculum, pixel_baseline=True
-        )
-        configure_trainability(
-            ema_model, 3, self.config.curriculum, pixel_baseline=True
-        )
-        self.ema.replace_from_model(ema_model)
-        self.optimizer = build_optimizer(
-            self.model, self.config.optimizer, transitioned=True
-        )
-        self.scheduler = None
-
-    def _transition(self, target_index: int) -> None:
-        if self.rank == 0 and self.config.checkpoint.save_boundary_before:
-            self.manager.save_boundary(
-                target_stage_index=target_index,
-                position="before",
-                model=self.model,
-                ema=self.ema,
-                state=self._resume_state("before", training_complete=False),
-                config=self.config,
-            )
-        if self.world_size > 1:
-            torch.distributed.barrier()
-        transition_to_stage(
-            self.model,
-            self.ema,
-            target_index,
-            self.projectors,
-            self.config.curriculum,
-        )
+    def _save_stage_boundary(self, target_index: int) -> None:
         self.stage_index = target_index
-        self.optimizer = build_optimizer(self.model, self.config.optimizer, transitioned=True)
-        self.scheduler = None
-        if self.rank == 0 and self.config.checkpoint.save_boundary_after:
+        if self.rank == 0 and self.config.checkpoint.save_stage_boundaries:
             self.manager.save_boundary(
                 target_stage_index=target_index,
                 position="after",
@@ -251,59 +183,63 @@ class ExperimentRunner:
         if self.world_size > 1:
             torch.distributed.barrier()
 
+    def _build_execution(self, steps_per_epoch: int) -> nn.Module:
+        if self.scheduler is None:
+            scheduler = self.config.optimizer.scheduler
+            self.scheduler = build_training_scheduler(
+                self.optimizer,
+                steps_per_epoch=steps_per_epoch,
+                total_epochs=self.config.total_epochs,
+                warmup_epochs=scheduler.warmup_epochs,
+                min_lr_ratio=scheduler.min_lr_ratio,
+            )
+            if self._pending_scheduler_state is not None:
+                self.scheduler.load_state_dict(self._pending_scheduler_state)
+                self._pending_scheduler_state = None
+        execution: nn.Module = compile_model_regions(self.model, self.config.compile)
+        if self.world_size > 1:
+            execution = torch.nn.parallel.DistributedDataParallel(
+                execution,
+                device_ids=[self.device.index] if self.device.type == "cuda" else None,
+            )
+        return execution
+
     def run(self, *, max_steps: int | None = None) -> None:
-        total_epochs = self.config.total_epochs
-        for epoch in range(self.completed_epoch, total_epochs):
-            if self.config.experiment.mode == "pixel_baseline":
-                stage, stage_index, epoch_in_stage = "rgb", 3, epoch
-                stage_epochs = total_epochs
+        execution: nn.Module | None = None
+        for epoch in range(self.completed_epoch, self.config.total_epochs):
+            pixel_baseline = self.config.experiment.mode == "pixel_baseline"
+            if pixel_baseline:
+                stage_index = self.config.num_representation_levels - 1
+                stage_name = self.config.stage_names[-1]
+                epoch_in_stage = epoch
             else:
-                position = stage_at_epoch(epoch, self.config.curriculum)
-                stage, stage_index = position.name, position.index
+                position = stage_at_epoch(epoch, self.config)
+                stage_index = position.index
+                stage_name = position.name
                 epoch_in_stage = position.epoch_within_stage
-                stage_epochs = self.config.curriculum.epochs[stage_index]
                 if stage_index != self.stage_index:
-                    self._transition(stage_index)
+                    self._save_stage_boundary(stage_index)
             loader = make_stage_loader(
                 self.config,
-                stage,
+                stage_index,
                 rank=self.rank,
                 world_size=self.world_size,
                 epoch=epoch,
+                pixel_baseline=pixel_baseline,
             )
-            if self.scheduler is None:
-                warmup = (
-                    self.config.curriculum.transition_warmup_epochs
-                    if stage_index > 0 and self.config.experiment.mode == "progressive"
-                    else 0
-                )
-                self.scheduler = build_stage_scheduler(
-                    self.optimizer,
-                    steps_per_epoch=len(loader),
-                    stage_epochs=stage_epochs,
-                    warmup_epochs=warmup,
-                    min_lr_ratio=self.config.optimizer.min_lr_ratio,
-                )
-                if self._pending_scheduler_state is not None:
-                    self.scheduler.load_state_dict(self._pending_scheduler_state)
-                    self._pending_scheduler_state = None
-            execution: nn.Module = compile_model_regions(self.model, self.config.compile)
-            if self.world_size > 1:
-                execution = torch.nn.parallel.DistributedDataParallel(
-                    execution,
-                    device_ids=[self.device.index] if self.device.type == "cuda" else None,
-                )
+            if execution is None:
+                execution = self._build_execution(len(loader))
             execution.train()
             source_model = None
-            if (
-                self.config.experiment.mode == "progressive"
-                and stage_index > 0
-                and self.config.curriculum.source_consistency_weight
-            ):
+            if self.config.curriculum.source_consistency_weight:
                 source_model = self.ema.to_model(self.model).to(self.device).eval()
             for batch in loader:
                 tokens = batch.tokens.to(self.device, non_blocking=True)
                 labels = batch.labels.to(self.device, non_blocking=True)
+                weights = batch.representation_weights.to(
+                    self.device, non_blocking=True
+                )
+                modes = batch.modes.to(self.device, non_blocking=True)
                 self.optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(
                     device_type=self.device.type,
@@ -314,15 +250,14 @@ class ExperimentRunner:
                         execution,
                         tokens,
                         labels,
+                        weights,
                         self.rng,
                         self.config,
-                        stage=stage,
                         source_model=source_model,
                     )
                 result.loss.total.backward()
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
-                    (p for p in self.model.parameters() if p.requires_grad),
-                    self.config.optimizer.gradient_clip,
+                    self.model.parameters(), self.config.optimizer.gradient_clip
                 )
                 self.optimizer.step()
                 assert self.scheduler is not None
@@ -330,47 +265,46 @@ class ExperimentRunner:
                 self.ema.update(self.model)
                 self.global_step += 1
                 self.images_seen += tokens.shape[0] * self.world_size
-                self.estimated_flops += model_flops_per_step(self.config, stage=stage)
-                self.log(
-                    {
-                        "stage": stage,
-                        "epoch": epoch,
-                        "epoch_within_stage": epoch_in_stage,
-                        "step": self.global_step,
-                        "loss": float(result.loss.total.detach()),
-                        "velocity_mse": float(result.loss.velocity_mse.detach()),
-                        "lr": self.optimizer.param_groups[0]["lr"],
-                        "gradient_norm": float(gradient_norm),
-                    }
-                )
+                self.estimated_flops += model_flops_per_step(self.config)
+                metrics: dict[str, float | int | str] = {
+                    "stage": stage_name,
+                    "epoch": epoch,
+                    "epoch_within_stage": epoch_in_stage,
+                    "step": self.global_step,
+                    "loss": float(result.loss.total.detach()),
+                    "velocity_mse": float(result.loss.velocity_mse.detach()),
+                    "target_rms": float(tokens.float().square().mean().sqrt()),
+                    "lr": self.optimizer.param_groups[0]["lr"],
+                    "gradient_norm": float(gradient_norm),
+                }
+                for mode, name in enumerate(MIXTURE_MODE_NAMES):
+                    metrics[f"mode/{name}"] = int((modes == mode).sum())
+                self.log(metrics)
                 if max_steps is not None and self.global_step >= max_steps:
                     self._write_run_metrics(complete=False)
                     return
             self.completed_epoch = epoch + 1
-            complete = self.completed_epoch == total_epochs
-            validation_interval = self.config.validation.interval_epochs
-            validate = complete or (
-                validation_interval > 0
-                and self.completed_epoch % validation_interval == 0
-            )
-            if validate:
+            complete = self.completed_epoch == self.config.total_epochs
+            interval = self.config.validation.interval_epochs
+            if complete or (interval > 0 and self.completed_epoch % interval == 0):
                 ema_model = self.ema.to_model(self.model).to(self.device)
-                validation_loss, preview, preview_labels = validate_stage_loss(
+                validation, preview, preview_labels = validate_stage_loss(
                     ema_model,
                     loader,
                     self.config,
-                    stage=stage,
+                    stage_index=stage_index,
                     epoch=epoch,
                     device=self.device,
                 )
-                self.log(
-                    {
-                        "stage": stage,
-                        "epoch": epoch,
-                        "step": self.global_step,
-                        "validation_loss": validation_loss,
-                    }
+                validation_metrics: dict[str, float | int | str] = {
+                    "stage": stage_name,
+                    "epoch": epoch,
+                    "step": self.global_step,
+                }
+                validation_metrics.update(
+                    {f"validation/{name}": value for name, value in validation.items()}
                 )
+                self.log(validation_metrics)
                 if self.rank == 0 and preview is not None and preview_labels is not None:
                     preview_directory = (
                         Path(self.config.experiment.output_directory) / "validation"
@@ -380,13 +314,15 @@ class ExperimentRunner:
                     save_feature_pca_preview(
                         features,
                         preview_labels,
-                        preview_directory / f"epoch-{self.completed_epoch:04d}-feature-pca.png",
+                        preview_directory
+                        / f"epoch-{self.completed_epoch:04d}-feature-pca.png",
                         128,
                     )
-            if complete:
-                self._finalize_export()
-            interval = self.config.checkpoint.interval_epochs
-            periodic = interval and self.completed_epoch % interval == 0
+            checkpoint_interval = self.config.checkpoint.interval_epochs
+            periodic = (
+                checkpoint_interval
+                and self.completed_epoch % checkpoint_interval == 0
+            )
             if self.rank == 0 and (complete or periodic):
                 self.manager.save(
                     model=self.model,
@@ -410,7 +346,9 @@ class ExperimentRunner:
             "completed_epoch": self.completed_epoch,
             "images_seen": self.images_seen,
             "estimated_flops": self.estimated_flops,
-            "wall_clock_seconds": self.elapsed_before_resume + time.perf_counter() - self.started_at,
+            "wall_clock_seconds": (
+                self.elapsed_before_resume + time.perf_counter() - self.started_at
+            ),
             "peak_memory_bytes": (
                 torch.cuda.max_memory_allocated(self.device)
                 if self.device.type == "cuda"

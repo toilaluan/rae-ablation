@@ -39,7 +39,7 @@ class RNGStreams:
     def load_state_dict(self, state: dict[str, Any]) -> None:
         expected = set(self.state_dict())
         if set(state) != expected:
-            raise ValueError("checkpoint RNG streams are incompatible with schema v3")
+            raise ValueError("checkpoint RNG streams are incompatible with schema v4")
         for name in expected - {"global_cpu", "global_cuda"}:
             getattr(self, name).set_state(state[name])
         torch.random.set_rng_state(state["global_cpu"])

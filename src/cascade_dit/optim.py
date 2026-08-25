@@ -11,32 +11,30 @@ from .config import OptimizerConfig
 def build_optimizer(
     model: nn.Module,
     config: OptimizerConfig,
-    *,
-    transitioned: bool = False,
 ) -> torch.optim.AdamW:
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not parameters:
         raise ValueError("model has no trainable parameters")
-    lr = config.transition_lr if transitioned else config.initial_lr
+    adamw = config.adamw
     return torch.optim.AdamW(
         parameters,
-        lr=lr,
-        betas=(config.beta1, config.beta2),
-        weight_decay=config.weight_decay,
+        lr=adamw.lr,
+        betas=(adamw.betas[0], adamw.betas[1]),
+        weight_decay=adamw.weight_decay,
     )
 
 
-def build_stage_scheduler(
+def build_training_scheduler(
     optimizer: torch.optim.Optimizer,
     *,
     steps_per_epoch: int,
-    stage_epochs: int,
+    total_epochs: int,
     warmup_epochs: int = 0,
     min_lr_ratio: float = 0.0,
 ) -> torch.optim.lr_scheduler.LambdaLR:
-    if steps_per_epoch < 1 or stage_epochs < 1 or warmup_epochs < 0:
-        raise ValueError("invalid stage scheduler counts")
-    total_steps = steps_per_epoch * stage_epochs
+    if steps_per_epoch < 1 or total_epochs < 1 or warmup_epochs < 0:
+        raise ValueError("invalid training scheduler counts")
+    total_steps = steps_per_epoch * total_epochs
     warmup_steps = min(warmup_epochs * steps_per_epoch, total_steps)
 
     def multiplier(step: int) -> float:

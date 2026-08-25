@@ -10,7 +10,7 @@ from cascade_dit.preparation import prepare_representations, representation_mani
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Extract DINO layers, statistics, and full-rank Procrustes alignments"
+        description="Extract configured DINO layers and independent normalization statistics"
     )
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")

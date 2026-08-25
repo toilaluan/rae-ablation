@@ -29,6 +29,7 @@ def _model_x0(
     values: Tensor,
     timestep: Tensor,
     labels: Tensor,
+    representation_weights: Tensor,
     *,
     num_classes: int,
     guidance_scale: float,
@@ -38,13 +39,14 @@ def _model_x0(
     progress = float(1 - timestep[0].item())
     active = guidance_scale != 1 and guidance_start <= progress <= guidance_end
     if not active:
-        return _prediction(model(values, timestep, labels, stage="rgb"))
+        return _prediction(model(values, timestep, labels, representation_weights))
     combined_values = torch.cat((values, values))
     combined_time = torch.cat((timestep, timestep))
     unconditional = torch.full_like(labels, num_classes)
     combined_labels = torch.cat((labels, unconditional))
+    combined_weights = torch.cat((representation_weights, representation_weights))
     conditional, unconditional_prediction = _prediction(
-        model(combined_values, combined_time, combined_labels, stage="rgb")
+        model(combined_values, combined_time, combined_labels, combined_weights)
     ).chunk(2)
     return unconditional_prediction + guidance_scale * (
         conditional - unconditional_prediction
@@ -56,6 +58,7 @@ def sample_tokens(
     model: nn.Module,
     noise: Tensor,
     labels: Tensor,
+    representation_weights: Tensor,
     *,
     steps: int = 40,
     solver: str = "euler",
@@ -74,6 +77,8 @@ def sample_tokens(
         raise ValueError("CFG interval must satisfy 0 <= start < end <= 1")
     if labels.shape != (noise.shape[0],):
         raise ValueError("sampling labels must have shape [B]")
+    if representation_weights.ndim != 2 or representation_weights.shape[0] != noise.shape[0]:
+        raise ValueError("sampling R must have shape [B,levels]")
     base_grid = torch.linspace(1, 0, steps + 1, device=noise.device, dtype=torch.float32)
     grid = shift_timestep(base_grid, timestep_shift)
     values = noise
@@ -85,6 +90,7 @@ def sample_tokens(
             state,
             time,
             labels,
+            representation_weights,
             num_classes=num_classes,
             guidance_scale=guidance_scale,
             guidance_start=guidance_start,

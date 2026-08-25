@@ -12,33 +12,32 @@ def _swiglu_flops(tokens: int, width: int, ratio: float) -> int:
     return 6 * tokens * width * intermediate
 
 
-def lightningdit_forward_flops(config: ExperimentConfig, *, include_pixel_detail: bool = True) -> int:
+def ddt_forward_flops(config: ExperimentConfig) -> int:
     model = config.model
-    total = 2 * TOKEN_COUNT * TOKEN_DIM * model.hidden_size
-    total += model.depth * (
-        _attention_flops(TOKEN_COUNT, model.hidden_size)
-        + _swiglu_flops(TOKEN_COUNT, model.hidden_size, model.mlp_ratio)
-        + 12 * model.hidden_size * model.hidden_size
+    encoder = model.encoder
+    decoder = model.decoder
+    global_tokens = (
+        model.conditioning.timestep_tokens + model.conditioning.class_tokens + 1
     )
-    total += 2 * TOKEN_COUNT * model.hidden_size * TOKEN_DIM
-    detail_hidden = int(TOKEN_DIM * config.detail_heads.token_expansion)
-    total += 4 * TOKEN_COUNT * TOKEN_DIM * model.hidden_size
-    total += config.detail_heads.token_depth * 4 * TOKEN_COUNT * TOKEN_DIM * detail_hidden
-    if include_pixel_detail and config.detail_heads.pixel_enabled:
-        # Convolution estimate is deliberately explicit and architecture-specific.
-        resolutions = (16, 8, 4, 2)
-        inputs = (3, 64, 128, 256)
-        outputs = (64, 128, 256, 512)
-        convolution = 0
-        for side, input_channels, output_channels in zip(
-            resolutions, inputs, outputs, strict=True
-        ):
-            convolution += 2 * side**2 * 9 * input_channels * output_channels
-            convolution += 2 * (side // 2) ** 2 * 16 * output_channels**2
-        total += TOKEN_COUNT * convolution * 2  # down and comparable up paths
+    encoder_tokens = TOKEN_COUNT + global_tokens
+    total = 2 * TOKEN_COUNT * TOKEN_DIM * encoder.width
+    total += encoder.depth * (
+        _attention_flops(encoder_tokens, encoder.width)
+        + _swiglu_flops(
+            encoder_tokens, encoder.width, model.feedforward.mlp_ratio
+        )
+    )
+    if encoder.width != decoder.width:
+        total += 2 * TOKEN_COUNT * encoder.width * decoder.width
+    total += 2 * TOKEN_COUNT * TOKEN_DIM * decoder.width
+    total += decoder.depth * (
+        _attention_flops(TOKEN_COUNT, decoder.width)
+        + _swiglu_flops(TOKEN_COUNT, decoder.width, model.feedforward.mlp_ratio)
+        + 12 * TOKEN_COUNT * decoder.width * decoder.width
+    )
+    total += 2 * TOKEN_COUNT * decoder.width * TOKEN_DIM
     return total
 
 
-def model_flops_per_step(config: ExperimentConfig, *, stage: str = "rgb") -> int:
-    forward = lightningdit_forward_flops(config, include_pixel_detail=stage == "rgb")
-    return config.optimizer.global_batch_size * 3 * forward
+def model_flops_per_step(config: ExperimentConfig) -> int:
+    return config.optimizer.global_batch_size * 3 * ddt_forward_flops(config)

@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 4
 
 IMAGE_SIZE = 128
 PATCH_SIZE = 16
@@ -30,7 +30,7 @@ def _positive(name: str, *values: int | float) -> None:
 @dataclass
 class ExperimentOptions:
     mode: str = "progressive"
-    name: str = "dino-to-pixel-lightningdit-b1"
+    name: str = "adjacent-flow-ddt"
     seed: int = 0
     output_directory: str = "runs/experiment"
 
@@ -52,7 +52,6 @@ class DataConfig:
 class EncoderConfig:
     repository: str = DINO_REPOSITORY
     revision: str = DINO_REVISION
-    layers: list[int] = field(default_factory=lambda: [12, 8, 4])
     patch_size: int = PATCH_SIZE
     hidden_size: int = TOKEN_DIM
     num_register_tokens: int = 4
@@ -60,9 +59,32 @@ class EncoderConfig:
 
 
 @dataclass
+class RepresentationSourceConfig:
+    kind: str = "dino"
+    layer: int | None = None
+
+
+@dataclass
+class RepresentationStageConfig:
+    name: str = ""
+    epochs: int = 20
+    source: RepresentationSourceConfig = field(default_factory=RepresentationSourceConfig)
+
+
+def _default_stages() -> list[RepresentationStageConfig]:
+    return [
+        RepresentationStageConfig("dino12", 20, RepresentationSourceConfig("dino", 12)),
+        RepresentationStageConfig("dino8", 20, RepresentationSourceConfig("dino", 8)),
+        RepresentationStageConfig("dino4", 20, RepresentationSourceConfig("dino", 4)),
+        RepresentationStageConfig("rgb", 20, RepresentationSourceConfig("rgb", None)),
+    ]
+
+
+@dataclass
 class RepresentationsConfig:
-    directory: str = "data/representations"
+    directory: str = "data/direct-representations"
     manifest: str = "manifest.json"
+    stages: list[RepresentationStageConfig] = field(default_factory=_default_stages)
     dtype: str = "bfloat16"
     cache_batch_size: int = 128
     asynchronous_writes: bool = True
@@ -72,61 +94,88 @@ class RepresentationsConfig:
 
 
 @dataclass
-class AlignmentConfig:
-    enabled: bool = True
-    subset_size: int = 50_000
-    subset_seed: int = 17
-    heldout_size: int = 10_000
-    pairs: list[str] = field(
-        default_factory=lambda: ["dino12->dino8", "dino8->dino4", "dino4->rgb"]
-    )
-    identity: bool = False
-    direct_layer12_to_rgb: bool = False
-    svd_driver: str = "gesvd"
+class DDTPathConfig:
+    width: int = 768
+    depth: int = 12
+    heads: int = 12
 
 
 @dataclass
-class ModelConfig:
-    token_dim: int = TOKEN_DIM
-    hidden_size: int = 768
-    depth: int = 12
-    num_heads: int = 12
+class DDTFeedForwardConfig:
     mlp_ratio: float = 4.0
-    num_classes: int = 1000
-    class_dropout_probability: float = 0.1
+
+
+@dataclass
+class DDTAttentionConfig:
     qk_norm: bool = True
-    rms_norm: bool = True
     rope: bool = True
-    swiglu: bool = True
-    adaln_shift: bool = True
-    gradient_checkpointing: bool = False
     sdpa: bool = True
 
 
 @dataclass
-class DetailHeadsConfig:
-    token_enabled: bool = True
-    token_depth: int = 2
-    token_expansion: float = 2.0
-    pixel_enabled: bool = True
-    pixel_channels: list[int] = field(default_factory=lambda: [64, 128, 256, 512])
-    pixel_bottleneck_context: int = TOKEN_DIM
-    zero_initialize: bool = True
+class DDTConditioningConfig:
+    num_classes: int = 1000
+    class_dropout_probability: float = 0.1
+    timestep_tokens: int = 4
+    class_tokens: int = 8
+
+
+@dataclass
+class ModelConfig:
+    architecture: str = "ddt"
+    token_dim: int = TOKEN_DIM
+    encoder: DDTPathConfig = field(default_factory=DDTPathConfig)
+    decoder: DDTPathConfig = field(
+        default_factory=lambda: DDTPathConfig(width=2048, depth=2, heads=16)
+    )
+    feedforward: DDTFeedForwardConfig = field(default_factory=DDTFeedForwardConfig)
+    attention: DDTAttentionConfig = field(default_factory=DDTAttentionConfig)
+    conditioning: DDTConditioningConfig = field(default_factory=DDTConditioningConfig)
+    gradient_checkpointing: bool = False
+
+    @property
+    def num_classes(self) -> int:
+        return self.conditioning.num_classes
+
+    @property
+    def class_dropout_probability(self) -> float:
+        return self.conditioning.class_dropout_probability
+
+
+@dataclass
+class AdjacentMixConfig:
+    probability: float = 0.10
+    distribution: str = "uniform"
+    minimum: float = 0.0
+    maximum: float = 1.0
+
+
+@dataclass
+class AllLevelsMixConfig:
+    probability: float = 0.025
+    distribution: str = "uniform_simplex"
+    concentration: float = 1.0
+
+
+@dataclass
+class MixingConfig:
+    adjacent: AdjacentMixConfig = field(default_factory=AdjacentMixConfig)
+    pure_next_probability: float = 0.025
+    all_levels: AllLevelsMixConfig = field(default_factory=AllLevelsMixConfig)
+    final_stage: str = "pure"
+
+    @property
+    def pure_current_probability(self) -> float:
+        return 1.0 - (
+            self.adjacent.probability
+            + self.pure_next_probability
+            + self.all_levels.probability
+        )
 
 
 @dataclass
 class CurriculumConfig:
-    stages: list[str] = field(
-        default_factory=lambda: ["dino12", "dino8", "dino4", "rgb"]
-    )
-    epochs: list[int] = field(default_factory=lambda: [20, 20, 20, 20])
-    transition_warmup_epochs: int = 1
-    fully_train_blocks: list[int] = field(default_factory=lambda: [0, 1, 10, 11])
-    lora_blocks: list[int] = field(default_factory=lambda: list(range(2, 10)))
-    lora_rank: int = 16
-    lora_alpha: float = 16.0
-    lora_dropout: float = 0.05
-    later_stage_full_finetune: bool = False
+    mixing: MixingConfig = field(default_factory=MixingConfig)
     source_consistency_weight: float = 0.0
 
 
@@ -144,18 +193,27 @@ class ObjectiveConfig:
 
 
 @dataclass
+class AdamWConfig:
+    lr: float = 2e-4
+    betas: list[float] = field(default_factory=lambda: [0.9, 0.95])
+    weight_decay: float = 0.0
+
+
+@dataclass
+class SchedulerConfig:
+    kind: str = "cosine"
+    warmup_epochs: int = 0
+    min_lr_ratio: float = 0.0
+
+
+@dataclass
 class OptimizerConfig:
     kind: str = "adamw"
-    initial_lr: float = 2e-4
-    transition_lr: float = 5e-5
-    beta1: float = 0.9
-    beta2: float = 0.95
-    weight_decay: float = 0.0
+    adamw: AdamWConfig = field(default_factory=AdamWConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     gradient_clip: float = 1.0
     global_batch_size: int = 1024
     ema_decay: float = 0.9999
-    schedule: str = "cosine"
-    min_lr_ratio: float = 0.0
 
 
 @dataclass
@@ -181,8 +239,8 @@ class ValidationConfig:
 class CheckpointConfig:
     directory: str = "checkpoints"
     interval_epochs: int = 5
-    save_boundary_before: bool = True
-    save_boundary_after: bool = True
+    save_stage_boundaries: bool = True
+    keep_last_n: int = 8
     resume: str | None = None
 
 
@@ -199,7 +257,7 @@ class CompileConfig:
 class WandbConfig:
     enabled: bool = False
     entity: str | None = None
-    project: str = "dino-to-pixel-lightningdit"
+    project: str = "adjacent-flow-ddt"
     name: str | None = None
     group: str | None = None
     tags: list[str] = field(default_factory=list)
@@ -225,9 +283,7 @@ class ExperimentConfig:
     data: DataConfig = field(default_factory=DataConfig)
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     representations: RepresentationsConfig = field(default_factory=RepresentationsConfig)
-    alignment: AlignmentConfig = field(default_factory=AlignmentConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
-    detail_heads: DetailHeadsConfig = field(default_factory=DetailHeadsConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     objective: ObjectiveConfig = field(default_factory=ObjectiveConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -239,8 +295,28 @@ class ExperimentConfig:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     @property
+    def stages(self) -> list[RepresentationStageConfig]:
+        return self.representations.stages
+
+    @property
+    def stage_names(self) -> list[str]:
+        return [stage.name for stage in self.stages]
+
+    @property
+    def dino_layers(self) -> list[int]:
+        return [
+            int(stage.source.layer)
+            for stage in self.stages
+            if stage.source.kind == "dino" and stage.source.layer is not None
+        ]
+
+    @property
     def total_epochs(self) -> int:
-        return sum(self.curriculum.epochs)
+        return sum(stage.epochs for stage in self.stages)
+
+    @property
+    def num_representation_levels(self) -> int:
+        return len(self.stages)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -249,8 +325,7 @@ class ExperimentConfig:
         if self.schema_version != CONFIG_SCHEMA_VERSION:
             raise ValueError(
                 f"configuration schema {self.schema_version!r} is unsupported; "
-                f"schema_version: {CONFIG_SCHEMA_VERSION} is required. DDT/Mage "
-                "configs cannot be migrated."
+                f"schema_version: {CONFIG_SCHEMA_VERSION} is required"
             )
         if self.experiment.mode not in {"progressive", "pixel_baseline"}:
             raise ValueError("experiment.mode must be progressive or pixel_baseline")
@@ -266,14 +341,11 @@ class ExperimentConfig:
             DINO_REVISION,
         ):
             raise ValueError("encoder must use the pinned DINOv3-B/16 revision")
-        if self.encoder.layers != [12, 8, 4]:
-            raise ValueError("encoder.layers must be the one-indexed layers [12, 8, 4]")
         if (self.encoder.patch_size, self.encoder.hidden_size) != (PATCH_SIZE, TOKEN_DIM):
-            raise ValueError("DINOv3-B/16 representations must use 16px patches and width 768")
-        if self.encoder.num_register_tokens != 4:
-            raise ValueError("the pinned DINOv3-B/16 encoder must use four register tokens")
-        if not self.encoder.apply_final_norm:
-            raise ValueError("every selected DINO intermediate must use the final norm")
+            raise ValueError("DINO representations must use 16px patches and width 768")
+        if self.encoder.num_register_tokens != 4 or not self.encoder.apply_final_norm:
+            raise ValueError("DINO extraction requires four registers and final normalization")
+        self._validate_stages()
         if self.representations.dtype != "bfloat16":
             raise ValueError("representations.dtype must be bfloat16")
         if self.representations.statistics_dtype != "float64":
@@ -285,73 +357,21 @@ class ExperimentConfig:
             self.representations.cache_batch_size,
             self.representations.normalization_epsilon,
         )
-        if self.model.token_dim != TOKEN_DIM:
-            raise ValueError("model.token_dim must be 768 for raw DINO/RGB patch tokens")
-        if (self.model.depth, self.model.hidden_size, self.model.num_heads) != (12, 768, 12):
-            raise ValueError("the experiment requires official LightningDiT-B/1 dimensions")
-        if self.model.num_classes != 1000:
-            raise ValueError("class-conditional ImageNet requires model.num_classes=1000")
-        if not all(
-            (
-                self.model.qk_norm,
-                self.model.rms_norm,
-                self.model.rope,
-                self.model.swiglu,
-                self.model.adaln_shift,
-                self.model.sdpa,
-            )
-        ):
-            raise ValueError("LightningDiT must retain QK/RMS norm, RoPE, SwiGLU, AdaLN, and SDPA")
-        _positive(
-            "model dimensions", self.model.hidden_size, self.model.depth,
-            self.model.num_heads, self.model.mlp_ratio, self.model.num_classes,
-        )
-        if self.model.hidden_size % self.model.num_heads:
-            raise ValueError("model.hidden_size must be divisible by model.num_heads")
-        if (self.model.hidden_size // self.model.num_heads) % 4:
-            raise ValueError("the attention head dimension must be divisible by four for 2D RoPE")
-        if not 0 <= self.model.class_dropout_probability < 1:
-            raise ValueError("model.class_dropout_probability must be in [0,1)")
-        if self.detail_heads.token_depth != 2:
-            raise ValueError("detail_heads.token_depth must be 2")
-        if not self.detail_heads.token_enabled or not self.detail_heads.pixel_enabled:
-            raise ValueError("the primary architecture requires both detail heads")
-        if not self.detail_heads.zero_initialize:
-            raise ValueError("detail-head output projections must be zero initialized")
-        if self.detail_heads.pixel_bottleneck_context != TOKEN_DIM:
-            raise ValueError("the RGB detail bottleneck context must have width 768")
-        if self.detail_heads.pixel_channels != [64, 128, 256, 512]:
-            raise ValueError("detail_heads.pixel_channels must be [64, 128, 256, 512]")
-        if self.curriculum.stages != ["dino12", "dino8", "dino4", "rgb"]:
-            raise ValueError("curriculum.stages must be dino12, dino8, dino4, rgb")
-        if len(self.curriculum.epochs) != 4 or any(epoch <= 0 for epoch in self.curriculum.epochs):
-            raise ValueError("curriculum.epochs must contain four positive epoch counts")
-        all_blocks = self.curriculum.fully_train_blocks + self.curriculum.lora_blocks
-        if len(all_blocks) != len(set(all_blocks)):
-            raise ValueError("curriculum full-train and LoRA block lists must be disjoint")
-        if any(index < 0 or index >= self.model.depth for index in all_blocks):
-            raise ValueError("curriculum block index is outside model.depth")
-        if self.curriculum.later_stage_full_finetune and self.curriculum.lora_blocks:
-            raise ValueError("full-finetune override requires curriculum.lora_blocks=[]")
-        _positive("LoRA settings", self.curriculum.lora_rank, self.curriculum.lora_alpha)
-        if not 0 <= self.curriculum.lora_dropout < 1:
-            raise ValueError("curriculum.lora_dropout must be in [0,1)")
+        self._validate_model()
+        self._validate_mixing()
+        if self.curriculum.source_consistency_weight < 0:
+            raise ValueError("source consistency weight cannot be negative")
         if self.objective.prediction != "x0" or self.objective.loss_space != "velocity":
-            raise ValueError("the experiment requires clean-x0 prediction with velocity-space loss")
+            raise ValueError("the experiment requires x0 prediction with velocity loss")
         if self.objective.timestep_distribution != "shifted_logit_normal":
-            raise ValueError("objective.timestep_distribution must be shifted_logit_normal")
+            raise ValueError("objective timestep distribution must be shifted_logit_normal")
         _positive(
-            "objective settings", self.objective.timestep_scale,
-            self.objective.timestep_shift, self.objective.denominator_floor,
+            "objective settings",
+            self.objective.timestep_scale,
+            self.objective.timestep_shift,
+            self.objective.denominator_floor,
         )
-        if self.optimizer.kind != "adamw" or self.optimizer.schedule != "cosine":
-            raise ValueError("this experiment uses AdamW with per-stage cosine decay")
-        _positive(
-            "optimizer settings", self.optimizer.initial_lr, self.optimizer.transition_lr,
-            self.optimizer.global_batch_size, self.optimizer.gradient_clip,
-        )
-        if not 0 < self.optimizer.ema_decay < 1:
-            raise ValueError("optimizer.ema_decay must be in (0,1)")
+        self._validate_optimizer()
         if self.sampling.solver not in {"euler", "heun"}:
             raise ValueError("sampling.solver must be euler or heun")
         _positive(
@@ -362,30 +382,102 @@ class ExperimentConfig:
         )
         if not 0 <= self.sampling.guidance_start < self.sampling.guidance_end <= 1:
             raise ValueError("sampling guidance interval must satisfy 0 <= start < end <= 1")
-        if not all(
-            math.isfinite(value)
-            for value in (self.sampling.guidance_scale, self.sampling.timestep_shift)
-        ):
-            raise ValueError("sampling guidance and timestep shift must be finite")
         if self.data.workers < 0 or self.data.prefetch_factor < 1:
             raise ValueError("data workers must be non-negative and prefetch_factor positive")
         if self.data.max_samples is not None and self.data.max_samples < 1:
             raise ValueError("data.max_samples must be positive")
-        if self.alignment.subset_size < 1 or self.alignment.heldout_size < 1:
-            raise ValueError("alignment subset and held-out sizes must be positive")
-        required_pairs = {"dino12->dino8", "dino8->dino4", "dino4->rgb"}
-        if not required_pairs.issubset(self.alignment.pairs):
-            raise ValueError("alignment.pairs must contain all consecutive curriculum pairs")
-        if len(self.alignment.pairs) != len(set(self.alignment.pairs)):
-            raise ValueError("alignment.pairs cannot contain duplicates")
-        if self.alignment.svd_driver not in {"gesvd", "gesvdj"}:
-            raise ValueError("alignment.svd_driver must be gesvd or gesvdj")
         if self.wandb.mode not in {"online", "offline", "disabled"}:
             raise ValueError("wandb.mode must be online, offline, or disabled")
         if set(self.evaluation.metrics) != {"fid", "is"}:
             raise ValueError("evaluation.metrics must contain fid and is")
         if self.evaluation.num_samples % self.model.num_classes:
             raise ValueError("evaluation.num_samples must be class balanced")
+
+    def _validate_stages(self) -> None:
+        if len(self.stages) < 2:
+            raise ValueError("at least two ordered representation stages are required")
+        names = self.stage_names
+        if any(not name for name in names) or len(names) != len(set(names)):
+            raise ValueError("representation stage names must be non-empty and unique")
+        if any(stage.epochs < 1 for stage in self.stages):
+            raise ValueError("every representation stage must have positive epochs")
+        rgb = [index for index, stage in enumerate(self.stages) if stage.source.kind == "rgb"]
+        if rgb != [len(self.stages) - 1]:
+            raise ValueError("exactly one RGB representation is required as the final stage")
+        layers: list[int] = []
+        for stage in self.stages:
+            source = stage.source
+            if source.kind == "dino":
+                if source.layer is None or not 1 <= source.layer <= 12:
+                    raise ValueError("DINO stages require a one-indexed layer in [1,12]")
+                layers.append(source.layer)
+            elif source.kind == "rgb":
+                if source.layer is not None:
+                    raise ValueError("RGB stage source.layer must be null")
+            else:
+                raise ValueError("representation source kind must be dino or rgb")
+        if len(layers) != len(set(layers)):
+            raise ValueError("DINO representation layers must be unique")
+
+    def _validate_model(self) -> None:
+        if self.model.architecture != "ddt" or self.model.token_dim != TOKEN_DIM:
+            raise ValueError("model must be a 768-dimensional universal DDT")
+        for name, path in (("encoder", self.model.encoder), ("decoder", self.model.decoder)):
+            _positive(f"model {name}", path.width, path.depth, path.heads)
+            if path.width % path.heads or (path.width // path.heads) % 4:
+                raise ValueError(f"model.{name} head width must be divisible by four")
+        _positive(
+            "model settings",
+            self.model.feedforward.mlp_ratio,
+            self.model.num_classes,
+            self.model.conditioning.timestep_tokens,
+            self.model.conditioning.class_tokens,
+        )
+        if not 0 <= self.model.class_dropout_probability < 1:
+            raise ValueError("class dropout probability must be in [0,1)")
+
+    def _validate_mixing(self) -> None:
+        mixing = self.curriculum.mixing
+        probabilities = (
+            mixing.adjacent.probability,
+            mixing.pure_next_probability,
+            mixing.all_levels.probability,
+        )
+        if any(not math.isfinite(value) or value < 0 for value in probabilities):
+            raise ValueError("mixture probabilities must be finite and non-negative")
+        if mixing.pure_current_probability < 0:
+            raise ValueError("mixture probabilities cannot sum above one")
+        adjacent = mixing.adjacent
+        if adjacent.distribution != "uniform":
+            raise ValueError("adjacent mixture distribution must be uniform")
+        if not 0 <= adjacent.minimum < adjacent.maximum <= 1:
+            raise ValueError("adjacent uniform bounds must satisfy 0 <= min < max <= 1")
+        if mixing.all_levels.distribution != "uniform_simplex":
+            raise ValueError("all-level distribution must be uniform_simplex")
+        _positive("all-level concentration", mixing.all_levels.concentration)
+        if mixing.final_stage != "pure":
+            raise ValueError("the final representation stage must be pure")
+
+    def _validate_optimizer(self) -> None:
+        values = self.optimizer
+        if values.kind != "adamw" or values.scheduler.kind != "cosine":
+            raise ValueError("optimizer must be AdamW with one global cosine schedule")
+        if len(values.adamw.betas) != 2 or not all(
+            0 <= beta < 1 for beta in values.adamw.betas
+        ):
+            raise ValueError("optimizer.adamw.betas must contain two values in [0,1)")
+        _positive(
+            "optimizer settings",
+            values.adamw.lr,
+            values.global_batch_size,
+            values.gradient_clip,
+        )
+        if values.scheduler.warmup_epochs < 0:
+            raise ValueError("scheduler warmup epochs cannot be negative")
+        if not 0 <= values.scheduler.min_lr_ratio <= 1:
+            raise ValueError("scheduler min_lr_ratio must be in [0,1]")
+        if not 0 < values.ema_decay < 1:
+            raise ValueError("optimizer.ema_decay must be in (0,1)")
 
 
 def _structured_config(values: dict[str, Any]) -> ExperimentConfig:
@@ -407,21 +499,24 @@ def _require_current(values: object, source: str | Path) -> dict[str, Any]:
     if not isinstance(values, dict):
         raise ValueError(f"{source} must contain a configuration object")
     if values.get("schema_version") != CONFIG_SCHEMA_VERSION:
-        legacy = {"image_latents", "semantic_tokens", "train"} & set(values)
-        suffix = " DDT/Mage checkpoints and configs are intentionally unsupported." if legacy else ""
         raise ValueError(
-            f"{source} uses unsupported configuration schema {values.get('schema_version')!r}; "
-            f"schema_version: {CONFIG_SCHEMA_VERSION} is required.{suffix}"
+            f"{source} uses unsupported configuration schema "
+            f"{values.get('schema_version')!r}; schema_version: "
+            f"{CONFIG_SCHEMA_VERSION} is required. Alignment-era LightningDiT and "
+            "legacy DDT/Mage configurations are not supported."
         )
     return values
 
 
-def load_config(path: str | Path | None = None, overrides: list[str] | None = None) -> ExperimentConfig:
+def load_config(
+    path: str | Path | None = None, overrides: list[str] | None = None
+) -> ExperimentConfig:
     from omegaconf import OmegaConf
 
     values: dict[str, Any] = {"schema_version": CONFIG_SCHEMA_VERSION}
     if path is not None:
-        values = _require_current(OmegaConf.to_container(OmegaConf.load(path), resolve=True), path)
+        loaded = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
+        values = _require_current(loaded, path)
     if overrides:
         override_values = OmegaConf.to_container(OmegaConf.from_dotlist(overrides), resolve=True)
         if not isinstance(override_values, dict):
