@@ -124,3 +124,17 @@ def test_lora_target_groups_are_configurable() -> None:
     wrapped = [name for name, module in model.named_modules() if isinstance(module, LoRALinear)]
     assert wrapped
     assert all(".attention." in name for name in wrapped)
+
+
+def test_lora_adapters_follow_the_wrapped_weight_placement() -> None:
+    model = _model().to(dtype=torch.float64)
+
+    apply_lora(model, LoRAConfig(target_groups=["attention"]))
+
+    for module in model.modules():
+        if not isinstance(module, LoRALinear):
+            continue
+        assert module.adapter_a.weight.device == module.base.weight.device
+        assert module.adapter_b.weight.device == module.base.weight.device
+        assert module.adapter_a.weight.dtype == module.base.weight.dtype
+        assert module.adapter_b.weight.dtype == module.base.weight.dtype

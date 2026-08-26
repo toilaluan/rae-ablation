@@ -20,6 +20,8 @@ class LoRALinear(nn.Module):
         self.scaling = config.alpha / config.rank
         nn.init.kaiming_uniform_(self.adapter_a.weight, a=math.sqrt(5))
         nn.init.zeros_(self.adapter_b.weight)
+        self.adapter_a.to(device=base.weight.device, dtype=base.weight.dtype)
+        self.adapter_b.to(device=base.weight.device, dtype=base.weight.dtype)
 
     def forward(self, values: Tensor) -> Tensor:
         residual = self.adapter_b(self.adapter_a(self.dropout(values)))
