@@ -12,8 +12,8 @@ data:
   split: train
   validation_split: validation
   image_size: 128
-  workers: 16
-  prefetch_factor: 4
+  workers: 8
+  prefetch_factor: 2
   max_samples: null
   shuffle: true
 
@@ -30,7 +30,7 @@ representations:
   manifest: manifest.json
   stages:
     - name: dino12
-      epochs: 15
+      epochs: 50
       source: {kind: dino, layer: 12}
       timestep_shift: 4.0
     - name: dino8
@@ -38,9 +38,9 @@ representations:
       source: {kind: dino, layer: 8}
       timestep_shift: 4.0
     - name: rgb
-      epochs: 30
+      epochs: 120
       source: {kind: rgb, layer: null}
-      timestep_shift: 4.0
+      timestep_shift: 7.0
   dtype: bfloat16
   cache_batch_size: 256
   asynchronous_writes: true
@@ -52,9 +52,9 @@ model:
   architecture: ddt
   token_dim: 768
   encoder:
-    width: 1152
+    width: 768
     depth: 12
-    heads: 16
+    heads: 12
   decoder:
     width: 2048
     depth: 2
@@ -75,13 +75,13 @@ model:
 curriculum:
   mixing:
     adjacent:
-      probability: 0.10
+      probability: 0.1
       distribution: uniform
       minimum: 0.0
       maximum: 1.0
-    pure_next_probability: 0.025
+    pure_next_probability: 0.0
     all_levels:
-      probability: 0.025
+      probability: 0.0
       distribution: uniform_simplex
       concentration: 1.0
     final_stage: pure
@@ -104,12 +104,12 @@ optimizer:
     betas: [0.9, 0.95]
     weight_decay: 0.0
   scheduler:
-    kind: cosine
+    kind: constant
     warmup_epochs: 0
     min_lr_ratio: 0.0
   gradient_clip: 1.0
   global_batch_size: 1024
-  ema_decay: 0.9995
+  ema_decay: 0.999
 
 sampling:
   steps: 50
