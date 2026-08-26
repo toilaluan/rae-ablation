@@ -318,7 +318,20 @@ def sample_to_archive(
         torch.from_numpy(np.asarray(completion[positions.numpy()] == 0))
     ]
     started = time.perf_counter()
+    done = 0
     for beginning in range(0, pending.numel(), parameters.batch_size):
+        if rank == 0:
+            done += min(parameters.batch_size, pending.numel() - beginning)
+            elapsed = time.perf_counter() - started
+            remaining = (elapsed / done) * (pending.numel() - done) if done else 0.0
+            print(
+                f"[{rank}/{world_size}] "
+                f"sampling {done}/{pending.numel()} "
+                f"({done / pending.numel():.1%}) "
+                f"elapsed {elapsed:.1f}s "
+                f"remaining {remaining:.1f}s",
+                flush=True,
+            )
         batch_positions = pending[beginning : beginning + parameters.batch_size]
         generated = generate_batch(labels[batch_positions], seeds[batch_positions])
         expected = batch_positions.numel()

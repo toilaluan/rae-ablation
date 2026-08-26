@@ -31,8 +31,8 @@ pixel_training:
   use_representation_guiding: true
   lora:
     use_lora: false
-    rank: 8
-    alpha: 8.0
+    rank: 256
+    alpha: 256.0
     dropout: 0.0
     target_groups: [attention, feedforward, conditioning, projections]
   representations:
@@ -43,10 +43,10 @@ pixel_training:
         epochs: 50
         source: {kind: dino, layer: 12}
         timestep_shift: 4.0
-      - name: dino8
-        epochs: 5
-        source: {kind: dino, layer: 8}
-        timestep_shift: 4.0
+      # - name: dino8
+      #   epochs: 5
+      #   source: {kind: dino, layer: 8}
+      #   timestep_shift: 4.0
     dtype: bfloat16
     cache_batch_size: 256
     asynchronous_writes: true
