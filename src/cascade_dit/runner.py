@@ -24,6 +24,7 @@ from .data import (
     RepresentationBatchPreprocessor,
     data_fingerprint,
     make_stage_loader,
+    set_stage_loader_epoch,
 )
 from .distributed import broadcast_string
 from .evaluation import evaluate_npz, save_evaluation
@@ -652,6 +653,7 @@ class ExperimentRunner:
 
     def run(self, *, max_steps: int | None = None) -> None:
         execution: nn.Module | None = None
+        loader = None
         pixel_only = not self.config.pixel_training.use_representation_guiding
         for epoch, stage_index, stage_name, epoch_in_stage in self._epochs():
             pixel_stage = stage_index == self.representation_levels - 1
@@ -661,15 +663,19 @@ class ExperimentRunner:
                     self._activate_lora()
                     self.optimizer = build_optimizer(self.model, self.config.optimizer)
                     execution = None
-            loader = make_stage_loader(
-                self.config,
-                stage_index,
-                rank=self.rank,
-                world_size=self.world_size,
-                epoch=epoch_in_stage if pixel_only else epoch,
-                pixel_only=pixel_only,
-                representation_levels=self.representation_levels,
-            )
+            data_epoch = epoch_in_stage if pixel_only else epoch
+            if loader is None:
+                loader = make_stage_loader(
+                    self.config,
+                    stage_index,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    epoch=data_epoch,
+                    pixel_only=pixel_only,
+                    representation_levels=self.representation_levels,
+                )
+            else:
+                set_stage_loader_epoch(loader, stage_index, data_epoch)
             if execution is None:
                 execution = self._build_execution(len(loader))
             execution.train()

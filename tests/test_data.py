@@ -15,10 +15,12 @@ from cascade_dit.data import (
     ALL_LEVELS_MIX,
     PURE_CURRENT,
     PURE_NEXT,
+    MixedRepresentationDataset,
     RepresentationBatchPreprocessor,
     prepare_pixels,
     representation_collator,
     sample_representation_weights,
+    set_stage_loader_epoch,
 )
 from cascade_dit.representations import RepresentationManifest, patchify_rgb
 
@@ -75,6 +77,53 @@ def test_dynamic_level_count_and_final_stage_are_supported() -> None:
     assert final.mode == baseline.mode == PURE_CURRENT
     assert torch.equal(final.weights, torch.tensor([0.0, 0.0, 1.0]))
     assert torch.equal(baseline.weights, final.weights)
+
+
+def test_stage_loader_epoch_updates_shared_dataset_and_sampler_state() -> None:
+    config = ExperimentConfig()
+    levels = config.num_representation_levels
+
+    class TinyDataset:
+        def __len__(self) -> int:
+            return 1
+
+        def get_item(self, index: int, *, load_pixels: bool):
+            pixels = torch.zeros(3, 128, 128, dtype=torch.uint8) if load_pixels else None
+            return pixels, 0, index
+
+    manifest = RepresentationManifest(
+        dataset_size=1,
+        dataset_fingerprint="dataset",
+        encoder_fingerprint="encoder",
+        preparation_fingerprint="preparation",
+        stages=[],
+        statistics={},
+        cache_files={},
+        completion_files={},
+        complete=True,
+    )
+    dataset = MixedRepresentationDataset(
+        TinyDataset(),  # type: ignore[arg-type]
+        levels - 1,
+        0,
+        config,
+        manifest,
+        ".",
+        pixel_only=True,
+    )
+    sampler = torch.utils.data.DistributedSampler(
+        dataset, num_replicas=1, rank=0, shuffle=True
+    )
+    loader = torch.utils.data.DataLoader(dataset, batch_size=1, sampler=sampler)
+
+    assert dataset._stage_epoch.is_shared()
+    set_stage_loader_epoch(loader, levels - 1, 7)
+
+    assert dataset.stage_index == levels - 1
+    assert dataset.epoch == 7
+    assert sampler.epoch == 7
+    with pytest.raises(ValueError, match="non-negative"):
+        set_stage_loader_epoch(loader, levels - 1, -1)
 
 
 def test_sparse_raw_batches_are_preprocessed_like_the_cpu_reference() -> None:

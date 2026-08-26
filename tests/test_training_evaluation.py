@@ -186,3 +186,77 @@ def test_pixel_lora_resume_uses_active_config_and_checkpoint_tensor_width(
         for name, parameter in runner.model.named_parameters()
         if parameter.requires_grad
     )
+
+
+def test_run_reuses_one_loader_across_epochs(monkeypatch) -> None:
+    config = ExperimentConfig()
+    config.pixel_training.use_representation_guiding = False
+    config.pixel_training.epochs = 3
+    config.validation.interval_epochs = 0
+    config.checkpoint.interval_epochs = 0
+
+    class OneBatchLoader:
+        def __len__(self) -> int:
+            return 1
+
+        def __iter__(self):
+            return iter([None])
+
+    loader = OneBatchLoader()
+    builds: list[dict[str, object]] = []
+    advances: list[tuple[int, int]] = []
+
+    def make_loader(*_args, **kwargs):
+        builds.append(kwargs)
+        return loader
+
+    monkeypatch.setattr(runner_module, "make_stage_loader", make_loader)
+    monkeypatch.setattr(
+        runner_module,
+        "set_stage_loader_epoch",
+        lambda _loader, stage_index, epoch: advances.append((stage_index, epoch)),
+    )
+    monkeypatch.setattr(runner_module, "model_flops_per_step", lambda _config: 0)
+
+    runner = object.__new__(ExperimentRunner)
+    runner.config = config
+    runner.rank = 0
+    runner.world_size = 1
+    runner.device = torch.device("cpu")
+    runner.representation_levels = config.num_representation_levels
+    runner.completed_epoch = 0
+    runner.pixel_completed_epoch = 0
+    runner.stage_index = runner.representation_levels - 1
+    runner.global_step = 0
+    runner.images_seen = 0
+    runner.estimated_flops = 0
+    runner.model = nn.Linear(1, 1, bias=False)
+    runner.optimizer = torch.optim.SGD(runner.model.parameters(), lr=0.1)
+    runner.scheduler = torch.optim.lr_scheduler.LambdaLR(
+        runner.optimizer, lr_lambda=lambda _step: 1.0
+    )
+    runner.ema = SimpleNamespace(update=lambda _model: None)
+    runner.rng = object()
+    runner.log = lambda _metrics: None
+    runner._build_execution = lambda _steps: runner.model
+    runner._write_run_metrics = lambda **_kwargs: None
+    runner.batch_preprocessor = lambda _batch: SimpleNamespace(
+        tokens=torch.ones(1, 1, 1),
+        labels=torch.zeros(1, dtype=torch.int64),
+        representation_weights=torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+        modes=torch.zeros(1, dtype=torch.int64),
+    )
+
+    def training_loss(execution, *_args, **_kwargs):
+        total = execution.weight.square().sum()
+        return SimpleNamespace(
+            loss=SimpleNamespace(total=total, velocity_mse=total.detach())
+        )
+
+    monkeypatch.setattr(runner_module, "compute_training_loss", training_loss)
+
+    runner.run(max_steps=2)
+
+    assert len(builds) == 1
+    assert builds[0]["epoch"] == 0
+    assert advances == [(runner.representation_levels - 1, 1)]

@@ -226,12 +226,12 @@ class MixedRepresentationDataset(Dataset[RawRepresentationSample]):
         representation_levels: int | None = None,
     ) -> None:
         self.dataset = dataset
-        self.stage_index = stage_index
-        self.epoch = epoch
         self.config = config
         self.manifest = manifest
         self.pixel_only = pixel_only
         self.representation_levels = representation_levels or config.num_representation_levels
+        self._stage_epoch = torch.tensor(0, dtype=torch.int64).share_memory_()
+        self.set_epoch(stage_index, epoch)
         self.caches: dict[str, np.memmap] = {}
         if pixel_only:
             return
@@ -245,6 +245,22 @@ class MixedRepresentationDataset(Dataset[RawRepresentationSample]):
                 dtype=np.uint16,
                 shape=(len(dataset), TOKEN_COUNT, TOKEN_DIM),
             )
+
+    @property
+    def stage_index(self) -> int:
+        return int(self._stage_epoch.item()) % self.representation_levels
+
+    @property
+    def epoch(self) -> int:
+        return int(self._stage_epoch.item()) // self.representation_levels
+
+    def set_epoch(self, stage_index: int, epoch: int) -> None:
+        """Update curriculum state visible to persistent DataLoader workers."""
+        if not 0 <= stage_index < self.representation_levels:
+            raise ValueError("unknown training stage index")
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative")
+        self._stage_epoch.fill_(epoch * self.representation_levels + stage_index)
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -265,10 +281,13 @@ class MixedRepresentationDataset(Dataset[RawRepresentationSample]):
         return torch.from_numpy(values).view(torch.bfloat16)
 
     def __getitem__(self, index: int) -> RawRepresentationSample:
+        state = int(self._stage_epoch.item())
+        stage_index = state % self.representation_levels
+        epoch = state // self.representation_levels
         choice = sample_representation_weights(
             self.config,
-            self.stage_index,
-            self.epoch,
+            stage_index,
+            epoch,
             index,
             pixel_only=self.pixel_only,
             representation_levels=self.representation_levels,
@@ -462,3 +481,19 @@ def make_stage_loader(
         prefetch_factor=config.data.prefetch_factor if config.data.workers > 0 else None,
         drop_last=True,
     )
+
+
+def set_stage_loader_epoch(
+    loader: DataLoader,
+    stage_index: int,
+    epoch: int,
+) -> None:
+    """Advance a reusable stage loader without recreating its dataset or workers."""
+    dataset = loader.dataset
+    sampler = loader.sampler
+    if not isinstance(dataset, MixedRepresentationDataset):
+        raise TypeError("stage loader has an unexpected dataset")
+    if not isinstance(sampler, DistributedSampler):
+        raise TypeError("stage loader has an unexpected sampler")
+    dataset.set_epoch(stage_index, epoch)
+    sampler.set_epoch(epoch)
