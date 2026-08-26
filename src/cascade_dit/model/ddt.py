@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -209,33 +211,44 @@ class LabelEmbedder(nn.Module):
         return self.embedding(labels)[:, None] + self.tokens
 
 
-class RepresentationEmbedder(nn.Module):
-    def __init__(self, levels: int, width: int) -> None:
+class PixelRatioEmbedder(nn.Module):
+    def __init__(self, width: int) -> None:
         super().__init__()
-        self.levels = levels
-        self.embedding = nn.Parameter(torch.randn(levels, width) / width**0.5)
+        self.semantic = nn.Parameter(torch.randn(width) / width**0.5)
+        self.pixel = nn.Parameter(torch.randn(width) / width**0.5)
 
-    def forward(self, weights: Tensor) -> Tensor:
-        if weights.ndim != 2 or weights.shape[1] != self.levels:
-            raise ValueError(f"R must have shape [B,{self.levels}]")
-        if not torch.compiler.is_compiling():
-            if not torch.isfinite(weights).all() or torch.any(weights < 0):
-                raise ValueError("R must be finite and non-negative")
-            sums = weights.float().sum(dim=-1)
-            if not torch.allclose(sums, torch.ones_like(sums), atol=1e-5, rtol=1e-5):
-                raise ValueError("every R row must sum to one")
-        return weights.to(self.embedding) @ self.embedding
+    def forward(self, pixel_ratio: Tensor) -> Tensor:
+        if pixel_ratio.ndim != 1:
+            raise ValueError("pixel_ratio must have shape [B]")
+        if not torch.compiler.is_compiling() and (
+            not torch.isfinite(pixel_ratio).all()
+            or torch.any(
+                (pixel_ratio < 0) | (pixel_ratio > 1)
+            )
+        ):
+            raise ValueError("pixel_ratio must be finite and in [0,1]")
+        ratio = pixel_ratio.to(self.semantic)[:, None]
+        return torch.lerp(self.semantic[None], self.pixel[None], ratio)
+
+
+PredictionMode = Literal["semantic", "mixed", "pixel"]
+
+
+@dataclass(frozen=True)
+class DDTOutput:
+    prediction: Tensor
+    semantic_x0: Tensor | None = None
+    pixel_x0: Tensor | None = None
 
 
 class DDT(nn.Module):
-    """Universal class-conditional DDT over an 8x8x768 representation grid."""
+    """Class-conditional DDT over normalized semantic and pixel endpoints."""
 
-    def __init__(self, config: ModelConfig, representation_levels: int) -> None:
+    def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        if representation_levels < 1:
-            raise ValueError("DDT requires at least one representation level")
+        if not 1 <= config.decoder.semantic_depth < config.decoder.depth:
+            raise ValueError("semantic_depth must satisfy 1 <= semantic_depth < decoder.depth")
         self.config = config
-        self.representation_levels = representation_levels
         encoder_width = config.encoder.width
         decoder_width = config.decoder.width
         conditioning = config.conditioning
@@ -252,9 +265,7 @@ class DDT(nn.Module):
             conditioning.class_tokens,
             conditioning.class_dropout_probability,
         )
-        self.representation_embedder = RepresentationEmbedder(
-            representation_levels, encoder_width
-        )
+        self.pixel_ratio_embedder = PixelRatioEmbedder(encoder_width)
         self.encoder_blocks = nn.ModuleList(
             DDTEncoderBlock(config, global_tokens) for _ in range(config.encoder.depth)
         )
@@ -263,10 +274,15 @@ class DDT(nn.Module):
             if encoder_width != decoder_width
             else nn.Identity()
         )
-        self.decoder_blocks = nn.ModuleList(
-            DDTDecoderBlock(config) for _ in range(config.decoder.depth)
+        self.shared_decoder_blocks = nn.ModuleList(
+            DDTDecoderBlock(config) for _ in range(config.decoder.semantic_depth)
         )
-        self.final_layer = DDTFinalLayer(decoder_width, config.token_dim)
+        self.pixel_decoder_blocks = nn.ModuleList(
+            DDTDecoderBlock(config)
+            for _ in range(config.decoder.depth - config.decoder.semantic_depth)
+        )
+        self.semantic_head = DDTFinalLayer(decoder_width, config.token_dim)
+        self.pixel_head = DDTFinalLayer(decoder_width, config.token_dim)
         self.gradient_checkpointing = config.gradient_checkpointing
         self.initialize_weights()
 
@@ -281,13 +297,14 @@ class DDT(nn.Module):
         nn.init.normal_(self.class_embedder.embedding.weight, std=0.02)
         for layer in (self.timestep_embedder.mlp[0], self.timestep_embedder.mlp[2]):
             nn.init.normal_(layer.weight, std=0.02)
-        for block in self.decoder_blocks:
+        for block in (*self.shared_decoder_blocks, *self.pixel_decoder_blocks):
             nn.init.zeros_(block.adaln[-1].weight)
             nn.init.zeros_(block.adaln[-1].bias)
-        nn.init.zeros_(self.final_layer.adaln[-1].weight)
-        nn.init.zeros_(self.final_layer.adaln[-1].bias)
-        nn.init.zeros_(self.final_layer.projection.weight)
-        nn.init.zeros_(self.final_layer.projection.bias)
+        for head in (self.semantic_head, self.pixel_head):
+            nn.init.zeros_(head.adaln[-1].weight)
+            nn.init.zeros_(head.adaln[-1].bias)
+            nn.init.zeros_(head.projection.weight)
+            nn.init.zeros_(head.projection.bias)
 
     def _encoder_block(self, block: DDTEncoderBlock, values: Tensor) -> Tensor:
         if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
@@ -312,10 +329,11 @@ class DDT(nn.Module):
         noisy_tokens: Tensor,
         timestep: Tensor,
         labels: Tensor,
-        representation_weights: Tensor,
+        pixel_ratio: Tensor,
         *,
+        prediction_mode: PredictionMode,
         force_class_drop: Tensor | None = None,
-    ) -> Tensor:
+    ) -> DDTOutput:
         if noisy_tokens.ndim != 3 or noisy_tokens.shape[1:] != (
             TOKEN_COUNT,
             self.config.token_dim,
@@ -324,11 +342,13 @@ class DDT(nn.Module):
         batch = noisy_tokens.shape[0]
         if timestep.shape != (batch,) or labels.shape != (batch,):
             raise ValueError("timestep and labels must have shape [B]")
-        if representation_weights.shape[0] != batch:
-            raise ValueError("R batch dimension must match noisy tokens")
+        if pixel_ratio.shape != (batch,):
+            raise ValueError("pixel_ratio must have shape [B]")
+        if prediction_mode not in {"semantic", "mixed", "pixel"}:
+            raise ValueError("prediction_mode must be semantic, mixed, or pixel")
 
         with self._autocast(noisy_tokens):
-            representation = self.representation_embedder(representation_weights)[:, None]
+            representation = self.pixel_ratio_embedder(pixel_ratio)[:, None]
             timestep_base, timestep_tokens = self.timestep_embedder(timestep)
             class_tokens = self.class_embedder(labels, force_class_drop)
             source = self.source_projection(noisy_tokens) + representation
@@ -342,10 +362,36 @@ class DDT(nn.Module):
                 F.silu(spatial + timestep_base + representation)
             )
             decoded = self.target_projection(noisy_tokens)
-            for block in self.decoder_blocks:
+            for block in self.shared_decoder_blocks:
                 decoded = self._decoder_block(block, decoded, conditioning)
-            return self.final_layer(decoded, conditioning)
+
+            semantic_x0 = None
+            if prediction_mode != "pixel":
+                semantic_x0 = self.semantic_head(decoded, conditioning)
+                if prediction_mode == "semantic":
+                    return DDTOutput(semantic_x0, semantic_x0=semantic_x0)
+
+            pixel_state = decoded
+            pixel_conditioning = conditioning
+            if prediction_mode == "mixed":
+                pixel_state = pixel_state.detach()
+                pixel_conditioning = pixel_conditioning.detach()
+            for block in self.pixel_decoder_blocks:
+                pixel_state = self._decoder_block(
+                    block, pixel_state, pixel_conditioning
+                )
+            pixel_x0 = self.pixel_head(pixel_state, pixel_conditioning)
+            if prediction_mode == "pixel":
+                return DDTOutput(pixel_x0, pixel_x0=pixel_x0)
+            assert semantic_x0 is not None
+            ratio = pixel_ratio.to(semantic_x0)[:, None, None]
+            prediction = torch.lerp(semantic_x0, pixel_x0, ratio)
+            return DDTOutput(
+                prediction,
+                semantic_x0=semantic_x0,
+                pixel_x0=pixel_x0,
+            )
 
 
-def build_model(config: ModelConfig, representation_levels: int) -> DDT:
-    return DDT(config, representation_levels)
+def build_model(config: ModelConfig) -> DDT:
+    return DDT(config)

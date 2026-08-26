@@ -8,18 +8,8 @@ import torch
 
 from cascade_dit.compare import compare_runs
 from cascade_dit.evaluation import inception_score
-from cascade_dit.feature_pca import feature_pca_rgb
 from cascade_dit.rng import RNGStreams
 from cascade_dit.validation import ValidationPlan, create_validation_plan
-
-
-def test_feature_pca_is_deterministic_and_bounded() -> None:
-    features = torch.randn(2, 12, 8, 8, generator=torch.Generator().manual_seed(7))
-    first = feature_pca_rgb(features, 32)
-    second = feature_pca_rgb(features, 32)
-    assert first.shape == (2, 3, 32, 32)
-    assert torch.equal(first, second)
-    assert torch.all((first >= 0) & (first <= 1))
 
 
 def test_inception_score_and_run_comparison() -> None:
@@ -54,9 +44,8 @@ def test_validation_plan_is_immutable_and_uses_a_class_balanced_prefix(tmp_path)
     plan = create_validation_plan(
         final_samples=20, periodic_samples=10, num_classes=5, seed=7
     )
-    labels, sample_ids, seeds = plan.prefix(10)
+    labels, seeds = plan.prefix(10)
     assert torch.bincount(labels, minlength=5).tolist() == [2, 2, 2, 2, 2]
-    assert sample_ids.tolist() == list(range(10))
     assert seeds.shape == (10,)
 
     path = tmp_path / "plan.pt"

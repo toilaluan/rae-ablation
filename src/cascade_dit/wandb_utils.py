@@ -12,12 +12,7 @@ class RunLogger:
         resolved_config: dict[str, Any],
         is_main_process: bool,
         run_id: str | None = None,
-        log_interval: int = 10,
     ) -> None:
-        if log_interval < 1:
-            raise ValueError("training log interval must be positive")
-        self.is_main_process = is_main_process
-        self.log_interval = log_interval
         self.run: Any = None
         if not config.enabled or not is_main_process:
             return
@@ -35,47 +30,9 @@ class RunLogger:
             resume="allow" if run_id else None,
         )
 
-    @property
-    def run_id(self) -> str | None:
-        return self.run.id if self.run is not None else None
-
-    def event(self, message: str) -> None:
-        if self.is_main_process:
-            print(message, flush=True)
-
     def log(self, metrics: dict[str, Any], step: int | None = None) -> None:
         if self.run is not None:
             self.run.log(metrics, step=step)
-
-    @staticmethod
-    def _metric(metrics: dict[str, Any], key: str, format_spec: str) -> str:
-        """Format console metrics without allowing logging drift to stop training."""
-        try:
-            return format(metrics[key], format_spec)
-        except (KeyError, TypeError, ValueError):
-            return "n/a"
-
-    def should_log_training(self, step: int, *, force: bool = False) -> bool:
-        return force or step % self.log_interval == 0
-
-    def log_training(
-        self, metrics: dict[str, Any], step: int, *, force: bool = False
-    ) -> None:
-        if not self.should_log_training(step, force=force):
-            return
-        self.log(metrics, step=step)
-        if not self.is_main_process:
-            return
-        self.event(
-            "train: "
-            f"step={step} epoch={self._metric(metrics, 'train/epoch', '.3f')} "
-            f"stage={metrics.get('train/stage', 'n/a')} "
-            f"loss={self._metric(metrics, 'train/loss', '.6f')} "
-            f"velocity={self._metric(metrics, 'train/velocity_mse', '.6f')} "
-            f"cosine={self._metric(metrics, 'train/cosine_loss', '.6f')} "
-            f"lr={self._metric(metrics, 'train/lr', '.3e')} "
-            f"grad_norm={self._metric(metrics, 'train/gradient_norm', '.4f')}"
-        )
 
     def log_grid(
         self, path: str, caption: str, step: int, key: str = "validation/sample_preview"
@@ -84,14 +41,6 @@ class RunLogger:
             import wandb
 
             self.run.log({key: wandb.Image(path, caption=caption)}, step=step)
-
-    def log_checkpoint(self, path: str, name: str) -> None:
-        if self.run is not None:
-            import wandb
-
-            artifact = wandb.Artifact(name=name, type="checkpoint")
-            artifact.add_dir(path)
-            self.run.log_artifact(artifact)
 
     def finish(self) -> None:
         if self.run is not None:

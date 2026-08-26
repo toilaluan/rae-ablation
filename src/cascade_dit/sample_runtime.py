@@ -30,10 +30,6 @@ class SamplingParameters:
     batch_size: int = 32
     seed: int = 0
 
-    @property
-    def sampling_nfe(self) -> int:
-        return self.steps if self.solver == "euler" else 2 * self.steps - 1
-
     def validate(self) -> None:
         if min(self.steps, self.batch_size) < 1:
             raise ValueError("sampling steps and batch size must be positive")
@@ -253,9 +249,6 @@ def _save_preview(images: np.ndarray, labels: np.ndarray, target: Path) -> None:
         canvas.paste(Image.fromarray(images[index]), (x, y))
         draw.text((x + 2, y + side + 1), str(int(labels[index])), fill="black")
     canvas.save(target)
-
-
-save_preview = _save_preview
 
 
 GenerateBatch = Callable[[Tensor, Tensor], Tensor]

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -10,8 +9,13 @@ from safetensors.torch import save_file
 from torch import Tensor
 from torch.utils.data import DataLoader, Subset
 
-from .config import TOKEN_DIM, ExperimentConfig
-from .data import data_fingerprint, load_imagenet, prepare_pixels
+from .config import PIXEL_REPRESENTATION_NAME, TOKEN_DIM, ExperimentConfig
+from .data import (
+    data_fingerprint,
+    load_imagenet,
+    prepare_pixels,
+    validate_endpoint_manifest,
+)
 from .representations import (
     ChannelStatistics,
     ChannelStatisticsAccumulator,
@@ -82,8 +86,19 @@ def representation_manifest_fingerprint(manifest: RepresentationManifest) -> str
 
 
 def _stage_payload(config: ExperimentConfig) -> list[dict[str, object]]:
+    semantic = config.representations.semantic
+    pixel = {
+        "name": PIXEL_REPRESENTATION_NAME,
+        "source": {"kind": "rgb", "layer": None},
+    }
+    if config.training.mode == "pixel_only":
+        return [pixel]
     return [
-        {"name": stage.name, "source": asdict(stage.source)} for stage in config.stages
+        {
+            "name": semantic.name,
+            "source": {"kind": "dino", "layer": semantic.layer},
+        },
+        pixel,
     ]
 
 
@@ -109,7 +124,7 @@ def preparation_fingerprint(
             ),
             "stages": selected_stages,
             "normalization_epsilon": config.representations.normalization_epsilon,
-            "cache_dtype": config.representations.dtype,
+            "cache_dtype": "bfloat16",
         }
     )
 
@@ -117,6 +132,7 @@ def preparation_fingerprint(
 def validate_manifest_compatibility(
     config: ExperimentConfig, manifest: RepresentationManifest
 ) -> None:
+    validate_endpoint_manifest(config, manifest, load_semantic=True)
     requested_stages = _stage_payload(config)
     cached_stages = manifest.stages
     if not cached_stages_include(cached_stages, requested_stages):
@@ -148,11 +164,10 @@ def _loader(dataset: object, indices: Tensor, config: ExperimentConfig) -> DataL
 
 
 def _dino_stage_layers(config: ExperimentConfig) -> dict[str, int]:
-    return {
-        stage.name: int(stage.source.layer)
-        for stage in config.stages
-        if stage.source.kind == "dino" and stage.source.layer is not None
-    }
+    if config.training.mode == "pixel_only":
+        return {}
+    semantic = config.representations.semantic
+    return {semantic.name: semantic.layer}
 
 
 def _extract_caches(
@@ -199,20 +214,15 @@ def _collect_statistics(
     device: torch.device,
 ) -> dict[str, ChannelStatistics]:
     accumulators = {
-        stage.name: ChannelStatisticsAccumulator(TOKEN_DIM) for stage in config.stages
+        **{name: ChannelStatisticsAccumulator(TOKEN_DIM) for name in caches},
+        PIXEL_REPRESENTATION_NAME: ChannelStatisticsAccumulator(TOKEN_DIM),
     }
-    rgb_name = config.stages[-1].name
     indices = torch.arange(rank, len(dataset), world_size)
-    for i, (pixels, _labels, batch_indices) in enumerate(
-        _loader(dataset, indices, config), start=1
-    ):
-        print(i)
-        if i >= 100:
-            break
+    for pixels, _labels, batch_indices in _loader(dataset, indices, config):
         for name, cache in caches.items():
             accumulators[name].update(cache.lookup(batch_indices))
         rgb = patchify_rgb(prepare_pixels(pixels, device)).cpu()
-        accumulators[rgb_name].update(rgb)
+        accumulators[PIXEL_REPRESENTATION_NAME].update(rgb)
     return {
         name: _merge_statistics(
             accumulator, config.representations.normalization_epsilon
@@ -225,10 +235,12 @@ def _preparation_identity(
     config: ExperimentConfig, dataset_size: int
 ) -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "dataset_size": dataset_size,
         "dataset_fingerprint": data_fingerprint(config.data, config.data.image_size),
-        "encoder_fingerprint": encoder_fingerprint(config.encoder, config.dino_layers),
+        "encoder_fingerprint": encoder_fingerprint(
+            config.encoder, list(_dino_stage_layers(config).values())
+        ),
         "stages": _stage_payload(config),
         "shape": [dataset_size, 64, TOKEN_DIM],
         "dtype": "bfloat16",
@@ -286,11 +298,21 @@ def prepare_representations(
     root = Path(config.representations.directory)
     manifest_path = root / config.representations.manifest
     if manifest_path.is_file():
-        existing = RepresentationManifest.load(manifest_path)
-        validate_manifest_compatibility(config, existing)
+        existing = RepresentationManifest.load(
+            manifest_path,
+            required_stages=(
+                None
+                if config.training.mode == "progressive"
+                else [PIXEL_REPRESENTATION_NAME]
+            ),
+        )
+        if config.training.mode == "progressive":
+            validate_manifest_compatibility(config, existing)
+        else:
+            validate_endpoint_manifest(config, existing, load_semantic=False)
         return existing
 
-    dataset = load_imagenet(config.data, config.data.image_size, load_pixels=True)
+    dataset = load_imagenet(config.data, config.data.image_size)
     layers = _dino_stage_layers(config)
     initialization_error: BaseException | None = None
     if rank == 0:
@@ -322,15 +344,16 @@ def prepare_representations(
     caches = {
         name: LayerMemmap.initialize(root, name, len(dataset)) for name in layers
     }
-    encoder = load_dino_encoder(
-        config.encoder,
-        list(layers.values()),
-        device,
-        compile_config=config.compile,
-    )
-    _extract_caches(
-        dataset, encoder, caches, layers, config, rank, world_size, device
-    )
+    if layers:
+        encoder = load_dino_encoder(
+            config.encoder,
+            list(layers.values()),
+            device,
+            compile_config=config.compile,
+        )
+        _extract_caches(
+            dataset, encoder, caches, layers, config, rank, world_size, device
+        )
     _barrier()
     for cache in caches.values():
         cache.values.flush()
@@ -350,7 +373,9 @@ def prepare_representations(
         manifest = RepresentationManifest(
             dataset_size=len(dataset),
             dataset_fingerprint=data_fingerprint(config.data, config.data.image_size),
-            encoder_fingerprint=encoder_fingerprint(config.encoder, config.dino_layers),
+            encoder_fingerprint=encoder_fingerprint(
+                config.encoder, list(layers.values())
+            ),
             preparation_fingerprint=preparation_fingerprint(config),
             stages=_stage_payload(config),
             statistics={

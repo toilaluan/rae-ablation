@@ -6,10 +6,21 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from cascade_dit.checkpoint import EMA, CheckpointManager, ResumeState
+from cascade_dit.checkpoint import (
+    EMA,
+    TRAINING_STATE_SCHEMA_VERSION,
+    CheckpointManager,
+    ResumeState,
+)
 from cascade_dit.checkpoint_bundle import load_checkpoint_bundle
-from cascade_dit.config import DDTAttentionConfig, DDTPathConfig, ExperimentConfig, ModelConfig
-from cascade_dit.model import DDT, LoRALinear, apply_lora
+from cascade_dit.config import (
+    DDTAttentionConfig,
+    DDTDecoderConfig,
+    DDTPathConfig,
+    ExperimentConfig,
+    ModelConfig,
+)
+from cascade_dit.model import build_model
 from cascade_dit.rng import RNGStreams
 
 
@@ -17,27 +28,29 @@ def _config() -> ExperimentConfig:
     config = ExperimentConfig()
     config.model = ModelConfig(
         encoder=DDTPathConfig(16, 1, 1),
-        decoder=DDTPathConfig(32, 1, 2),
+        decoder=DDTDecoderConfig(32, 2, 1, 2),
         attention=DDTAttentionConfig(rope=False),
     )
     config.model.conditioning.num_classes = 4
+    config.validation.periodic_samples = 4
+    config.evaluation.num_samples = 4
     return config
 
 
-def _model(config: ExperimentConfig) -> DDT:
-    return DDT(config.model, config.num_representation_levels)
-
-
-def _state(config: ExperimentConfig, *, complete: bool = False) -> ResumeState:
-    stage_index = config.num_representation_levels - 1 if complete else 0
+def _state(
+    config: ExperimentConfig,
+    *,
+    phase: str = "semantic",
+    complete: bool = False,
+) -> ResumeState:
+    completed = config.total_epochs if complete else 1
+    epoch_in_phase = config.training.pixel.epochs if complete else 1
     return ResumeState(
-        schema_version=4,
-        completed_epoch=config.total_epochs if complete else 20,
+        schema_version=TRAINING_STATE_SCHEMA_VERSION,
+        completed_epoch=completed,
         global_step=7,
-        stage_index=stage_index,
-        stage=config.stage_names[stage_index],
-        epoch_within_stage=20,
-        transition_state="stable",
+        phase="pixel" if complete else phase,  # type: ignore[arg-type]
+        epoch_within_phase=epoch_in_phase,
         training_complete=complete,
         images_seen=1024,
         estimated_flops=123,
@@ -50,89 +63,65 @@ def _state(config: ExperimentConfig, *, complete: bool = False) -> ResumeState:
     )
 
 
-def test_checkpoint_roundtrip_and_old_schema_rejection(tmp_path) -> None:
+def test_checkpoint_roundtrip_plain_state_and_old_schema_rejection(tmp_path) -> None:
     config = _config()
-    model = _model(config)
+    model = build_model(config.model)
     ema = EMA(model)
     manager = CheckpointManager(tmp_path)
     saved = manager.save(model=model, ema=ema, state=_state(config), config=config)
+    original = {name: value.clone() for name, value in model.state_dict().items()}
     with torch.no_grad():
         next(model.parameters()).zero_()
     restored = manager.load(saved, model, ema, expected_data_fingerprint="data")
-    assert restored.completed_epoch == 20
+    assert restored.phase == "semantic"
+    assert all(torch.equal(model.state_dict()[name], value) for name, value in original.items())
+    serialized = load_file(saved / "model.safetensors")
+    assert set(serialized) == set(model.state_dict())
+    assert not any("adapter" in name or ".base." in name for name in serialized)
+
     old = tmp_path / "old"
     old.mkdir()
-    (old / "metadata.json").write_text(json.dumps({"schema_version": 3}))
-    with pytest.raises(ValueError, match="incompatible"):
+    (old / "metadata.json").write_text(json.dumps({"schema_version": 4}))
+    with pytest.raises(ValueError, match="old checkpoints"):
         manager.load(old, model, ema)
 
 
-def test_boundary_save_is_idempotent_and_requires_complete_rgb(tmp_path) -> None:
+def test_pixel_boundary_is_idempotent_and_not_sampling_eligible(tmp_path) -> None:
     config = _config()
-    model = _model(config)
+    model = build_model(config.model)
     ema = EMA(model)
     manager = CheckpointManager(tmp_path)
-    before = ResumeState(**(vars(_state(config)) | {"transition_state": "before"}))
-    first = manager.save_boundary(
-        target_stage_index=1,
-        position="before",
-        model=model,
-        ema=ema,
-        state=before,
-        config=config,
+    state = ResumeState(
+        **(
+            vars(_state(config))
+            | {
+                "completed_epoch": config.training.semantic.epochs,
+                "phase": "pixel",
+                "epoch_within_phase": 0,
+            }
+        )
     )
-    second = manager.save_boundary(
-        target_stage_index=1,
-        position="before",
-        model=model,
-        ema=ema,
-        state=before,
-        config=config,
+    first = manager.save_phase_boundary(
+        model=model, ema=ema, state=state, config=config
+    )
+    second = manager.save_phase_boundary(
+        model=model, ema=ema, state=state, config=config
     )
     assert first == second
-    with pytest.raises(ValueError, match="completed RGB"):
+    with pytest.raises(ValueError, match="completed pixel"):
         load_checkpoint_bundle(first, require_rgb_complete=True)
 
 
-def test_completed_rgb_checkpoint_is_sampling_eligible(tmp_path) -> None:
+def test_completed_pixel_checkpoint_is_sampling_eligible(tmp_path) -> None:
     config = _config()
-    model = _model(config)
-    ema = EMA(model)
+    model = build_model(config.model)
     manager = CheckpointManager(tmp_path)
     saved = manager.save(
         model=model,
-        ema=ema,
+        ema=EMA(model),
         state=_state(config, complete=True),
         config=config,
     )
-    assert load_checkpoint_bundle(saved, require_rgb_complete=True).weights.is_file()
-
-
-def test_lora_checkpoint_exports_merged_plain_weights(tmp_path) -> None:
-    config = _config()
-    config.pixel_training.lora.use_lora = True
-    model = _model(config)
-    apply_lora(model, config.pixel_training.lora)
-    with torch.no_grad():
-        for module in model.modules():
-            if isinstance(module, LoRALinear):
-                module.adapter_b.weight.normal_(std=0.01)
-    ema = EMA(model)
-    manager = CheckpointManager(tmp_path)
-
-    saved = manager.save(model=model, ema=ema, state=_state(config), config=config)
-
-    metadata = json.loads((saved / "metadata.json").read_text())
-    assert metadata["model_format"] == "lora_merged"
-    plain = _model(config)
-    plain.load_state_dict(load_file(saved / "model.safetensors"))
-    assert not any("adapter_" in name or ".base." in name for name in load_file(saved / "model.safetensors"))
-    reloaded = _model(config)
-    apply_lora(reloaded, config.pixel_training.lora)
-    reloaded_ema = EMA(reloaded)
-    manager.load(saved, reloaded, reloaded_ema)
-    assert all(
-        torch.count_nonzero(module.adapter_b.weight) == 0
-        for module in reloaded.modules()
-        if isinstance(module, LoRALinear)
-    )
+    bundle = load_checkpoint_bundle(saved, require_rgb_complete=True)
+    assert bundle.weights.is_file()
+    assert bundle.metadata["phase"] == "pixel"

@@ -1,20 +1,13 @@
-"""Adjacent-flow DINO-to-pixel DDT experiment."""
+"""Two-endpoint semantic-to-pixel DDT experiments."""
 
-from .config import ExperimentConfig, ModelConfig, load_config
-from .model import DDT, build_model
-from .representations import ChannelStatistics, patchify_rgb, unpatchify_rgb
-from .vision import DINOMultiLayerEncoder
+from .config import load_config
+from .model import DDT, DDTOutput, build_model
 
 __all__ = [
     "DDT",
-    "ChannelStatistics",
-    "DINOMultiLayerEncoder",
-    "ExperimentConfig",
-    "ModelConfig",
+    "DDTOutput",
     "build_model",
     "load_config",
-    "patchify_rgb",
-    "unpatchify_rgb",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

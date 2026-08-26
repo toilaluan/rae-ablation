@@ -6,6 +6,7 @@ from itertools import pairwise
 import torch
 from torch import Tensor, nn
 
+from .model import PredictionMode
 from .objective import shift_timestep, x0_to_velocity
 
 
@@ -16,11 +17,9 @@ def class_balanced_labels(sample_count: int, num_classes: int) -> Tensor:
 
 
 def _prediction(output: object) -> Tensor:
-    if isinstance(output, Tensor):
-        return output
     value = getattr(output, "prediction", None)
     if not isinstance(value, Tensor):
-        raise TypeError("model output must be a tensor or expose .prediction")
+        raise TypeError("model output must expose a tensor .prediction")
     return value
 
 
@@ -29,8 +28,9 @@ def _model_x0(
     values: Tensor,
     timestep: Tensor,
     labels: Tensor,
-    representation_weights: Tensor,
+    pixel_ratio: Tensor,
     *,
+    prediction_mode: PredictionMode,
     num_classes: int,
     guidance_scale: float,
     guidance_start: float,
@@ -39,14 +39,28 @@ def _model_x0(
     progress = float(1 - timestep[0].item())
     active = guidance_scale != 1 and guidance_start <= progress <= guidance_end
     if not active:
-        return _prediction(model(values, timestep, labels, representation_weights))
+        return _prediction(
+            model(
+                values,
+                timestep,
+                labels,
+                pixel_ratio,
+                prediction_mode=prediction_mode,
+            )
+        )
     combined_values = torch.cat((values, values))
     combined_time = torch.cat((timestep, timestep))
     unconditional = torch.full_like(labels, num_classes)
     combined_labels = torch.cat((labels, unconditional))
-    combined_weights = torch.cat((representation_weights, representation_weights))
+    combined_ratio = torch.cat((pixel_ratio, pixel_ratio))
     conditional, unconditional_prediction = _prediction(
-        model(combined_values, combined_time, combined_labels, combined_weights)
+        model(
+            combined_values,
+            combined_time,
+            combined_labels,
+            combined_ratio,
+            prediction_mode=prediction_mode,
+        )
     ).chunk(2)
     return unconditional_prediction + guidance_scale * (
         conditional - unconditional_prediction
@@ -58,8 +72,9 @@ def sample_tokens(
     model: nn.Module,
     noise: Tensor,
     labels: Tensor,
-    representation_weights: Tensor,
+    pixel_ratio: Tensor,
     *,
+    prediction_mode: PredictionMode,
     steps: int = 40,
     solver: str = "euler",
     timestep_shift: float = 1.0,
@@ -70,15 +85,17 @@ def sample_tokens(
     num_classes: int = 1000,
     callback: Callable[[int, Tensor], None] | None = None,
 ) -> Tensor:
-    """Integrate one RGB Gaussian-flow trajectory from t=1 to t=0."""
+    """Integrate one endpoint trajectory from t=1 to t=0."""
     if steps < 1 or solver not in {"euler", "heun"}:
         raise ValueError("sampling requires positive steps and the euler or heun solver")
+    if prediction_mode not in {"semantic", "pixel"}:
+        raise ValueError("sampling supports only semantic or pixel prediction mode")
     if not 0 <= guidance_start < guidance_end <= 1:
         raise ValueError("CFG interval must satisfy 0 <= start < end <= 1")
     if labels.shape != (noise.shape[0],):
         raise ValueError("sampling labels must have shape [B]")
-    if representation_weights.ndim != 2 or representation_weights.shape[0] != noise.shape[0]:
-        raise ValueError("sampling R must have shape [B,levels]")
+    if pixel_ratio.shape != (noise.shape[0],):
+        raise ValueError("sampling pixel_ratio must have shape [B]")
     base_grid = torch.linspace(1, 0, steps + 1, device=noise.device, dtype=torch.float32)
     grid = shift_timestep(base_grid, timestep_shift)
     values = noise
@@ -90,7 +107,8 @@ def sample_tokens(
             state,
             time,
             labels,
-            representation_weights,
+            pixel_ratio,
+            prediction_mode=prediction_mode,
             num_classes=num_classes,
             guidance_scale=guidance_scale,
             guidance_start=guidance_start,
@@ -112,4 +130,48 @@ def sample_tokens(
     return values
 
 
-sample_rgb_tokens = sample_tokens
+@torch.no_grad()
+def sample_semantic_then_pixel(
+    model: nn.Module,
+    noise: Tensor,
+    labels: Tensor,
+    *,
+    steps: int = 40,
+    solver: str = "euler",
+    timestep_shift: float = 1.0,
+    guidance_scale: float = 1.0,
+    guidance_start: float = 0.0,
+    guidance_end: float = 1.0,
+    denominator_floor: float = 0.05,
+    num_classes: int = 1000,
+) -> Tensor:
+    """Sample semantic x0, then perform exactly one t=0 semantic-conditioned RGB decode."""
+    ratio = torch.zeros(noise.shape[0], device=noise.device, dtype=torch.float32)
+    semantic = sample_tokens(
+        model,
+        noise,
+        labels,
+        ratio,
+        prediction_mode="semantic",
+        steps=steps,
+        solver=solver,
+        timestep_shift=timestep_shift,
+        guidance_scale=guidance_scale,
+        guidance_start=guidance_start,
+        guidance_end=guidance_end,
+        denominator_floor=denominator_floor,
+        num_classes=num_classes,
+    )
+    zero = torch.zeros(noise.shape[0], device=noise.device, dtype=torch.float32)
+    return _model_x0(
+        model,
+        semantic,
+        zero,
+        labels,
+        ratio,
+        prediction_mode="pixel",
+        num_classes=num_classes,
+        guidance_scale=guidance_scale,
+        guidance_start=guidance_start,
+        guidance_end=guidance_end,
+    )

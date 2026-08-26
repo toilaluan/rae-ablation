@@ -12,7 +12,7 @@ from cascade_dit.wandb_utils import RunLogger
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train representation-guided or pixel-only DDT"
+        description="Train progressive semantic-to-pixel or pixel-only DDT"
     )
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
@@ -33,7 +33,6 @@ def main() -> None:
         config.wandb,
         config.as_dict(),
         rank == 0,
-        log_interval=arguments.log_interval,
     )
 
     def log(metrics: dict[str, float | int | str]) -> None:

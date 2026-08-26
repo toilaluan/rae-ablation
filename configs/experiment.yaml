@@ -1,7 +1,7 @@
-schema_version: 6
+schema_version: 7
 
 experiment:
-  name: adjacent-flow-ddt
+  name: semantic-pixel-ddt
   seed: 0
   output_directory: runs/experiment
 
@@ -9,7 +9,6 @@ data:
   repository: benjamin-paine/imagenet-1k-256x256
   revision: 1bd0400450249a7fe90c0aece37d0d03e7ea956a
   split: train
-  validation_split: validation
   image_size: 128
   workers: 8
   prefetch_factor: 2
@@ -24,35 +23,29 @@ encoder:
   num_register_tokens: 4
   apply_final_norm: true
 
-pixel_training:
-  name: rgb
-  epochs: 120
-  timestep_shift: 7.0
-  use_representation_guiding: true
-  lora:
-    use_lora: false
-    rank: 256
-    alpha: 256.0
-    dropout: 0.0
-    target_groups: [attention, feedforward, conditioning, projections]
-  representations:
-    directory: data/direct-representations
-    manifest: manifest.json
-    stages:
-      - name: dino12
-        epochs: 50
-        source: {kind: dino, layer: 12}
-        timestep_shift: 4.0
-      # - name: dino8
-      #   epochs: 5
-      #   source: {kind: dino, layer: 8}
-      #   timestep_shift: 4.0
-    dtype: bfloat16
-    cache_batch_size: 256
-    asynchronous_writes: true
-    statistics_dtype: float64
-    normalization_epsilon: 1.0e-6
-    require_complete: true
+training:
+  mode: progressive
+  semantic:
+    epochs: 50
+    timestep_shift: 4.0
+    mixed_probability: 0.1
+    mix_ratio:
+      distribution: logit_normal
+      loc: 0.0
+      scale: 1.0
+  pixel:
+    epochs: 120
+    timestep_shift: 7.0
+
+representations:
+  directory: data/direct-representations
+  manifest: manifest.json
+  semantic:
+    name: dino12
+    layer: 12
+  cache_batch_size: 256
+  normalization_epsilon: 1.0e-6
+  require_complete: true
 
 model:
   architecture: ddt
@@ -63,7 +56,8 @@ model:
     heads: 12
   decoder:
     width: 2048
-    depth: 2
+    depth: 3
+    semantic_depth: 2
     heads: 16
   feedforward:
     mlp_ratio: 4.0
@@ -78,30 +72,11 @@ model:
     class_tokens: 8
   gradient_checkpointing: false
 
-curriculum:
-  mixing:
-    adjacent:
-      probability: 0.1
-      distribution: uniform
-      minimum: 0.0
-      maximum: 1.0
-    pure_next_probability: 0.0
-    all_levels:
-      probability: 0.0
-      distribution: uniform_simplex
-      concentration: 1.0
-    final_stage: pure
-  source_consistency_weight: 0.0
-
 objective:
-  prediction: x0
-  loss_space: velocity
-  timestep_distribution: shifted_logit_normal
   timestep_loc: 0.0
   timestep_scale: 1.0
   denominator_floor: 0.05
-  cosine_loss_weight: 0.0
-  cosine_loss_epsilon: 1.0e-8
+  pixel_auxiliary_mse_weight: 1.0
 
 optimizer:
   kind: adamw
@@ -130,14 +105,12 @@ sampling:
 validation:
   interval_epochs: 5
   batches: 32
-  pca_preview_samples: 16
   periodic_samples: 10000
 
 checkpoint:
   directory: checkpoints
   interval_epochs: 5
-  save_stage_boundaries: true
-  keep_last_n: 8
+  save_phase_boundary: true
   resume: null
 
 compile:
@@ -150,18 +123,14 @@ compile:
 wandb:
   enabled: true
   entity: null
-  project: adjacent-flow-ddt
+  project: semantic-pixel-ddt
   name: null
   group: null
   tags: []
   mode: online
-  checkpoint_artifacts: false
 
 evaluation:
   num_samples: 50000
   reference_npz: data/VIRTUAL_imagenet128_labeled.npz
-  metrics: [fid, is]
   batch_size: 32
   device: auto
-  report_flops: true
-  report_peak_memory: true

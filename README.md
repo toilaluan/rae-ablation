@@ -1,70 +1,50 @@
-# Adjacent-Flow DINO-to-Pixel DDT
+# Semantic-to-Pixel DDT
 
-This repository compares a progressive representation curriculum with a matched
-RGB-only baseline on class-conditional ImageNet-128 generation. Every target is an
-`8x8` grid of 768-dimensional tokens: configured DINOv3-B/16 intermediate layers or
-flattened `3x16x16` RGB patches.
+This repository compares two class-conditional ImageNet-128 training modes with the
+same dual-head DDT architecture:
 
-The checked-in guided curriculum uses DINO layers 12 and 8, followed by the RGB target
-configured under `pixel_training`. The DINO list is data-driven: changing
-`pixel_training.representations.stages` changes extraction, cache count, curriculum
-length, and the width of the model's representation condition `R`. Set
-`pixel_training.use_representation_guiding=false` for direct pixel training without
-loading or validating DINO caches.
+- `progressive`: train a normalized DINO semantic endpoint, then normalized RGB pixels.
+- `pixel_only`: train normalized RGB pixels directly.
 
-## Adjacent-flow curriculum
+Every endpoint is an `8x8` grid of 768-dimensional tokens. The semantic endpoint is a
+configurable DINOv3-B/16 layer (layer 12 by default); RGB endpoints are flattened
+`3x16x16` patches.
 
-Each representation is independently normalized with full-training-set channel means
-and standard deviations. There is no Procrustes, AsymFlow, projector, VAE, or latent
-alignment preprocessing. Clean representations are mixed directly before one shared
-Gaussian noise tensor is added.
+## Training distribution
 
-For each item in every non-final stage, the default target distribution is:
+During the semantic phase, every item loads both DINO and RGB. By default, 90% are pure
+semantic (`pixel_ratio=0`) and 10% use a ratio sampled from
+`sigmoid(N(0, 1))`. The endpoints are normalized independently and then interpolated.
+Pure-semantic items use normalized RGB as an auxiliary pixel target. The pixel phase
+and `pixel_only` mode load only RGB and always use `pixel_ratio=1`.
 
-```text
-85.0%  pure current representation
-10.0%  current/next mixture with a Uniform(0,1) next weight
- 2.5%  pure next representation
- 2.5%  all configured levels with a uniform-simplex R
-```
-
-The mode and weights are deterministic from the experiment seed, epoch, and source
-index. Pure examples load one representation, adjacent mixtures load two, and only the
-2.5% all-level examples load every representation. The final stage is pure RGB. A
-pixel-only run trains for `pixel_training.epochs`.
+The item choice is deterministic from the experiment seed, epoch, and source index.
+One DataLoader is reused across phases; its shared phase/epoch state remains visible to
+persistent workers.
 
 ## Model and objective
 
-Both modes use the same universal DDT and have identical parameter counts. Its default
-encoder is width 768, depth 12, and 12 heads; its decoder is width 2048, depth 2, and 16
-heads. Dimensions are independently configurable under `model.encoder` and
-`model.decoder`.
+The decoder is split at `model.decoder.semantic_depth`. Shared blocks feed a
+zero-initialized semantic head; remaining refinement blocks feed a separate
+zero-initialized pixel head.
 
-DDT uses separate noisy-token projections for its representation encoder and AdaLN
-decoder, RMSNorm, QK normalization, 2D RoPE, SwiGLU, SDPA, class global tokens, and a
-single zero-initialized clean-target head. There are no token or convolutional detail
-heads. The absolute `R` vector is converted through learned level embeddings, added to
-encoder spatial inputs and decoder conditioning, and appended as an encoder global
-token. `R` is never dropped during CFG.
+- `semantic` mode runs the shared decoder and semantic head only.
+- `mixed` mode runs both heads. Pixel refinement receives detached shared state and
+  conditioning, so pixel losses cannot update the encoder or shared decoder.
+- `pixel` mode skips the semantic head and trains the full trunk and pixel branch end to
+  end.
 
-Training predicts clean `x0` and evaluates velocity-space loss on a linear Gaussian flow
-with shifted-logit-normal timesteps. Each curriculum stage controls its own timestep
-shift. Every model parameter trains throughout one global AdamW optimizer, EMA, and
-50-epoch scheduler. `optimizer.scheduler.kind` accepts `cosine` or `constant`; both
-support the configured linear warmup, while `min_lr_ratio` applies only to cosine.
-Stage boundaries normally only change the data distribution and timestep shift. When
-`pixel_training.lora.use_lora=true`, entering RGB freezes the base DDT, adds configured
-low-rank adapters, and starts a fresh pixel-stage optimizer and scheduler.
+The ratio-mixed clean prediction is converted to velocity for the main MSE. Only
+`pixel_ratio=0` items receive the direct auxiliary RGB MSE. One optimizer, scheduler,
+and EMA continue across the progressive boundary; only the compiled/DDP execution
+wrapper is rebuilt.
 
 ## Preparation and training
 
-Preparation extracts every configured DINO layer in one encoder pass, writes separate
-resumable BF16 memmaps, and accumulates independent DINO/RGB normalization statistics.
-An existing cache can be reused by a curriculum that keeps an ordered subset of its
-stages, so a cached stage such as DINO layer 8 can be removed without re-preparation.
-The default three DINO caches require about 352 GiB for full ImageNet. This schema uses
-`data/direct-representations` by default and intentionally does not reuse alignment-era
-manifests or caches. Existing runtime data is never deleted automatically.
+Preparation writes a resumable BF16 memmap for the selected DINO endpoint and computes
+independent DINO/RGB channel statistics over the full training set. Manifest schema v3
+is retained. An existing compatible manifest may contain extra, unused DINO layers and
+will be reused without preparation.
 
 ```bash
 torchrun --standalone --nproc-per-node=8 scripts/prepare_representations.py \
@@ -72,37 +52,32 @@ torchrun --standalone --nproc-per-node=8 scripts/prepare_representations.py \
 
 torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --config configs/experiment.yaml \
+  --override training.mode=progressive \
   --output runs/progressive-seed0
 
 torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --config configs/experiment.yaml \
-  --override pixel_training.use_representation_guiding=false \
-  --output runs/pixel-baseline-seed0
-
-torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/experiment.yaml \
-  --override pixel_training.use_representation_guiding=false \
-  --override pixel_training.lora.use_lora=true \
-  --resume runs/progressive-seed0/checkpoints/last \
-  --output runs/pixel-lora-seed0
+  --override training.mode=pixel_only \
+  --output runs/pixel-only-seed0
 ```
 
-All public settings are nested in `configs/experiment.yaml` and support repeated
-dot-list overrides, for example:
+Settings support repeated dot-list overrides, for example:
 
 ```bash
---override curriculum.mixing.adjacent.probability=0.2 \
+--override training.semantic.mixed_probability=0.2 \
+--override training.semantic.mix_ratio.scale=0.75 \
 --override model.encoder.depth=16
 ```
 
 ## Sampling and evaluation
 
-Sampling accepts only a completed final-RGB checkpoint and always supplies RGB one-hot
-`R`. It follows one normalized RGB flow trajectory, applies interval CFG, reverses RGB
-normalization, unpatchifies, and clamps to `[0,1]`. Sampling is deterministic across
-batch sizes and rank counts, and interrupted archives resume from their completion map.
-Under `torchrun`, `--batch-size` is per GPU; rank zero alone packages the archive and
-computes optional metrics.
+During semantic training, evaluation integrates only a pure-semantic trajectory with
+`pixel_ratio=0`, then makes exactly one class-guided pixel prediction at `t=0`, also
+with `pixel_ratio=0`. Pixel training evaluates a pure-pixel trajectory with
+`pixel_ratio=1`. Both paths denormalize the final RGB tokens before previews and
+FID/IS.
+
+Standalone sampling accepts a completed pixel-phase checkpoint:
 
 ```bash
 torchrun --standalone --nproc-per-node=8 scripts/sample.py \
@@ -111,24 +86,16 @@ torchrun --standalone --nproc-per-node=8 scripts/sample.py \
   --evaluate
 ```
 
-Every configured validation event samples the EMA model directly in RGB space, even
-during DINO stages. Periodic events use the fixed 10k prefix of one immutable sampling
-plan; training completion uses all 50k samples. FID/IS and RGB grids are logged to W&B,
-along with PCA feature previews during non-RGB stages. Training-time sample archives
-are pruned after metrics are saved, while grids, manifests, and evaluation JSON remain.
-Final comparisons include FID-50k, IS, wall-clock time, images seen, estimated FLOPs,
-peak memory, and parameter counts.
+Sampling is deterministic across batch sizes and rank counts. Interrupted archives
+resume from their completion maps.
 
-## Verification
+## Verification and compatibility
 
 ```bash
 uv run --extra dev pytest -q
 uv run --extra dev ruff check .
 ```
 
-Configuration, checkpoints, and representation manifests use versioned schemas.
-Schema-v6 nests RGB, LoRA, and representation-guidance settings beneath
-`pixel_training`. Schema-v5 configs and current checkpoints are migrated when read;
-alignment-era artifacts remain unsupported.
-Alignment-era LightningDiT and legacy DDT/Mage artifacts are rejected rather than
-migrated or overwritten.
+Configuration schema v7 and checkpoint schema v5 intentionally reject older
+training artifacts. Representation manifest schema v3 remains reusable
+when it contains the selected semantic cache and RGB statistics.

@@ -1,98 +1,139 @@
 from __future__ import annotations
 
-import copy
-
-import pytest
 import torch
 
-from cascade_dit.checkpoint import EMA
+from cascade_dit.checkpoint import EMA, CheckpointManager, ResumeState
 from cascade_dit.config import (
     DDTAttentionConfig,
+    DDTDecoderConfig,
     DDTPathConfig,
     ExperimentConfig,
     ModelConfig,
-    RepresentationSourceConfig,
-    RepresentationStageConfig,
 )
-from cascade_dit.curriculum import configure_trainability, stage_at_epoch
-from cascade_dit.model import DDT
+from cascade_dit.data import PreparedEndpointBatch
+from cascade_dit.model import build_model
 from cascade_dit.optim import build_optimizer, parameter_count
 from cascade_dit.rng import RNGStreams
-from cascade_dit.training import train_one_step
+from cascade_dit.training import compute_training_loss
 
 
-def _config(levels: int) -> ExperimentConfig:
+def _config() -> ExperimentConfig:
     config = ExperimentConfig()
-    dino = [12, 8, 4, 2][: levels - 1]
-    config.representations.stages = [
-        RepresentationStageConfig(
-            f"dino{layer}", 1, RepresentationSourceConfig("dino", layer)
-        )
-        for layer in dino
-    ]
-    config.pixel_training.epochs = 1
+    config.training.semantic.epochs = 1
+    config.training.pixel.epochs = 1
     config.model = ModelConfig(
         encoder=DDTPathConfig(16, 1, 1),
-        decoder=DDTPathConfig(32, 1, 2),
+        decoder=DDTDecoderConfig(32, 2, 1, 2),
         attention=DDTAttentionConfig(rope=False),
     )
     config.model.conditioning.num_classes = 4
     config.optimizer.global_batch_size = 1
+    config.validation.periodic_samples = 4
+    config.evaluation.num_samples = 4
     config.validate()
     return config
 
 
-@pytest.mark.parametrize("levels", [3, 4])
-def test_tiny_dynamic_curriculum_and_matched_baseline(levels: int) -> None:
-    config = _config(levels)
-    model = DDT(config.model, levels)
-    configure_trainability(model)
+def _batch(ratio: float) -> PreparedEndpointBatch:
+    semantic = torch.randn(1, 64, 768)
+    pixel = torch.randn(1, 64, 768)
+    ratios = torch.tensor([ratio])
+    clean = torch.lerp(semantic, pixel, ratios[:, None, None])
+    return PreparedEndpointBatch(
+        clean,
+        semantic if ratio != 1 else None,
+        pixel,
+        ratios,
+        torch.tensor([2]),
+    )
+
+
+def test_progressive_boundary_keeps_optimizer_and_architecture_matches_baseline() -> None:
+    config = _config()
+    model = build_model(config.model)
     optimizer = build_optimizer(model, config.optimizer)
     optimizer_identity = id(optimizer)
     ema = EMA(model)
     streams = RNGStreams.create(8)
-    targets = torch.randn(1, 64, 768)
-    labels = torch.tensor([2])
-    for epoch in range(config.total_epochs):
-        position = stage_at_epoch(epoch, config)
-        weights = torch.zeros(1, levels)
-        weights[:, position.index] = 1
-        result = train_one_step(
+    for phase, ratio in (("semantic", 0.0), ("pixel", 1.0)):
+        optimizer.zero_grad(set_to_none=True)
+        result = compute_training_loss(
             model,
-            optimizer,
-            targets,
-            labels,
-            weights,
+            _batch(ratio),
             streams,
             config,
-            stage_index=position.index,
+            phase=phase,  # type: ignore[arg-type]
         )
-        assert torch.isfinite(result.loss.total)
+        result.loss.total.backward()
+        optimizer.step()
         ema.update(model)
+        assert torch.isfinite(result.loss.total)
     assert id(optimizer) == optimizer_identity
 
-    baseline = DDT(config.model, levels)
-    configure_trainability(baseline)
+    baseline_config = _config()
+    baseline_config.training.mode = "pixel_only"
+    baseline = build_model(baseline_config.model)
     assert parameter_count(model) == parameter_count(baseline)
-    baseline_weights = torch.zeros(1, levels)
-    baseline_weights[:, -1] = 1
-    baseline_result = train_one_step(
+    baseline_result = compute_training_loss(
         baseline,
-        build_optimizer(baseline, config.optimizer),
-        targets,
-        labels,
-        baseline_weights,
+        _batch(1.0),
         RNGStreams.create(8),
-        config,
-        stage_index=levels - 1,
+        baseline_config,
+        phase="pixel",
     )
     assert torch.isfinite(baseline_result.loss.total)
 
 
-def test_source_model_copy_stays_independent() -> None:
-    config = _config(3)
-    first = DDT(config.model, 3)
-    second = copy.deepcopy(first)
-    with torch.no_grad():
-        next(second.parameters()).add_(1)
-    assert not torch.equal(next(first.parameters()), next(second.parameters()))
+def test_cpu_ddp_pixel_mode_tolerates_unused_semantic_head(tmp_path) -> None:
+    if torch.distributed.is_initialized():
+        return
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{tmp_path / 'ddp-init'}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        config = _config()
+        model = build_model(config.model)
+        execution = torch.nn.parallel.DistributedDataParallel(
+            model, find_unused_parameters=True
+        )
+        result = compute_training_loss(
+            execution,
+            _batch(1.0),
+            RNGStreams.create(9),
+            config,
+            phase="pixel",
+        )
+        result.loss.total.backward()
+        assert model.semantic_head.projection.weight.grad is None
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_checkpoint_resume_state_supports_each_fixed_phase(tmp_path) -> None:
+    config = _config()
+    for phase, completed, within in (("semantic", 0, 0), ("pixel", 1, 0)):
+        model = build_model(config.model)
+        manager = CheckpointManager(tmp_path / phase)
+        state = ResumeState(
+            schema_version=5,
+            completed_epoch=completed,
+            global_step=3,
+            phase=phase,  # type: ignore[arg-type]
+            epoch_within_phase=within,
+            training_complete=False,
+            images_seen=4,
+            estimated_flops=5,
+            wall_clock_seconds=1.0,
+            optimizer=None,
+            scheduler=None,
+            rng_streams=RNGStreams.create(4).state_dict(),
+            data_fingerprint="data",
+            representation_fingerprint="representations",
+        )
+        saved = manager.save(model=model, ema=EMA(model), state=state, config=config)
+        loaded = manager.load(saved, model, EMA(model))
+        assert loaded.phase == phase
+        assert loaded.epoch_within_phase == within

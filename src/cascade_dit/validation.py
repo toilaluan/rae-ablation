@@ -9,8 +9,8 @@ import torch
 from torch import Tensor
 
 from .config import ExperimentConfig
-from .data import MIXTURE_MODE_NAMES, RepresentationBatchPreprocessor
-from .rng import RNGStreams, preserve_global_rng
+from .data import EndpointBatchPreprocessor, EndpointPhase
+from .rng import RNGStreams
 from .sampling import class_balanced_labels
 from .training import compute_training_loss
 
@@ -18,12 +18,11 @@ from .training import compute_training_loss
 @dataclass
 class ValidationPlan:
     labels: Tensor
-    sample_ids: Tensor
     noise_seeds: Tensor
     plan_hash: str
 
-    def prefix(self, count: int) -> tuple[Tensor, Tensor, Tensor]:
-        return self.labels[:count], self.sample_ids[:count], self.noise_seeds[:count]
+    def prefix(self, count: int) -> tuple[Tensor, Tensor]:
+        return self.labels[:count], self.noise_seeds[:count]
 
     def save(self, path: str | Path) -> None:
         target = Path(path)
@@ -58,87 +57,30 @@ def create_validation_plan(
     class_balanced_labels(periodic_samples, num_classes)
     if periodic_samples > final_samples:
         raise ValueError("periodic plan must be a prefix of final plan")
-    sample_ids = torch.arange(final_samples, dtype=torch.int64)
     generator = torch.Generator().manual_seed(seed)
     noise_seeds = torch.randint(0, 2**63 - 1, (final_samples,), generator=generator)
-    values = {"labels": labels, "sample_ids": sample_ids, "noise_seeds": noise_seeds}
+    values = {"labels": labels, "noise_seeds": noise_seeds}
     return ValidationPlan(**values, plan_hash=_plan_digest(values))
 
 
-def noise_for_samples(
-    seeds: Tensor,
-    shape: tuple[int, ...],
-    device: str | torch.device,
-    dtype: torch.dtype = torch.float16,
-    *,
-    seed_offset: int = 0,
-) -> Tensor:
-    """Generate each example independently, invariant to batching and rank partitioning."""
-    samples = []
-    modulus = 2**63 - 1
-    for seed in seeds.cpu().tolist():
-        generator = torch.Generator(device=device).manual_seed((seed + seed_offset) % modulus)
-        samples.append(torch.randn(shape, generator=generator, device=device, dtype=dtype))
-    return torch.stack(samples)
-
-
-def should_validate(
-    completed_epoch: int,
-    total_epochs: int,
-    interval: int,
-    last_completed_validation_epoch: int | None = None,
-    validate_now: bool = False,
-) -> bool:
-    if completed_epoch == last_completed_validation_epoch and not validate_now:
-        return False
-    return (
-        validate_now
-        or completed_epoch == total_epochs
-        or (interval > 0 and completed_epoch % interval == 0)
-    )
-
-
-def run_preserving_training_state(model: torch.nn.Module, function: object) -> object:
-    was_training = model.training
-    with preserve_global_rng():
-        model.eval()
-        try:
-            return function()  # type: ignore[operator]
-        finally:
-            model.train(was_training)
-
-
 @torch.inference_mode()
-def validate_stage_loss(
+def validate_phase_loss(
     model: torch.nn.Module,
     loader: object,
-    batch_preprocessor: RepresentationBatchPreprocessor,
+    batch_preprocessor: EndpointBatchPreprocessor,
     config: ExperimentConfig,
     *,
-    stage_index: int,
+    phase: EndpointPhase,
     epoch: int,
     device: torch.device,
-    timestep_shift: float | None = None,
-    preview_features: bool | None = None,
-) -> tuple[dict[str, float], Tensor | None, Tensor | None]:
-    """Deterministic loss and feature preview inputs for any curriculum stage."""
+) -> dict[str, float]:
     streams = RNGStreams.create(config.experiment.seed + 1_000_003 + epoch, device)
-    losses: list[float] = []
-    mode_losses: dict[int, list[float]] = {
-        index: [] for index in range(len(MIXTURE_MODE_NAMES))
-    }
-    preview: Tensor | None = None
-    preview_labels: Tensor | None = None
-    active_shift = (
-        config.stages[stage_index].timestep_shift
-        if timestep_shift is None
-        else timestep_shift
-    )
-    should_preview = (
-        stage_index != config.num_representation_levels - 1
-        if preview_features is None
-        else preview_features
-    )
+    totals: list[float] = []
+    velocities: list[float] = []
+    auxiliary: list[float] = []
+    weighted_auxiliary: list[float] = []
+    ratios: list[Tensor] = []
+    pure_semantic_count = 0
     was_training = model.training
     model.eval()
     try:
@@ -146,47 +88,33 @@ def validate_stage_loss(
             if batch_index >= config.validation.batches:
                 break
             batch = batch_preprocessor(raw_batch)
-            tokens = batch.tokens
-            labels = batch.labels
-            weights = batch.representation_weights
-            modes = batch.modes
             result = compute_training_loss(
                 model,
-                tokens,
-                labels,
-                weights,
+                batch,
                 streams,
                 config,
-                timestep_shift=active_shift,
+                phase=phase,
             )
-            losses.append(float(result.loss.total))
-            for mode in mode_losses:
-                selected = modes == mode
-                if selected.any():
-                    mode_result = compute_training_loss(
-                        model,
-                        tokens[selected],
-                        labels[selected],
-                        weights[selected],
-                        streams,
-                        config,
-                        timestep_shift=active_shift,
-                    )
-                    mode_losses[mode].append(float(mode_result.loss.total))
-            if preview is None and should_preview:
-                count = min(config.validation.pca_preview_samples, tokens.shape[0])
-                preview = result.clean_prediction[:count].detach().float().cpu()
-                preview_labels = labels[:count].detach().cpu()
+            totals.append(float(result.loss.total))
+            velocities.append(float(result.loss.velocity_mse))
+            auxiliary.append(float(result.loss.pixel_auxiliary_mse))
+            weighted_auxiliary.append(float(result.loss.weighted_pixel_auxiliary_mse))
+            pure_semantic_count += result.loss.pure_semantic_count
+            ratios.append(batch.pixel_ratio.detach().float().cpu())
     finally:
         model.train(was_training)
-    if not losses:
+    if not totals:
         raise ValueError("validation loader produced no batches")
-    metrics = {"overall": sum(losses) / len(losses)}
-    metrics.update(
-        {
-            MIXTURE_MODE_NAMES[mode]: sum(values) / len(values)
-            for mode, values in mode_losses.items()
-            if values
-        }
-    )
-    return metrics, preview, preview_labels
+    all_ratios = torch.cat(ratios)
+    mixed_count = int(((all_ratios > 0) & (all_ratios < 1)).sum())
+    return {
+        "loss": sum(totals) / len(totals),
+        "velocity_mse": sum(velocities) / len(velocities),
+        "pixel_auxiliary_mse": sum(auxiliary) / len(auxiliary),
+        "weighted_pixel_auxiliary_mse": sum(weighted_auxiliary) / len(weighted_auxiliary),
+        "pure_semantic_count": float(pure_semantic_count),
+        "mixed_count": float(mixed_count),
+        "pixel_ratio_mean": float(all_ratios.mean()),
+        "pixel_ratio_min": float(all_ratios.min()),
+        "pixel_ratio_max": float(all_ratios.max()),
+    }

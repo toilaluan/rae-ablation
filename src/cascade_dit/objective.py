@@ -7,6 +7,7 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from .config import ObjectiveConfig
+from .model import DDTOutput
 
 
 @dataclass(frozen=True)
@@ -22,8 +23,9 @@ class GaussianFlowPath:
 class FlowLoss:
     total: Tensor
     velocity_mse: Tensor
-    cosine: Tensor
-    source_consistency: Tensor
+    pixel_auxiliary_mse: Tensor
+    weighted_pixel_auxiliary_mse: Tensor
+    pure_semantic_count: int
 
 
 def _broadcast_timestep(timestep: Tensor, values: Tensor) -> Tensor:
@@ -51,7 +53,9 @@ def sample_timesteps(
         raise ValueError("invalid shifted-logit-normal timestep settings")
     logits = torch.randn(batch_size, generator=generator, device=generator.device)
     timesteps = (logits.mul(scale).add(loc)).sigmoid().to(device)
-    return shift_timestep(timesteps, shift).clamp_(torch.finfo(torch.float32).eps, 1 - 1e-6)
+    return shift_timestep(timesteps, shift).clamp_(
+        torch.finfo(torch.float32).eps, 1 - 1e-6
+    )
 
 
 def gaussian_flow_path(clean: Tensor, noise: Tensor, timestep: Tensor) -> GaussianFlowPath:
@@ -76,39 +80,42 @@ def x0_to_velocity(
     return (noisy - clean_prediction) / denominator
 
 
-def velocity_to_x0(noisy: Tensor, velocity: Tensor, timestep: Tensor) -> Tensor:
-    if noisy.shape != velocity.shape:
-        raise ValueError("noisy values and velocity must have equal shapes")
-    return noisy - _broadcast_timestep(timestep, noisy) * velocity
-
-
-def clean_prediction_loss(
+def flow_matching_loss(
     path: GaussianFlowPath,
-    clean_prediction: Tensor,
+    output: DDTOutput,
+    pixel_target: Tensor,
+    pixel_ratio: Tensor,
     config: ObjectiveConfig,
-    *,
-    source_prediction: Tensor | None = None,
-    source_consistency_weight: float = 0.0,
 ) -> FlowLoss:
+    if pixel_target.shape != path.clean.shape:
+        raise ValueError("pixel target must have the clean endpoint shape")
+    if pixel_ratio.shape != (path.clean.shape[0],):
+        raise ValueError("pixel_ratio must have shape [B]")
     predicted_velocity = x0_to_velocity(
-        path.noisy, clean_prediction, path.timestep, config.denominator_floor
+        path.noisy,
+        output.prediction,
+        path.timestep,
+        config.denominator_floor,
     )
     velocity_mse = F.mse_loss(predicted_velocity.float(), path.velocity.float())
-    if config.cosine_loss_weight:
-        prediction_flat = predicted_velocity.float().reshape(predicted_velocity.shape[0], -1)
-        target_flat = path.velocity.float().reshape(path.velocity.shape[0], -1)
-        cosine = (1 - F.cosine_similarity(
-            prediction_flat, target_flat, dim=-1, eps=config.cosine_loss_epsilon
-        )).mean()
+    pure_semantic = pixel_ratio == 0
+    pure_semantic_count = int(pure_semantic.sum().item())
+    if pure_semantic_count:
+        if output.pixel_x0 is None:
+            raise ValueError("pure-semantic items require a pixel prediction")
+        pixel_auxiliary_mse = F.mse_loss(
+            output.pixel_x0[pure_semantic].float(),
+            pixel_target[pure_semantic].float(),
+        )
+    elif output.pixel_x0 is not None:
+        pixel_auxiliary_mse = output.pixel_x0.float().sum() * 0
     else:
-        cosine = velocity_mse.new_zeros(())
-    if source_prediction is not None and source_consistency_weight:
-        source_consistency = F.mse_loss(clean_prediction.float(), source_prediction.detach().float())
-    else:
-        source_consistency = velocity_mse.new_zeros(())
-    total = (
-        velocity_mse
-        + config.cosine_loss_weight * cosine
-        + source_consistency_weight * source_consistency
+        pixel_auxiliary_mse = velocity_mse.new_zeros(())
+    weighted = config.pixel_auxiliary_mse_weight * pixel_auxiliary_mse
+    return FlowLoss(
+        velocity_mse + weighted,
+        velocity_mse,
+        pixel_auxiliary_mse,
+        weighted,
+        pure_semantic_count,
     )
-    return FlowLoss(total, velocity_mse, cosine, source_consistency)

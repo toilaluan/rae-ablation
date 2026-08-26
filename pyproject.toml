@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cascade-dit"
 version = "0.4.0"
-description = "Adjacent-flow DINO-to-pixel DDT experiments"
+description = "Two-endpoint semantic-to-pixel DDT experiments"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

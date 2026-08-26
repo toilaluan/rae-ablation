@@ -2,20 +2,18 @@ from __future__ import annotations
 
 import json
 import math
-from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 6
+CONFIG_SCHEMA_VERSION = 7
 
 IMAGE_SIZE = 128
 PATCH_SIZE = 16
 GRID_SIZE = 8
 TOKEN_COUNT = GRID_SIZE * GRID_SIZE
 TOKEN_DIM = 768
-RGB_CHANNELS = 3
-RGB_PATCH_DIM = RGB_CHANNELS * PATCH_SIZE * PATCH_SIZE
+PIXEL_REPRESENTATION_NAME = "rgb"
 
 DINO_REPOSITORY = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 DINO_REVISION = "5931719e67bbdb9737e363e781fb0c67687896bc"
@@ -30,7 +28,7 @@ def _positive(name: str, *values: int | float) -> None:
 
 @dataclass
 class ExperimentOptions:
-    name: str = "adjacent-flow-ddt"
+    name: str = "semantic-pixel-ddt"
     seed: int = 0
     output_directory: str = "runs/experiment"
 
@@ -40,7 +38,6 @@ class DataConfig:
     repository: str = IMAGENET_REPOSITORY
     revision: str = IMAGENET_REVISION
     split: str = "train"
-    validation_split: str = "validation"
     image_size: int = IMAGE_SIZE
     workers: int = 16
     prefetch_factor: int = 4
@@ -59,67 +56,49 @@ class EncoderConfig:
 
 
 @dataclass
-class RepresentationSourceConfig:
-    kind: str = "dino"
-    layer: int | None = None
+class LogitNormalConfig:
+    distribution: str = "logit_normal"
+    loc: float = 0.0
+    scale: float = 1.0
 
 
 @dataclass
-class RepresentationStageConfig:
-    name: str = ""
-    epochs: int = 20
-    source: RepresentationSourceConfig = field(default_factory=RepresentationSourceConfig)
+class SemanticTrainingConfig:
+    epochs: int = 50
     timestep_shift: float = 4.0
+    mixed_probability: float = 0.1
+    mix_ratio: LogitNormalConfig = field(default_factory=LogitNormalConfig)
 
 
-def _default_stages() -> list[RepresentationStageConfig]:
-    return [
-        RepresentationStageConfig("dino12", 20, RepresentationSourceConfig("dino", 12), 4.0),
-        RepresentationStageConfig("dino8", 20, RepresentationSourceConfig("dino", 8), 4.0),
-        RepresentationStageConfig("dino4", 20, RepresentationSourceConfig("dino", 4), 4.0),
-    ]
+@dataclass
+class PixelTrainingConfig:
+    epochs: int = 120
+    timestep_shift: float = 7.0
+
+
+@dataclass
+class TrainingConfig:
+    mode: str = "progressive"
+    semantic: SemanticTrainingConfig = field(default_factory=SemanticTrainingConfig)
+    pixel: PixelTrainingConfig = field(default_factory=PixelTrainingConfig)
+
+
+@dataclass
+class SemanticRepresentationConfig:
+    name: str = "dino12"
+    layer: int = 12
 
 
 @dataclass
 class RepresentationsConfig:
     directory: str = "data/direct-representations"
     manifest: str = "manifest.json"
-    stages: list[RepresentationStageConfig] = field(default_factory=_default_stages)
-    dtype: str = "bfloat16"
-    cache_batch_size: int = 128
-    asynchronous_writes: bool = True
-    statistics_dtype: str = "float64"
+    semantic: SemanticRepresentationConfig = field(
+        default_factory=SemanticRepresentationConfig
+    )
+    cache_batch_size: int = 256
     normalization_epsilon: float = 1e-6
     require_complete: bool = True
-
-
-LORA_TARGET_GROUPS = (
-    "attention",
-    "feedforward",
-    "conditioning",
-    "projections",
-)
-
-
-@dataclass
-class LoRAConfig:
-    use_lora: bool = False
-    rank: int = 8
-    alpha: float = 8.0
-    dropout: float = 0.0
-    target_groups: list[str] = field(
-        default_factory=lambda: list(LORA_TARGET_GROUPS)
-    )
-
-
-@dataclass
-class PixelTrainingConfig:
-    name: str = "rgb"
-    epochs: int = 20
-    timestep_shift: float = 4.0
-    use_representation_guiding: bool = True
-    lora: LoRAConfig = field(default_factory=LoRAConfig)
-    representations: RepresentationsConfig = field(default_factory=RepresentationsConfig)
 
 
 @dataclass
@@ -127,6 +106,14 @@ class DDTPathConfig:
     width: int = 768
     depth: int = 12
     heads: int = 12
+
+
+@dataclass
+class DDTDecoderConfig:
+    width: int = 2048
+    depth: int = 3
+    semantic_depth: int = 2
+    heads: int = 16
 
 
 @dataclass
@@ -154,9 +141,7 @@ class ModelConfig:
     architecture: str = "ddt"
     token_dim: int = TOKEN_DIM
     encoder: DDTPathConfig = field(default_factory=DDTPathConfig)
-    decoder: DDTPathConfig = field(
-        default_factory=lambda: DDTPathConfig(width=2048, depth=2, heads=16)
-    )
+    decoder: DDTDecoderConfig = field(default_factory=DDTDecoderConfig)
     feedforward: DDTFeedForwardConfig = field(default_factory=DDTFeedForwardConfig)
     attention: DDTAttentionConfig = field(default_factory=DDTAttentionConfig)
     conditioning: DDTConditioningConfig = field(default_factory=DDTConditioningConfig)
@@ -172,52 +157,11 @@ class ModelConfig:
 
 
 @dataclass
-class AdjacentMixConfig:
-    probability: float = 0.10
-    distribution: str = "uniform"
-    minimum: float = 0.0
-    maximum: float = 1.0
-
-
-@dataclass
-class AllLevelsMixConfig:
-    probability: float = 0.025
-    distribution: str = "uniform_simplex"
-    concentration: float = 1.0
-
-
-@dataclass
-class MixingConfig:
-    adjacent: AdjacentMixConfig = field(default_factory=AdjacentMixConfig)
-    pure_next_probability: float = 0.025
-    all_levels: AllLevelsMixConfig = field(default_factory=AllLevelsMixConfig)
-    final_stage: str = "pure"
-
-    @property
-    def pure_current_probability(self) -> float:
-        return 1.0 - (
-            self.adjacent.probability
-            + self.pure_next_probability
-            + self.all_levels.probability
-        )
-
-
-@dataclass
-class CurriculumConfig:
-    mixing: MixingConfig = field(default_factory=MixingConfig)
-    source_consistency_weight: float = 0.0
-
-
-@dataclass
 class ObjectiveConfig:
-    prediction: str = "x0"
-    loss_space: str = "velocity"
-    timestep_distribution: str = "shifted_logit_normal"
     timestep_loc: float = 0.0
     timestep_scale: float = 1.0
     denominator_floor: float = 0.05
-    cosine_loss_weight: float = 0.0
-    cosine_loss_epsilon: float = 1e-8
+    pixel_auxiliary_mse_weight: float = 1.0
 
 
 @dataclass
@@ -260,7 +204,6 @@ class SamplingConfig:
 class ValidationConfig:
     interval_epochs: int = 5
     batches: int = 32
-    pca_preview_samples: int = 16
     periodic_samples: int = 10_000
 
 
@@ -268,8 +211,7 @@ class ValidationConfig:
 class CheckpointConfig:
     directory: str = "checkpoints"
     interval_epochs: int = 5
-    save_stage_boundaries: bool = True
-    keep_last_n: int = 8
+    save_phase_boundary: bool = True
     resume: str | None = None
 
 
@@ -286,23 +228,19 @@ class CompileConfig:
 class WandbConfig:
     enabled: bool = False
     entity: str | None = None
-    project: str = "adjacent-flow-ddt"
+    project: str = "semantic-pixel-ddt"
     name: str | None = None
     group: str | None = None
     tags: list[str] = field(default_factory=list)
     mode: str = "online"
-    checkpoint_artifacts: bool = False
 
 
 @dataclass
 class EvaluationConfig:
     num_samples: int = 50_000
     reference_npz: str = "data/VIRTUAL_imagenet128_labeled.npz"
-    metrics: list[str] = field(default_factory=lambda: ["fid", "is"])
     batch_size: int = 32
     device: str = "auto"
-    report_flops: bool = True
-    report_peak_memory: bool = True
 
 
 @dataclass
@@ -311,9 +249,9 @@ class ExperimentConfig:
     experiment: ExperimentOptions = field(default_factory=ExperimentOptions)
     data: DataConfig = field(default_factory=DataConfig)
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
-    pixel_training: PixelTrainingConfig = field(default_factory=PixelTrainingConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    representations: RepresentationsConfig = field(default_factory=RepresentationsConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
-    curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     objective: ObjectiveConfig = field(default_factory=ObjectiveConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
@@ -324,50 +262,22 @@ class ExperimentConfig:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     @property
-    def stages(self) -> list[RepresentationStageConfig]:
-        return [*self.representation_stages, self.pixel_stage]
-
-    @property
-    def representations(self) -> RepresentationsConfig:
-        return self.pixel_training.representations
-
-    @property
-    def representation_stages(self) -> list[RepresentationStageConfig]:
-        return self.pixel_training.representations.stages
-
-    @property
-    def pixel_stage(self) -> RepresentationStageConfig:
-        return RepresentationStageConfig(
-            name=self.pixel_training.name,
-            epochs=self.pixel_training.epochs,
-            source=RepresentationSourceConfig("rgb", None),
-            timestep_shift=self.pixel_training.timestep_shift,
-        )
-
-    @property
-    def stage_names(self) -> list[str]:
-        return [stage.name for stage in self.stages]
-
-    @property
-    def dino_layers(self) -> list[int]:
-        return [
-            int(stage.source.layer)
-            for stage in self.stages
-            if stage.source.kind == "dino" and stage.source.layer is not None
-        ]
-
-    @property
     def total_epochs(self) -> int:
-        if not self.pixel_training.use_representation_guiding:
-            return self.pixel_training.epochs
-        return sum(stage.epochs for stage in self.stages)
-
-    @property
-    def num_representation_levels(self) -> int:
-        return len(self.stages)
+        if self.training.mode == "pixel_only":
+            return self.training.pixel.epochs
+        return self.training.semantic.epochs + self.training.pixel.epochs
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def phase_for_epoch(self, epoch: int) -> tuple[str, int]:
+        if not 0 <= epoch < self.total_epochs:
+            raise ValueError("epoch is outside the training schedule")
+        if self.training.mode == "pixel_only":
+            return "pixel", epoch
+        if epoch < self.training.semantic.epochs:
+            return "semantic", epoch
+        return "pixel", epoch - self.training.semantic.epochs
 
     def validate(self) -> None:
         if self.schema_version != CONFIG_SCHEMA_VERSION:
@@ -375,6 +285,24 @@ class ExperimentConfig:
                 f"configuration schema {self.schema_version!r} is unsupported; "
                 f"schema_version: {CONFIG_SCHEMA_VERSION} is required"
             )
+        if self.training.mode not in {"progressive", "pixel_only"}:
+            raise ValueError("training.mode must be progressive or pixel_only")
+        _positive(
+            "training phase settings",
+            self.training.semantic.epochs,
+            self.training.semantic.timestep_shift,
+            self.training.pixel.epochs,
+            self.training.pixel.timestep_shift,
+        )
+        mixed_probability = self.training.semantic.mixed_probability
+        if not math.isfinite(mixed_probability) or not 0 <= mixed_probability <= 1:
+            raise ValueError("training.semantic.mixed_probability must be in [0,1]")
+        ratio = self.training.semantic.mix_ratio
+        if ratio.distribution != "logit_normal":
+            raise ValueError("training.semantic.mix_ratio.distribution must be logit_normal")
+        if not math.isfinite(ratio.loc):
+            raise ValueError("training.semantic.mix_ratio.loc must be finite")
+        _positive("training.semantic.mix_ratio.scale", ratio.scale)
         if self.data.image_size != IMAGE_SIZE:
             raise ValueError("data.image_size must be 128")
         if (self.data.repository, self.data.revision) != (
@@ -382,8 +310,17 @@ class ExperimentConfig:
             IMAGENET_REVISION,
         ):
             raise ValueError("data must use the pinned ImageNet repository revision")
-        self._validate_stages()
-        if self.pixel_training.use_representation_guiding:
+        semantic = self.representations.semantic
+        if not semantic.name:
+            raise ValueError("representations.semantic.name must be non-empty")
+        if not 1 <= semantic.layer <= 12:
+            raise ValueError("representations.semantic.layer must be in [1,12]")
+        _positive(
+            "representation settings",
+            self.representations.cache_batch_size,
+            self.representations.normalization_epsilon,
+        )
+        if self.training.mode == "progressive":
             if (self.encoder.repository, self.encoder.revision) != (
                 DINO_REPOSITORY,
                 DINO_REVISION,
@@ -396,32 +333,19 @@ class ExperimentConfig:
                 raise ValueError("DINO representations must use 16px patches and width 768")
             if self.encoder.num_register_tokens != 4 or not self.encoder.apply_final_norm:
                 raise ValueError("DINO extraction requires four registers and final normalization")
-            if self.representations.dtype != "bfloat16":
-                raise ValueError("representations.dtype must be bfloat16")
-            if self.representations.statistics_dtype != "float64":
-                raise ValueError("representation statistics must accumulate in float64")
             if not self.representations.require_complete:
-                raise ValueError("training must require complete representation caches")
-            _positive(
-                "representation settings",
-                self.representations.cache_batch_size,
-                self.representations.normalization_epsilon,
-            )
+                raise ValueError("progressive training requires a complete representation cache")
         self._validate_model()
-        if self.pixel_training.use_representation_guiding:
-            self._validate_mixing()
-            if self.curriculum.source_consistency_weight < 0:
-                raise ValueError("source consistency weight cannot be negative")
-        self._validate_lora()
-        if self.objective.prediction != "x0" or self.objective.loss_space != "velocity":
-            raise ValueError("the experiment requires x0 prediction with velocity loss")
-        if self.objective.timestep_distribution != "shifted_logit_normal":
-            raise ValueError("objective timestep distribution must be shifted_logit_normal")
         _positive(
             "objective settings",
             self.objective.timestep_scale,
             self.objective.denominator_floor,
         )
+        if (
+            not math.isfinite(self.objective.pixel_auxiliary_mse_weight)
+            or self.objective.pixel_auxiliary_mse_weight < 0
+        ):
+            raise ValueError("objective.pixel_auxiliary_mse_weight must be non-negative")
         self._validate_optimizer()
         if self.sampling.solver not in {"euler", "heun"}:
             raise ValueError("sampling.solver must be euler or heun")
@@ -439,8 +363,6 @@ class ExperimentConfig:
             raise ValueError("data.max_samples must be positive")
         if self.wandb.mode not in {"online", "offline", "disabled"}:
             raise ValueError("wandb.mode must be online, offline, or disabled")
-        if set(self.evaluation.metrics) != {"fid", "is"}:
-            raise ValueError("evaluation.metrics must contain fid and is")
         if self.evaluation.num_samples % self.model.num_classes:
             raise ValueError("evaluation.num_samples must be class balanced")
         if self.validation.periodic_samples % self.model.num_classes:
@@ -448,7 +370,6 @@ class ExperimentConfig:
         _positive(
             "validation settings",
             self.validation.batches,
-            self.validation.pca_preview_samples,
             self.validation.periodic_samples,
             self.evaluation.num_samples,
             self.evaluation.batch_size,
@@ -456,57 +377,15 @@ class ExperimentConfig:
         if self.validation.periodic_samples > self.evaluation.num_samples:
             raise ValueError("periodic validation samples cannot exceed final evaluation samples")
 
-    def _validate_stages(self) -> None:
-        if not self.pixel_training.name:
-            raise ValueError("pixel_training.name must be non-empty")
-        _positive(
-            "pixel training settings",
-            self.pixel_training.epochs,
-            self.pixel_training.timestep_shift,
-        )
-        if not self.pixel_training.use_representation_guiding:
-            return
-        if not self.representation_stages:
-            raise ValueError("representation guiding requires at least one DINO stage")
-        names = self.stage_names
-        if any(not name for name in names) or len(names) != len(set(names)):
-            raise ValueError("representation stage names must be non-empty and unique")
-        if any(stage.epochs < 1 for stage in self.representation_stages):
-            raise ValueError("every representation stage must have positive epochs")
-        _positive(
-            "representation stage timestep shifts",
-            *(stage.timestep_shift for stage in self.representation_stages),
-        )
-        layers: list[int] = []
-        for stage in self.representation_stages:
-            source = stage.source
-            if source.kind == "dino":
-                if source.layer is None or not 1 <= source.layer <= 12:
-                    raise ValueError("DINO stages require a one-indexed layer in [1,12]")
-                layers.append(source.layer)
-            else:
-                raise ValueError("pixel_training.representations stages must be DINO")
-        if len(layers) != len(set(layers)):
-            raise ValueError("DINO representation layers must be unique")
-
-    def _validate_lora(self) -> None:
-        lora = self.pixel_training.lora
-        _positive("LoRA rank and alpha", lora.rank, lora.alpha)
-        if not 0 <= lora.dropout < 1:
-            raise ValueError("pixel_training.lora.dropout must be in [0,1)")
-        if not lora.target_groups or len(lora.target_groups) != len(set(lora.target_groups)):
-            raise ValueError("LoRA target groups must be non-empty and unique")
-        unknown = set(lora.target_groups) - set(LORA_TARGET_GROUPS)
-        if unknown:
-            raise ValueError(f"unknown LoRA target groups: {sorted(unknown)}")
-
     def _validate_model(self) -> None:
         if self.model.architecture != "ddt" or self.model.token_dim != TOKEN_DIM:
-            raise ValueError("model must be a 768-dimensional universal DDT")
+            raise ValueError("model must be a 768-dimensional DDT")
         for name, path in (("encoder", self.model.encoder), ("decoder", self.model.decoder)):
             _positive(f"model {name}", path.width, path.depth, path.heads)
             if path.width % path.heads or (path.width // path.heads) % 4:
                 raise ValueError(f"model.{name} head width must be divisible by four")
+        if not 1 <= self.model.decoder.semantic_depth < self.model.decoder.depth:
+            raise ValueError("model.decoder.semantic_depth must satisfy 1 <= semantic_depth < depth")
         _positive(
             "model settings",
             self.model.feedforward.mlp_ratio,
@@ -516,28 +395,6 @@ class ExperimentConfig:
         )
         if not 0 <= self.model.class_dropout_probability < 1:
             raise ValueError("class dropout probability must be in [0,1)")
-
-    def _validate_mixing(self) -> None:
-        mixing = self.curriculum.mixing
-        probabilities = (
-            mixing.adjacent.probability,
-            mixing.pure_next_probability,
-            mixing.all_levels.probability,
-        )
-        if any(not math.isfinite(value) or value < 0 for value in probabilities):
-            raise ValueError("mixture probabilities must be finite and non-negative")
-        if mixing.pure_current_probability < 0:
-            raise ValueError("mixture probabilities cannot sum above one")
-        adjacent = mixing.adjacent
-        if adjacent.distribution != "uniform":
-            raise ValueError("adjacent mixture distribution must be uniform")
-        if not 0 <= adjacent.minimum < adjacent.maximum <= 1:
-            raise ValueError("adjacent uniform bounds must satisfy 0 <= min < max <= 1")
-        if mixing.all_levels.distribution != "uniform_simplex":
-            raise ValueError("all-level distribution must be uniform_simplex")
-        _positive("all-level concentration", mixing.all_levels.concentration)
-        if mixing.final_stage != "pure":
-            raise ValueError("the final representation stage must be pure")
 
     def _validate_optimizer(self) -> None:
         values = self.optimizer
@@ -578,48 +435,15 @@ def _structured_config(values: dict[str, Any]) -> ExperimentConfig:
     return result
 
 
-def _migrate_v5(values: dict[str, Any], source: str | Path) -> dict[str, Any]:
-    migrated = deepcopy(values)
-    experiment = migrated.get("experiment")
-    representations = migrated.pop("representations", None)
-    if not isinstance(experiment, dict) or not isinstance(representations, dict):
-        raise ValueError(f"{source} is not a valid schema-v5 configuration")
-    mode = experiment.pop("mode", None)
-    if mode not in {"progressive", "pixel_baseline"}:
-        raise ValueError(f"{source} has an invalid schema-v5 experiment mode")
-    stages = representations.get("stages")
-    if not isinstance(stages, list) or not stages:
-        raise ValueError(f"{source} has no schema-v5 RGB stage to migrate")
-    pixel = stages[-1]
-    if not isinstance(pixel, dict):
-        raise ValueError(f"{source} has an invalid schema-v5 RGB stage")
-    pixel_source = pixel.get("source")
-    if not isinstance(pixel_source, dict) or pixel_source.get("kind") != "rgb":
-        raise ValueError(f"{source} schema-v5 final stage is not RGB")
-    representations["stages"] = stages[:-1]
-    migrated["pixel_training"] = {
-        "name": pixel.get("name", "rgb"),
-        "epochs": pixel.get("epochs", 20),
-        "timestep_shift": pixel.get("timestep_shift", 4.0),
-        "use_representation_guiding": mode == "progressive",
-        "representations": representations,
-    }
-    migrated["schema_version"] = CONFIG_SCHEMA_VERSION
-    return migrated
-
-
 def _require_current(values: object, source: str | Path) -> dict[str, Any]:
     if not isinstance(values, dict):
         raise ValueError(f"{source} must contain a configuration object")
     version = values.get("schema_version")
-    if version == 5:
-        return _migrate_v5(values, source)
     if version != CONFIG_SCHEMA_VERSION:
         raise ValueError(
-            f"{source} uses unsupported configuration schema "
-            f"{version!r}; schema_version: "
-            f"{CONFIG_SCHEMA_VERSION} is required. Alignment-era LightningDiT and "
-            "legacy DDT/Mage configurations are not supported."
+            f"{source} uses unsupported configuration schema {version!r}; "
+            f"schema_version: {CONFIG_SCHEMA_VERSION} is required. Schema-v5/v6 "
+            "curriculum configurations are intentionally not migrated."
         )
     return values
 

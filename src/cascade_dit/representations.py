@@ -20,12 +20,6 @@ from .config import IMAGE_SIZE, PATCH_SIZE, TOKEN_COUNT, TOKEN_DIM
 REPRESENTATION_SCHEMA_VERSION = 3
 
 
-def required_representation_bytes(dataset_size: int, dino_levels: int = 3) -> int:
-    if dataset_size < 1 or dino_levels < 1:
-        raise ValueError("dataset size and DINO level count must be positive")
-    return dino_levels * dataset_size * (TOKEN_COUNT * TOKEN_DIM * 2 + 1)
-
-
 def preflight_representation_capacity(
     root: str | Path, dataset_size: int, dino_names: Iterable[str]
 ) -> int:
@@ -101,22 +95,6 @@ class ChannelStatisticsAccumulator:
         self.m2 += batch_m2 + delta.square() * (self.count * batch_count / total)
         self.count = total
 
-    def merge(self, other: ChannelStatisticsAccumulator) -> None:
-        if other.channels != self.channels:
-            raise ValueError("statistics channel counts differ")
-        if other.count == 0:
-            return
-        if self.count == 0:
-            self.count = other.count
-            self.mean = other.mean.clone()
-            self.m2 = other.m2.clone()
-            return
-        delta = other.mean - self.mean
-        total = self.count + other.count
-        self.m2 += other.m2 + delta.square() * (self.count * other.count / total)
-        self.mean += delta * (other.count / total)
-        self.count = total
-
     def finalize(self, epsilon: float = 1e-6) -> ChannelStatistics:
         if self.count < 2:
             raise ValueError("at least two tokens are required for statistics")
@@ -124,13 +102,6 @@ class ChannelStatisticsAccumulator:
         return ChannelStatistics(
             self.mean.float(), variance.clamp_min(epsilon**2).sqrt().float(), self.count
         )
-
-
-def deterministic_subset_indices(dataset_size: int, subset_size: int, seed: int) -> Tensor:
-    if dataset_size < 1 or not 0 < subset_size <= dataset_size:
-        raise ValueError("subset size must be within the dataset")
-    generator = torch.Generator().manual_seed(seed)
-    return torch.randperm(dataset_size, generator=generator)[:subset_size]
 
 
 def fingerprint(payload: dict[str, Any]) -> str:

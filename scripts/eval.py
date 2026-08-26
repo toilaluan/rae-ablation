@@ -28,14 +28,14 @@ def _plan_hash(samples: Path, plan_path: Path | None, parser: argparse.ArgumentP
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
         if not manifest.get("complete"):
-            parser.error(f"adjacent sample manifest is incomplete: {manifest_path}")
+            parser.error(f"sample manifest is incomplete: {manifest_path}")
         value = manifest.get("sampling_plan_hash", manifest.get("validation_plan_hash"))
         if not isinstance(value, str) or not value:
-            parser.error(f"adjacent sample manifest has no plan hash: {manifest_path}")
+            parser.error(f"sample manifest has no plan hash: {manifest_path}")
         manifest_hash = value
     if plan_path is None:
         if manifest_hash is None:
-            parser.error("--plan is required for an external NPZ without an adjacent manifest")
+            parser.error("--plan is required for an external NPZ without a sample manifest")
         return manifest_hash
     plan_hash = ValidationPlan.load(plan_path).plan_hash
     if manifest_hash is not None and manifest_hash != plan_hash:

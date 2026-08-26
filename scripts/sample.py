@@ -63,7 +63,7 @@ def main() -> None:
     )
     num_samples = int(_pick(arguments.num_samples, config.evaluation.num_samples))
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    model = build_model(config.model, bundle.representation_levels).to(device)
+    model = build_model(config.model).to(device)
     model.load_state_dict(load_file(bundle.weights, device=str(device)))
     model.eval()
     execution = compile_model_regions(model, config.compile)
@@ -71,19 +71,16 @@ def main() -> None:
     root = Path(config.representations.directory)
     manifest = RepresentationManifest.load(
         root / config.representations.manifest,
-        required_stages=[config.pixel_training.name],
+        required_stages=["rgb"],
     )
-    rgb_statistics = statistics_from_manifest(manifest, config.pixel_training.name)
+    rgb_statistics = statistics_from_manifest(manifest, "rgb")
 
     @torch.inference_mode()
     def generate(labels: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:
         noise = noise_for_seeds(
             seeds, (TOKEN_COUNT, TOKEN_DIM), device, dtype=dtype
         )
-        weights = torch.zeros(
-            labels.shape[0], bundle.representation_levels, device=device
-        )
-        weights[:, -1] = 1
+        pixel_ratio = torch.ones(labels.shape[0], device=device)
         with torch.autocast(
             device_type=device.type,
             dtype=torch.bfloat16,
@@ -93,7 +90,8 @@ def main() -> None:
                 execution_holder["model"],
                 noise,
                 labels.to(device),
-                weights,
+                pixel_ratio,
+                prediction_mode="pixel",
                 steps=parameters.steps,
                 solver=parameters.solver,
                 timestep_shift=parameters.timestep_shift,

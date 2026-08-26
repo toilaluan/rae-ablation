@@ -10,9 +10,7 @@ from cascade_dit.representations import (
     ChannelStatisticsAccumulator,
     LayerMemmap,
     RepresentationManifest,
-    deterministic_subset_indices,
     patchify_rgb,
-    required_representation_bytes,
     unpatchify_rgb,
 )
 
@@ -35,10 +33,6 @@ def test_streaming_channel_statistics_normalize_to_unit_variance() -> None:
     normalized = statistics.normalize(values)
     assert torch.allclose(normalized.mean((0, 1)), torch.zeros(4), atol=1e-6)
     assert torch.allclose(normalized.square().mean((0, 1)), torch.ones(4), atol=1e-5)
-
-
-def test_dynamic_layer_cache_is_resumable_and_sized() -> None:
-    assert required_representation_bytes(2, dino_levels=2) == 2 * 2 * (64 * 768 * 2 + 1)
 
 
 def test_layer_cache_is_resumable_and_deterministic(tmp_path) -> None:
@@ -93,13 +87,6 @@ def test_normalization_only_manifest_and_old_schema_rejection(tmp_path) -> None:
     path.write_text("not-json")
     with pytest.raises(ValueError, match="corrupt"):
         RepresentationManifest.load(path)
-
-
-def test_subset_selection_is_deterministic() -> None:
-    assert torch.equal(
-        deterministic_subset_indices(100, 12, 4),
-        deterministic_subset_indices(100, 12, 4),
-    )
 
 
 def test_rgb_only_manifest_validation_ignores_dino_statistics_and_cache(tmp_path) -> None:

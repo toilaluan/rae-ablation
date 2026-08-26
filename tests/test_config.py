@@ -4,132 +4,73 @@ import json
 
 import pytest
 
-from cascade_dit.config import (
-    CONFIG_SCHEMA_VERSION,
-    ExperimentConfig,
-    RepresentationSourceConfig,
-    RepresentationStageConfig,
-    load_config,
-)
+import cascade_dit
+from cascade_dit.config import CONFIG_SCHEMA_VERSION, ExperimentConfig, load_config
 
 
-def test_checked_in_nested_config_and_baseline_override() -> None:
+def test_checked_in_schema_v7_config_and_both_modes() -> None:
+    assert set(cascade_dit.__all__) == {"DDT", "DDTOutput", "build_model", "load_config"}
     config = load_config("configs/experiment.yaml")
-    assert config.total_epochs == 175
-    assert config.stage_names == ["dino12", "dino8", "rgb"]
-    assert config.dino_layers == [12, 8]
-    assert (config.model.encoder.width, config.model.encoder.depth) == (768, 12)
-    assert (config.model.decoder.width, config.model.decoder.depth) == (2048, 2)
-    assert config.curriculum.mixing.pure_current_probability == pytest.approx(0.9)
-    assert config.optimizer.scheduler.kind == "constant"
+    assert config.schema_version == CONFIG_SCHEMA_VERSION == 7
+    assert config.training.mode == "progressive"
+    assert config.total_epochs == 170
+    assert config.phase_for_epoch(49) == ("semantic", 49)
+    assert config.phase_for_epoch(50) == ("pixel", 0)
+    assert config.representations.semantic.name == "dino12"
+    assert config.model.decoder.semantic_depth == 2
+
     baseline = load_config(
         "configs/experiment.yaml",
-        [
-            "pixel_training.use_representation_guiding=false",
-            "model.encoder.depth=6",
-        ],
+        ["training.mode=pixel_only", "model.encoder.depth=6"],
     )
-    assert not baseline.pixel_training.use_representation_guiding
     assert baseline.total_epochs == 120
+    assert baseline.phase_for_epoch(0) == ("pixel", 0)
     assert baseline.model.encoder.depth == 6
-    constant = load_config(
-        "configs/experiment.yaml", ["optimizer.scheduler.kind=constant"]
-    )
-    assert constant.optimizer.scheduler.kind == "constant"
 
 
-def test_dynamic_stage_list_controls_R_width_and_epochs() -> None:
-    config = ExperimentConfig()
-    config.representations.stages = [
-        RepresentationStageConfig(
-            "semantic", 3, RepresentationSourceConfig("dino", 11)
-        ),
-        RepresentationStageConfig(
-            "detail", 4, RepresentationSourceConfig("dino", 2)
-        ),
-    ]
-    config.pixel_training.name = "pixels"
-    config.pixel_training.epochs = 5
-    config.validate()
-    assert config.num_representation_levels == 3
-    assert config.total_epochs == 12
-    assert config.dino_layers == [11, 2]
-
-
-def test_schema_stage_and_probability_validation(tmp_path) -> None:
-    path = tmp_path / "old.json"
-    path.write_text(json.dumps({"schema_version": 4}))
-    with pytest.raises(ValueError, match="Alignment-era"):
+@pytest.mark.parametrize("version", [5, 6])
+def test_old_config_schemas_are_rejected(tmp_path, version: int) -> None:
+    path = tmp_path / f"v{version}.json"
+    path.write_text(json.dumps({"schema_version": version}))
+    with pytest.raises(ValueError, match="not migrated"):
         load_config(path)
 
+
+@pytest.mark.parametrize("semantic_depth", [0, 3, 4])
+def test_decoder_split_is_validated(semantic_depth: int) -> None:
     config = ExperimentConfig()
-    config.curriculum.mixing.adjacent.probability = 0.98
-    with pytest.raises(ValueError, match="sum above one"):
-        config.validate()
-
-    config = ExperimentConfig()
-    config.representations.stages[-1].source.kind = "rgb"
-    with pytest.raises(ValueError, match="must be DINO"):
-        config.validate()
-    assert ExperimentConfig().schema_version == CONFIG_SCHEMA_VERSION
-
-
-def test_stage_timestep_shifts_and_evaluation_sample_counts_are_validated() -> None:
-    config = ExperimentConfig()
-    config.representations.stages[1].timestep_shift = 0
-    with pytest.raises(ValueError, match="timestep shifts"):
-        config.validate()
-
-    config = ExperimentConfig()
-    config.validation.periodic_samples = 1_500
-    with pytest.raises(ValueError, match="class balanced"):
-        config.validate()
-
-    config.validation.periodic_samples = 51_000
-    with pytest.raises(ValueError, match="cannot exceed"):
-        config.validate()
-
-    config = ExperimentConfig()
-    config.optimizer.scheduler.kind = "linear"
-    with pytest.raises(ValueError, match="constant or cosine"):
+    config.model.decoder.depth = 3
+    config.model.decoder.semantic_depth = semantic_depth
+    with pytest.raises(ValueError, match="semantic_depth"):
         config.validate()
 
 
-def test_schema_v5_moves_rgb_and_mode_under_pixel_training(tmp_path) -> None:
-    current = load_config("configs/experiment.yaml").as_dict()
-    pixel = current.pop("pixel_training")
-    representations = pixel["representations"]
-    representations["stages"].append(
-        {
-            "name": pixel["name"],
-            "epochs": pixel["epochs"],
-            "source": {"kind": "rgb", "layer": None},
-            "timestep_shift": pixel["timestep_shift"],
-        }
-    )
-    current["schema_version"] = 5
-    current["experiment"]["mode"] = "pixel_baseline"
-    current["representations"] = representations
-    path = tmp_path / "v5.json"
-    path.write_text(json.dumps(current))
-
-    migrated = load_config(path)
-
-    assert migrated.schema_version == 6
-    assert migrated.pixel_training.name == "rgb"
-    assert not migrated.pixel_training.use_representation_guiding
-    assert migrated.stage_names == ["dino12", "dino8", "rgb"]
-
-
-def test_pixel_only_validation_ignores_dino_preparation_settings() -> None:
+def test_ratio_probability_and_auxiliary_weight_validation() -> None:
     config = ExperimentConfig()
-    config.pixel_training.use_representation_guiding = False
-    config.encoder.repository = "unused"
-    config.representations.dtype = "unused"
-    config.representations.require_complete = False
-    config.representations.stages = []
+    config.training.semantic.mixed_probability = 1.01
+    with pytest.raises(ValueError, match="mixed_probability"):
+        config.validate()
 
-    config.validate()
+    config = ExperimentConfig()
+    config.training.semantic.mix_ratio.scale = 0
+    with pytest.raises(ValueError, match=r"mix_ratio\.scale"):
+        config.validate()
 
-    assert config.total_epochs == config.pixel_training.epochs
-    assert config.num_representation_levels == 1
+    config = ExperimentConfig()
+    config.training.semantic.mix_ratio.distribution = "uniform"
+    with pytest.raises(ValueError, match="logit_normal"):
+        config.validate()
+
+    config = ExperimentConfig()
+    config.objective.pixel_auxiliary_mse_weight = -1
+    with pytest.raises(ValueError, match="non-negative"):
+        config.validate()
+
+
+def test_invalid_mode_and_epoch_are_rejected() -> None:
+    config = ExperimentConfig()
+    config.training.mode = "baseline"
+    with pytest.raises(ValueError, match="progressive or pixel_only"):
+        config.validate()
+    with pytest.raises(ValueError, match="outside"):
+        ExperimentConfig().phase_for_epoch(-1)

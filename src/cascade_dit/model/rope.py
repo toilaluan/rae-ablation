@@ -132,39 +132,3 @@ def precompute_rope_tables(
         torch.cat((prefix_cos, image_cos), dim=0),
         torch.cat((prefix_sin, image_sin), dim=0),
     )
-
-
-def apply_2d_rope_positions(
-    q: Tensor,
-    k: Tensor,
-    y_positions: Tensor,
-    x_positions: Tensor,
-) -> tuple[Tensor, Tensor]:
-    """Apply factorized 2D RoPE at explicit coordinates."""
-    if q.shape != k.shape or q.ndim != 4:
-        raise ValueError("q and k must have equal [B, heads, tokens, dim] shapes")
-    if (
-        y_positions.ndim != 1
-        or x_positions.ndim != 1
-        or y_positions.shape != x_positions.shape
-        or q.shape[-2] != y_positions.shape[0]
-    ):
-        raise ValueError("RoPE coordinates must match the token count")
-    cos, sin = rope_cos_sin(
-        y_positions.to(q.device),
-        x_positions.to(q.device),
-        q.shape[-1],
-        q.dtype,
-    )
-    return apply_rope_cos_sin(q, k, cos, sin)
-
-
-def apply_2d_rope(q: Tensor, k: Tensor, height: int, width: int) -> tuple[Tensor, Tensor]:
-    """Apply factorized 2D rotary embeddings to ``[B, heads, HW, dim]`` tensors."""
-    if height < 1 or width < 1:
-        raise ValueError("RoPE grid dimensions must be positive")
-    y = torch.arange(height, device=q.device, dtype=torch.float32)
-    x = torch.arange(width, device=q.device, dtype=torch.float32)
-    y = y[:, None].expand(height, width).reshape(-1)
-    x = x[None, :].expand(height, width).reshape(-1)
-    return apply_2d_rope_positions(q, k, y, x)
