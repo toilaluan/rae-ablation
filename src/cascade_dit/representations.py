@@ -177,7 +177,11 @@ class RepresentationManifest:
 
     @classmethod
     def load(
-        cls, path: str | Path, *, require_complete: bool = True
+        cls,
+        path: str | Path,
+        *,
+        require_complete: bool = True,
+        required_stages: Iterable[str] | None = None,
     ) -> RepresentationManifest:
         target = Path(path)
         try:
@@ -190,10 +194,20 @@ class RepresentationManifest:
                 "are not reused by this experiment"
             )
         manifest = cls(**values)
-        manifest._validate(target, require_complete=require_complete)
+        manifest._validate(
+            target,
+            require_complete=require_complete,
+            required_stages=None if required_stages is None else set(required_stages),
+        )
         return manifest
 
-    def _validate(self, path: Path, *, require_complete: bool) -> None:
+    def _validate(
+        self,
+        path: Path,
+        *,
+        require_complete: bool,
+        required_stages: set[str] | None,
+    ) -> None:
         if require_complete and not self.complete:
             raise ValueError("representation manifest is incomplete")
         if self.dataset_size < 1 or not all(
@@ -205,14 +219,19 @@ class RepresentationManifest:
         ):
             raise ValueError("representation manifest fingerprints are incomplete")
         names = self.stage_names
-        if len(names) < 2 or len(names) != len(set(names)):
+        if not names or len(names) != len(set(names)):
             raise ValueError("representation manifest stages are invalid")
+        selected = set(names) if required_stages is None else required_stages
+        if not selected.issubset(names):
+            raise ValueError("representation manifest does not include required stages")
         root = path.parent
         tensors_path = root / self.tensor_file
         if not tensors_path.is_file():
             raise ValueError("representation statistics tensor file is missing")
         tensors = load_file(tensors_path)
         for name in names:
+            if name not in selected:
+                continue
             try:
                 recorded = self.statistics[name]
                 mean = torch.tensor(recorded["mean"])
@@ -230,6 +249,8 @@ class RepresentationManifest:
                     raise ValueError(f"manifest and tensor statistics disagree: {key}")
         for stage in self.stages:
             name = str(stage["name"])
+            if name not in selected:
+                continue
             source = stage.get("source")
             if not isinstance(source, dict):
                 raise ValueError(f"representation source is corrupt: {name}")

@@ -232,8 +232,8 @@ class DDT(nn.Module):
 
     def __init__(self, config: ModelConfig, representation_levels: int) -> None:
         super().__init__()
-        if representation_levels < 2:
-            raise ValueError("DDT requires at least two representation levels")
+        if representation_levels < 1:
+            raise ValueError("DDT requires at least one representation level")
         self.config = config
         self.representation_levels = representation_levels
         encoder_width = config.encoder.width

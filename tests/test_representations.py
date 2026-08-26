@@ -100,3 +100,35 @@ def test_subset_selection_is_deterministic() -> None:
         deterministic_subset_indices(100, 12, 4),
         deterministic_subset_indices(100, 12, 4),
     )
+
+
+def test_rgb_only_manifest_validation_ignores_dino_statistics_and_cache(tmp_path) -> None:
+    save_file(
+        {
+            "statistics.rgb.mean": torch.zeros(768),
+            "statistics.rgb.std": torch.ones(768),
+        },
+        tmp_path / "statistics.safetensors",
+    )
+    manifest = RepresentationManifest(
+        dataset_size=2,
+        dataset_fingerprint="data",
+        encoder_fingerprint="encoder",
+        preparation_fingerprint="preparation",
+        stages=[
+            {"name": "deep", "source": {"kind": "dino", "layer": 12}},
+            {"name": "rgb", "source": {"kind": "rgb", "layer": None}},
+        ],
+        statistics={
+            "rgb": {"mean": [0.0] * 768, "std": [1.0] * 768, "count": 128}
+        },
+        cache_files={},
+        completion_files={},
+        complete=True,
+    )
+    path = tmp_path / "manifest.json"
+    manifest.save(path)
+
+    loaded = RepresentationManifest.load(path, required_stages=["rgb"])
+
+    assert loaded.stage_names[-1] == "rgb"

@@ -5,9 +5,16 @@ import copy
 import pytest
 import torch
 
-from cascade_dit.config import DDTAttentionConfig, DDTPathConfig, ModelConfig
+from cascade_dit.config import DDTAttentionConfig, DDTPathConfig, LoRAConfig, ModelConfig
 from cascade_dit.curriculum import configure_trainability
-from cascade_dit.model import DDT, DDTDecoderBlock, DDTEncoderBlock
+from cascade_dit.model import (
+    DDT,
+    DDTDecoderBlock,
+    DDTEncoderBlock,
+    LoRALinear,
+    apply_lora,
+    merged_state_dict,
+)
 from cascade_dit.optim import parameter_count
 
 
@@ -77,3 +84,43 @@ def test_progressive_and_baseline_are_identical_full_train_architectures() -> No
     with torch.no_grad():
         next(duplicate.parameters()).add_(1)
     assert not torch.equal(next(progressive.parameters()), next(duplicate.parameters()))
+
+
+def test_lora_is_zero_delta_trainable_and_exports_plain_ddt_state() -> None:
+    model = _model(levels=3)
+    arguments = _arguments(levels=3)
+    before = model(*arguments).detach()
+
+    trainable = apply_lora(model, LoRAConfig())
+
+    assert trainable
+    assert all("adapter_" in name for name in trainable)
+    assert all(
+        not parameter.requires_grad
+        for module in model.modules()
+        if isinstance(module, LoRALinear)
+        for parameter in module.base.parameters()
+    )
+    after = model(*arguments)
+    assert torch.equal(before, after)
+    after.square().mean().backward()
+    assert any(
+        parameter.grad is not None
+        for name, parameter in model.named_parameters()
+        if name in trainable
+    )
+
+    plain = _model(levels=3)
+    plain.load_state_dict(merged_state_dict(model))
+    assert torch.equal(model(*arguments), plain(*arguments))
+
+
+def test_lora_target_groups_are_configurable() -> None:
+    model = _model()
+    apply_lora(
+        model,
+        LoRAConfig(target_groups=["attention"]),
+    )
+    wrapped = [name for name, module in model.named_modules() if isinstance(module, LoRALinear)]
+    assert wrapped
+    assert all(".attention." in name for name in wrapped)

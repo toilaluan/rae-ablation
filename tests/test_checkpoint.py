@@ -4,11 +4,12 @@ import json
 
 import pytest
 import torch
+from safetensors.torch import load_file
 
 from cascade_dit.checkpoint import EMA, CheckpointManager, ResumeState
 from cascade_dit.checkpoint_bundle import load_checkpoint_bundle
 from cascade_dit.config import DDTAttentionConfig, DDTPathConfig, ExperimentConfig, ModelConfig
-from cascade_dit.model import DDT
+from cascade_dit.model import DDT, LoRALinear, apply_lora
 from cascade_dit.rng import RNGStreams
 
 
@@ -105,3 +106,33 @@ def test_completed_rgb_checkpoint_is_sampling_eligible(tmp_path) -> None:
         config=config,
     )
     assert load_checkpoint_bundle(saved, require_rgb_complete=True).weights.is_file()
+
+
+def test_lora_checkpoint_exports_merged_plain_weights(tmp_path) -> None:
+    config = _config()
+    config.pixel_training.lora.use_lora = True
+    model = _model(config)
+    apply_lora(model, config.pixel_training.lora)
+    with torch.no_grad():
+        for module in model.modules():
+            if isinstance(module, LoRALinear):
+                module.adapter_b.weight.normal_(std=0.01)
+    ema = EMA(model)
+    manager = CheckpointManager(tmp_path)
+
+    saved = manager.save(model=model, ema=ema, state=_state(config), config=config)
+
+    metadata = json.loads((saved / "metadata.json").read_text())
+    assert metadata["model_format"] == "lora_merged"
+    plain = _model(config)
+    plain.load_state_dict(load_file(saved / "model.safetensors"))
+    assert not any("adapter_" in name or ".base." in name for name in load_file(saved / "model.safetensors"))
+    reloaded = _model(config)
+    apply_lora(reloaded, config.pixel_training.lora)
+    reloaded_ema = EMA(reloaded)
+    manager.load(saved, reloaded, reloaded_ema)
+    assert all(
+        torch.count_nonzero(module.adapter_b.weight) == 0
+        for module in reloaded.modules()
+        if isinstance(module, LoRALinear)
+    )

@@ -118,6 +118,8 @@ def validate_stage_loss(
     stage_index: int,
     epoch: int,
     device: torch.device,
+    timestep_shift: float | None = None,
+    preview_features: bool | None = None,
 ) -> tuple[dict[str, float], Tensor | None, Tensor | None]:
     """Deterministic loss and feature preview inputs for any curriculum stage."""
     streams = RNGStreams.create(config.experiment.seed + 1_000_003 + epoch, device)
@@ -127,6 +129,16 @@ def validate_stage_loss(
     }
     preview: Tensor | None = None
     preview_labels: Tensor | None = None
+    active_shift = (
+        config.stages[stage_index].timestep_shift
+        if timestep_shift is None
+        else timestep_shift
+    )
+    should_preview = (
+        stage_index != config.num_representation_levels - 1
+        if preview_features is None
+        else preview_features
+    )
     was_training = model.training
     model.eval()
     try:
@@ -145,7 +157,7 @@ def validate_stage_loss(
                 weights,
                 streams,
                 config,
-                timestep_shift=config.stages[stage_index].timestep_shift,
+                timestep_shift=active_shift,
             )
             losses.append(float(result.loss.total))
             for mode in mode_losses:
@@ -158,10 +170,10 @@ def validate_stage_loss(
                         weights[selected],
                         streams,
                         config,
-                        timestep_shift=config.stages[stage_index].timestep_shift,
+                        timestep_shift=active_shift,
                     )
                     mode_losses[mode].append(float(mode_result.loss.total))
-            if preview is None and stage_index != config.num_representation_levels - 1:
+            if preview is None and should_preview:
                 count = min(config.validation.pca_preview_samples, tokens.shape[0])
                 preview = result.clean_prediction[:count].detach().float().cpu()
                 preview_labels = labels[:count].detach().cpu()

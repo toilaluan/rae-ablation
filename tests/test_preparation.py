@@ -28,8 +28,8 @@ def _config_with_layer_8() -> ExperimentConfig:
         RepresentationStageConfig(
             "dino8", 1, RepresentationSourceConfig("dino", 8)
         ),
-        RepresentationStageConfig("rgb", 1, RepresentationSourceConfig("rgb")),
     ]
+    config.pixel_training.epochs = 1
     return config
 
 

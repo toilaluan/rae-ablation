@@ -29,7 +29,8 @@ def _config(levels: int) -> ExperimentConfig:
             f"dino{layer}", 1, RepresentationSourceConfig("dino", layer)
         )
         for layer in dino
-    ] + [RepresentationStageConfig("rgb", 1, RepresentationSourceConfig("rgb"))]
+    ]
+    config.pixel_training.epochs = 1
     config.model = ModelConfig(
         encoder=DDTPathConfig(16, 1, 1),
         decoder=DDTPathConfig(32, 1, 2),

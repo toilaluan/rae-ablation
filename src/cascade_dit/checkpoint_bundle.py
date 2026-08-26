@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from safetensors import safe_open
+
 from .checkpoint import CHECKPOINT_SCHEMA_VERSION
 from .config import ExperimentConfig, load_checkpoint_config
 
@@ -14,6 +16,7 @@ class CheckpointBundle:
     config: ExperimentConfig
     weights: Path
     metadata: dict[str, object]
+    representation_levels: int
 
 
 def resolve_checkpoint_directory(path: str | Path) -> Path:
@@ -45,4 +48,11 @@ def load_checkpoint_bundle(path: str | Path, *, require_rgb_complete: bool = Fal
     weights = directory / "ema.safetensors"
     if not weights.is_file():
         raise FileNotFoundError(f"checkpoint EMA weights are missing: {weights}")
-    return CheckpointBundle(directory, config, weights, metadata)
+    with safe_open(weights, framework="pt", device="cpu") as tensors:
+        name = "representation_embedder.embedding"
+        if name not in set(tensors.keys()):
+            raise ValueError("checkpoint EMA has no representation embedding")
+        shape = tensors.get_slice(name).get_shape()
+    if len(shape) != 2 or shape[0] < 1:
+        raise ValueError("checkpoint EMA representation embedding is invalid")
+    return CheckpointBundle(directory, config, weights, metadata, int(shape[0]))

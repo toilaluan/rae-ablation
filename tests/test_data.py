@@ -60,8 +60,8 @@ def test_dynamic_level_count_and_final_stage_are_supported() -> None:
     config.representations.stages = [
         RepresentationStageConfig("deep", 1, RepresentationSourceConfig("dino", 12)),
         RepresentationStageConfig("shallow", 1, RepresentationSourceConfig("dino", 3)),
-        RepresentationStageConfig("rgb", 1, RepresentationSourceConfig("rgb")),
     ]
+    config.pixel_training.epochs = 1
     config.validate()
     all_levels = None
     for index in range(20_000):
@@ -71,7 +71,7 @@ def test_dynamic_level_count_and_final_stage_are_supported() -> None:
             break
     assert all_levels is not None and all_levels.weights.shape == (3,)
     final = sample_representation_weights(config, 2, 1, 0)
-    baseline = sample_representation_weights(config, 0, 1, 0, pixel_baseline=True)
+    baseline = sample_representation_weights(config, 0, 1, 0, pixel_only=True)
     assert final.mode == baseline.mode == PURE_CURRENT
     assert torch.equal(final.weights, torch.tensor([0.0, 0.0, 1.0]))
     assert torch.equal(baseline.weights, final.weights)
@@ -82,7 +82,6 @@ def test_sparse_raw_batches_are_preprocessed_like_the_cpu_reference() -> None:
     config.representations.stages = [
         RepresentationStageConfig("deep", 1, RepresentationSourceConfig("dino", 12)),
         RepresentationStageConfig("shallow", 1, RepresentationSourceConfig("dino", 6)),
-        RepresentationStageConfig("rgb", 1, RepresentationSourceConfig("rgb")),
     ]
     channel = torch.arange(768, dtype=torch.float32)
     statistics = {
@@ -149,6 +148,45 @@ def test_sparse_raw_batches_are_preprocessed_like_the_cpu_reference() -> None:
     assert torch.equal(prepared.labels, torch.tensor([4, 5, 6]))
     assert torch.equal(prepared.indices, torch.tensor([10, 11, 12]))
     assert torch.equal(prepared.modes, torch.tensor([ADJACENT_MIX, PURE_CURRENT, ADJACENT_MIX]))
+
+
+def test_pixel_only_preprocessing_needs_only_rgb_statistics() -> None:
+    config = ExperimentConfig()
+    config.pixel_training.use_representation_guiding = False
+    statistics = {
+        "rgb": {
+            "mean": torch.zeros(768).tolist(),
+            "std": torch.ones(768).tolist(),
+            "count": 10,
+        }
+    }
+    manifest = RepresentationManifest(
+        dataset_size=1,
+        dataset_fingerprint="dataset",
+        encoder_fingerprint="ignored",
+        preparation_fingerprint="ignored",
+        stages=[{"name": "rgb", "source": {"kind": "rgb", "layer": None}}],
+        statistics=statistics,
+        cache_files={},
+        completion_files={},
+        complete=True,
+    )
+    pixels = torch.randint(0, 256, (3, 128, 128), dtype=torch.uint8)
+    weights = torch.tensor([0.0, 0.0, 1.0])
+    batch = representation_collator(
+        [((None, None, pixels), weights, 3, 7, PURE_CURRENT)]
+    )
+
+    prepared = RepresentationBatchPreprocessor(
+        config,
+        manifest,
+        "cpu",
+        pixel_only=True,
+        representation_levels=3,
+    )(batch)
+
+    assert torch.equal(prepared.representation_weights, weights[None])
+    assert torch.equal(prepared.tokens, patchify_rgb(prepare_pixels(pixels[None], "cpu")))
 
 
 @pytest.mark.cuda

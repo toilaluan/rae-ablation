@@ -12,7 +12,7 @@ from cascade_dit.wandb_utils import RunLogger
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train adjacent-flow DDT or its matched RGB baseline"
+        description="Train representation-guided or pixel-only DDT"
     )
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.yaml"))
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
@@ -48,6 +48,9 @@ def main() -> None:
         if rank == 0 and step % arguments.log_interval == 0:
             print(json.dumps(metrics, sort_keys=True), flush=True)
 
+    resume = arguments.resume or (
+        Path(config.checkpoint.resume) if config.checkpoint.resume else None
+    )
     runner = ExperimentRunner(
         config,
         rank=rank,
@@ -55,12 +58,8 @@ def main() -> None:
         device=device,
         log=log,
         log_image=logger.log_grid,
+        resume=resume,
     )
-    resume = arguments.resume or (
-        Path(config.checkpoint.resume) if config.checkpoint.resume else None
-    )
-    if resume is not None:
-        runner.resume(resume)
     try:
         runner.run(max_steps=arguments.max_steps)
     finally:

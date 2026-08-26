@@ -167,13 +167,14 @@ def sample_representation_weights(
     epoch: int,
     source_index: int,
     *,
-    pixel_baseline: bool = False,
+    pixel_only: bool = False,
+    representation_levels: int | None = None,
 ) -> MixtureChoice:
-    levels = config.num_representation_levels
+    levels = representation_levels or config.num_representation_levels
     if not 0 <= stage_index < levels:
         raise ValueError("stage index is outside the representation list")
     weights = np.zeros(levels, dtype=np.float32)
-    if pixel_baseline or stage_index == levels - 1:
+    if pixel_only or stage_index == levels - 1:
         weights[-1] = 1
         return MixtureChoice(torch.from_numpy(weights), PURE_CURRENT)
 
@@ -221,15 +222,19 @@ class MixedRepresentationDataset(Dataset[RawRepresentationSample]):
         manifest: RepresentationManifest,
         root: str | Path,
         *,
-        pixel_baseline: bool = False,
+        pixel_only: bool = False,
+        representation_levels: int | None = None,
     ) -> None:
         self.dataset = dataset
         self.stage_index = stage_index
         self.epoch = epoch
         self.config = config
         self.manifest = manifest
-        self.pixel_baseline = pixel_baseline
+        self.pixel_only = pixel_only
+        self.representation_levels = representation_levels or config.num_representation_levels
         self.caches: dict[str, np.memmap] = {}
+        if pixel_only:
+            return
         for stage in config.stages:
             if stage.source.kind != "dino":
                 continue
@@ -247,6 +252,10 @@ class MixedRepresentationDataset(Dataset[RawRepresentationSample]):
     def _load_level(
         self, level: int, source_index: int, pixels: Tensor | None
     ) -> Tensor:
+        if self.pixel_only and level == self.representation_levels - 1:
+            if pixels is None:
+                raise ValueError("RGB pixels were not loaded for a nonzero RGB weight")
+            return pixels
         stage = self.config.stages[level]
         if stage.source.kind == "rgb":
             if pixels is None:
@@ -261,13 +270,14 @@ class MixedRepresentationDataset(Dataset[RawRepresentationSample]):
             self.stage_index,
             self.epoch,
             index,
-            pixel_baseline=self.pixel_baseline,
+            pixel_only=self.pixel_only,
+            representation_levels=self.representation_levels,
         )
         rgb_required = bool(choice.weights[-1] > 0)
         pixels, label, source_index = self.dataset.get_item(
             index, load_pixels=rgb_required
         )
-        levels: list[Tensor | None] = [None] * self.config.num_representation_levels
+        levels: list[Tensor | None] = [None] * self.representation_levels
         for level in torch.nonzero(choice.weights, as_tuple=False).flatten().tolist():
             levels[level] = self._load_level(level, source_index, pixels)
         return tuple(levels), choice.weights, label, source_index, choice.mode
@@ -337,10 +347,25 @@ class RepresentationBatchPreprocessor:
         config: ExperimentConfig,
         manifest: RepresentationManifest,
         device: torch.device | str,
+        *,
+        pixel_only: bool = False,
+        representation_levels: int | None = None,
     ) -> None:
         self.device = torch.device(device)
-        self.source_kinds = tuple(stage.source.kind for stage in config.stages)
-        statistics = [_statistics(manifest, stage.name) for stage in config.stages]
+        levels = representation_levels or config.num_representation_levels
+        self.source_kinds = (
+            tuple(["dino"] * (levels - 1) + ["rgb"])
+            if pixel_only
+            else tuple(stage.source.kind for stage in config.stages)
+        )
+        if pixel_only:
+            pixel = _statistics(manifest, config.pixel_training.name)
+            statistics = [
+                ChannelStatistics(torch.zeros(TOKEN_DIM), torch.ones(TOKEN_DIM), pixel.count)
+                for _level in range(levels - 1)
+            ] + [pixel]
+        else:
+            statistics = [_statistics(manifest, stage.name) for stage in config.stages]
         self.means = torch.stack([values.mean for values in statistics]).to(self.device)
         self.stds = torch.stack([values.std for values in statistics]).to(self.device)
 
@@ -382,20 +407,26 @@ def make_stage_loader(
     rank: int = 0,
     world_size: int = 1,
     epoch: int = 0,
-    pixel_baseline: bool = False,
+    pixel_only: bool = False,
+    representation_levels: int | None = None,
 ) -> DataLoader:
-    if not 0 <= stage_index < config.num_representation_levels:
+    levels = representation_levels or config.num_representation_levels
+    if not 0 <= stage_index < levels:
         raise ValueError("unknown training stage index")
     root = Path(config.representations.directory)
     manifest = RepresentationManifest.load(
         root / config.representations.manifest,
         require_complete=config.representations.require_complete,
+        required_stages=[config.pixel_training.name] if pixel_only else None,
     )
+    requested = [config.pixel_stage] if pixel_only else config.stages
     expected_stages = [
-        {"name": stage.name, "source": asdict(stage.source)} for stage in config.stages
+        {"name": stage.name, "source": asdict(stage.source)} for stage in requested
     ]
     if not cached_stages_include(manifest.stages, expected_stages):
         raise ValueError("prepared representations do not include configured stages")
+    if manifest.dataset_fingerprint != data_fingerprint(config.data, config.data.image_size):
+        raise ValueError("prepared representations use a different dataset")
     dataset = load_imagenet(config.data, load_pixels=True)
     if len(dataset) != manifest.dataset_size:
         raise ValueError("dataset size differs from prepared representations")
@@ -406,7 +437,8 @@ def make_stage_loader(
         config,
         manifest,
         root,
-        pixel_baseline=pixel_baseline,
+        pixel_only=pixel_only,
+        representation_levels=levels,
     )
     sampler = DistributedSampler(
         mixed_dataset,

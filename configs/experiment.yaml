@@ -1,7 +1,6 @@
-schema_version: 5
+schema_version: 6
 
 experiment:
-  mode: progressive
   name: adjacent-flow-ddt
   seed: 0
   output_directory: runs/experiment
@@ -25,28 +24,35 @@ encoder:
   num_register_tokens: 4
   apply_final_norm: true
 
-representations:
-  directory: data/direct-representations
-  manifest: manifest.json
-  stages:
-    - name: dino12
-      epochs: 50
-      source: {kind: dino, layer: 12}
-      timestep_shift: 4.0
-    - name: dino8
-      epochs: 5
-      source: {kind: dino, layer: 8}
-      timestep_shift: 4.0
-    - name: rgb
-      epochs: 120
-      source: {kind: rgb, layer: null}
-      timestep_shift: 7.0
-  dtype: bfloat16
-  cache_batch_size: 256
-  asynchronous_writes: true
-  statistics_dtype: float64
-  normalization_epsilon: 1.0e-6
-  require_complete: true
+pixel_training:
+  name: rgb
+  epochs: 120
+  timestep_shift: 7.0
+  use_representation_guiding: true
+  lora:
+    use_lora: false
+    rank: 8
+    alpha: 8.0
+    dropout: 0.0
+    target_groups: [attention, feedforward, conditioning, projections]
+  representations:
+    directory: data/direct-representations
+    manifest: manifest.json
+    stages:
+      - name: dino12
+        epochs: 50
+        source: {kind: dino, layer: 12}
+        timestep_shift: 4.0
+      - name: dino8
+        epochs: 5
+        source: {kind: dino, layer: 8}
+        timestep_shift: 4.0
+    dtype: bfloat16
+    cache_batch_size: 256
+    asynchronous_writes: true
+    statistics_dtype: float64
+    normalization_epsilon: 1.0e-6
+    require_complete: true
 
 model:
   architecture: ddt

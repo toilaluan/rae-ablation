@@ -11,8 +11,14 @@ import torch
 from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
 
-from .config import CONFIG_SCHEMA_VERSION, ExperimentConfig, load_checkpoint_config
+from .config import CONFIG_SCHEMA_VERSION, ExperimentConfig
 from .model.compile import clean_state_dict
+from .model.lora import (
+    expand_merged_state_dict,
+    has_lora,
+    load_merged_state_dict,
+    merged_state_dict,
+)
 
 CHECKPOINT_SCHEMA_VERSION = 4
 TRAINING_STATE_SCHEMA_VERSION = 4
@@ -58,6 +64,10 @@ class EMA:
             raise ValueError("EMA state keys do not match model")
         for name, value in state.items():
             self.shadow[name].copy_(value.to(self.shadow[name]))
+
+    def load_merged_state_dict(self, model: nn.Module, state: dict[str, Tensor]) -> None:
+        expanded = expand_merged_state_dict(model, state, template=self.shadow)
+        self.load_state_dict(expanded)
 
     def copy_to(self, model: nn.Module) -> None:
         model.load_state_dict(self.shadow)
@@ -127,6 +137,8 @@ class CheckpointManager:
             "wall_clock_seconds": state.wall_clock_seconds,
             "data_fingerprint": state.data_fingerprint,
             "representation_fingerprint": state.representation_fingerprint,
+            "model_format": "lora_merged" if has_lora(model) else "plain",
+            "optimizer_restorable": state.optimizer is not None,
         }
         if target.exists():
             existing_path = target / "metadata.json"
@@ -149,8 +161,11 @@ class CheckpointManager:
         temporary = self.directory / f".{name}.partial-{os.getpid()}"
         temporary.mkdir()
         try:
-            save_file(_tensor_state(clean_state_dict(model)), temporary / "model.safetensors")
-            save_file(_tensor_state(ema.state_dict()), temporary / "ema.safetensors")
+            save_file(merged_state_dict(model), temporary / "model.safetensors")
+            save_file(
+                merged_state_dict(model, _tensor_state(ema.state_dict())),
+                temporary / "ema.safetensors",
+            )
             torch.save(asdict(state), temporary / "training.pt")
             (temporary / "config.json").write_text(
                 json.dumps(config.as_dict(), indent=2, sort_keys=True) + "\n"
@@ -223,7 +238,6 @@ class CheckpointManager:
         metadata = json.loads(metadata_path.read_text())
         if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
             raise ValueError("checkpoint schema is incompatible; old checkpoints cannot be migrated")
-        config = load_checkpoint_config(path / "config.json")
         raw = torch.load(path / "training.pt", map_location="cpu", weights_only=False)
         if raw.get("schema_version") != TRAINING_STATE_SCHEMA_VERSION:
             raise ValueError("checkpoint training-state schema is incompatible")
@@ -240,27 +254,44 @@ class CheckpointManager:
         ):
             if metadata.get(name) != getattr(state, name):
                 raise ValueError(f"checkpoint {name} metadata is inconsistent")
-        if state.stage not in config.stage_names:
-            raise ValueError("checkpoint curriculum stage is invalid")
-        if config.stage_names[state.stage_index] != state.stage:
-            raise ValueError("checkpoint curriculum stage index is invalid")
-        if state.training_complete and (
-            state.stage != config.stage_names[-1]
-            or state.completed_epoch != config.total_epochs
+        if (
+            state.completed_epoch < 0
+            or state.global_step < 0
+            or state.stage_index < 0
+            or state.epoch_within_stage < 0
+            or not state.stage
         ):
-            raise ValueError("completed checkpoint is not at the end of the RGB stage")
+            raise ValueError("checkpoint training progress is invalid")
         for name, expected in (
             ("data_fingerprint", expected_data_fingerprint),
             ("representation_fingerprint", expected_representation_fingerprint),
         ):
             if expected is not None and getattr(state, name) != expected:
                 raise ValueError(f"checkpoint {name} mismatch")
-        model.load_state_dict(load_file(path / "model.safetensors"))
-        ema.load_state_dict(load_file(path / "ema.safetensors"))
+        model_state = load_file(path / "model.safetensors")
+        ema_state = load_file(path / "ema.safetensors")
+        load_merged_state_dict(model, model_state)
+        if has_lora(model):
+            ema.load_merged_state_dict(model, ema_state)
+        else:
+            ema.load_state_dict(ema_state)
         return state
 
-    def export_ema(self, ema: EMA, path: str | Path) -> None:
+    def export_ema(
+        self,
+        ema: EMA,
+        path: str | Path,
+        *,
+        model: nn.Module | None = None,
+    ) -> None:
         target = Path(path)
         temporary = target.with_suffix(target.suffix + f".partial-{os.getpid()}")
-        save_file(_tensor_state(ema.state_dict()), temporary)
+        state = _tensor_state(ema.state_dict())
+        if model is None:
+            if any(".adapter_" in name for name in state):
+                raise ValueError("exporting a LoRA EMA requires the model for merging")
+            payload = state
+        else:
+            payload = merged_state_dict(model, state)
+        save_file(payload, temporary)
         os.replace(temporary, target)

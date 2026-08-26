@@ -5,11 +5,12 @@ RGB-only baseline on class-conditional ImageNet-128 generation. Every target is 
 `8x8` grid of 768-dimensional tokens: configured DINOv3-B/16 intermediate layers or
 flattened `3x16x16` RGB patches.
 
-The checked-in ordered stages are DINO layers 12 and 8 for 15 and 5 epochs, followed
-by RGB for 30 epochs. The list is data-driven: changing `representations.stages`
-changes extraction, cache count, curriculum length, the training timestep shift, and
-the width of the model's representation condition `R` without code changes. RGB must
-remain the final stage, and every stage declares a positive `timestep_shift`.
+The checked-in guided curriculum uses DINO layers 12 and 8, followed by the RGB target
+configured under `pixel_training`. The DINO list is data-driven: changing
+`pixel_training.representations.stages` changes extraction, cache count, curriculum
+length, and the width of the model's representation condition `R`. Set
+`pixel_training.use_representation_guiding=false` for direct pixel training without
+loading or validating DINO caches.
 
 ## Adjacent-flow curriculum
 
@@ -29,8 +30,8 @@ For each item in every non-final stage, the default target distribution is:
 
 The mode and weights are deterministic from the experiment seed, epoch, and source
 index. Pure examples load one representation, adjacent mixtures load two, and only the
-2.5% all-level examples load every representation. The final stage is pure RGB. Pixel
-baseline mode is pure RGB for all 80 epochs.
+2.5% all-level examples load every representation. The final stage is pure RGB. A
+pixel-only run trains for `pixel_training.epochs`.
 
 ## Model and objective
 
@@ -51,8 +52,9 @@ with shifted-logit-normal timesteps. Each curriculum stage controls its own time
 shift. Every model parameter trains throughout one global AdamW optimizer, EMA, and
 50-epoch scheduler. `optimizer.scheduler.kind` accepts `cosine` or `constant`; both
 support the configured linear warmup, while `min_lr_ratio` applies only to cosine.
-Stage boundaries change the data distribution and active timestep shift; they do not
-mutate the model or reset optimization state.
+Stage boundaries normally only change the data distribution and timestep shift. When
+`pixel_training.lora.use_lora=true`, entering RGB freezes the base DDT, adds configured
+low-rank adapters, and starts a fresh pixel-stage optimizer and scheduler.
 
 ## Preparation and training
 
@@ -74,8 +76,15 @@ torchrun --standalone --nproc-per-node=8 scripts/train.py \
 
 torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --config configs/experiment.yaml \
-  --override experiment.mode=pixel_baseline \
+  --override pixel_training.use_representation_guiding=false \
   --output runs/pixel-baseline-seed0
+
+torchrun --standalone --nproc-per-node=8 scripts/train.py \
+  --config configs/experiment.yaml \
+  --override pixel_training.use_representation_guiding=false \
+  --override pixel_training.lora.use_lora=true \
+  --resume runs/progressive-seed0/checkpoints/last \
+  --output runs/pixel-lora-seed0
 ```
 
 All public settings are nested in `configs/experiment.yaml` and support repeated
@@ -117,8 +126,9 @@ uv run --extra dev pytest -q
 uv run --extra dev ruff check .
 ```
 
-Configuration, checkpoints, and representation manifests use clean versioned schemas.
-Schema-v5 configs require stage-wise timestep shifts; schema-v4 configs and checkpoints
-are rejected.
+Configuration, checkpoints, and representation manifests use versioned schemas.
+Schema-v6 nests RGB, LoRA, and representation-guidance settings beneath
+`pixel_training`. Schema-v5 configs and current checkpoints are migrated when read;
+alignment-era artifacts remain unsupported.
 Alignment-era LightningDiT and legacy DDT/Mage artifacts are rejected rather than
 migrated or overwritten.

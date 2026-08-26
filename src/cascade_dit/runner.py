@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import time
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 from torch import nn
 
 from .checkpoint import EMA, CheckpointManager, ResumeState
@@ -27,7 +29,7 @@ from .distributed import broadcast_string
 from .evaluation import evaluate_npz, save_evaluation
 from .feature_pca import save_feature_pca_preview
 from .flops import model_flops_per_step
-from .model import DDT, build_model
+from .model import DDT, apply_lora, build_model, has_lora, merged_state_dict
 from .model.compile import compile_model_regions
 from .optim import (
     build_optimizer,
@@ -40,7 +42,7 @@ from .preparation import (
     statistics_from_manifest,
     validate_manifest_compatibility,
 )
-from .representations import RepresentationManifest, unpatchify_rgb
+from .representations import RepresentationManifest, cached_stages_include, unpatchify_rgb
 from .rng import RNGStreams
 from .sample_runtime import (
     SamplingParameters,
@@ -63,13 +65,67 @@ def load_representation_manifest(
     manifest = RepresentationManifest.load(
         root / config.representations.manifest,
         require_complete=config.representations.require_complete,
+        required_stages=(
+            None
+            if config.pixel_training.use_representation_guiding
+            else [config.pixel_training.name]
+        ),
     )
-    validate_manifest_compatibility(config, manifest)
+    if config.pixel_training.use_representation_guiding:
+        validate_manifest_compatibility(config, manifest)
+    else:
+        pixel = {
+            "name": config.pixel_training.name,
+            "source": {"kind": "rgb", "layer": None},
+        }
+        if not cached_stages_include(manifest.stages, [pixel]):
+            raise ValueError("representation manifest does not include the configured RGB stage")
+        if manifest.dataset_fingerprint != data_fingerprint(config.data, config.data.image_size):
+            raise ValueError("representation manifest uses a different dataset")
     return manifest, representation_manifest_fingerprint(manifest)
 
 
+def _resolve_checkpoint_path(checkpoint: str | Path) -> Path:
+    path = Path(checkpoint)
+    if path.name == "last" or not (path / "metadata.json").is_file():
+        if (path / "last").is_dir():
+            path = (path / "last").resolve()
+        elif path.name == "last":
+            path = path.resolve()
+    return path.resolve()
+
+
+def _checkpoint_representation_levels(path: Path) -> int:
+    with safe_open(path / "model.safetensors", framework="pt", device="cpu") as tensors:
+        name = "representation_embedder.embedding"
+        if name not in set(tensors.keys()):
+            raise ValueError("checkpoint has no representation embedding")
+        shape = tensors.get_slice(name).get_shape()
+    if len(shape) != 2 or shape[0] < 1:
+        raise ValueError("checkpoint representation embedding has an invalid shape")
+    return int(shape[0])
+
+
+def _different_config_fields(
+    active: object,
+    saved: object,
+    prefix: str,
+) -> list[str]:
+    if isinstance(active, dict) and isinstance(saved, dict):
+        differences: list[str] = []
+        for name in sorted(set(active) | set(saved)):
+            child = f"{prefix}.{name}" if prefix else name
+            differences.extend(
+                _different_config_fields(active.get(name), saved.get(name), child)
+            )
+        return differences
+    if isinstance(active, list) and isinstance(saved, list):
+        return [] if active == saved else [prefix]
+    return [] if active == saved else [prefix]
+
+
 class ExperimentRunner:
-    """Dynamic adjacent-flow curriculum or architecture-matched RGB baseline."""
+    """Representation-guided or pixel-only DDT training."""
 
     def __init__(
         self,
@@ -80,6 +136,7 @@ class ExperimentRunner:
         device: torch.device | str = "cpu",
         log: Callable[[dict[str, float | int | str]], None] | None = None,
         log_image: ImageLog | None = None,
+        resume: str | Path | None = None,
     ) -> None:
         self.config = config
         self.rank = rank
@@ -87,17 +144,28 @@ class ExperimentRunner:
         self.device = torch.device(device)
         self.log = log or (lambda _metrics: None)
         self.log_image = log_image or (lambda _path, _caption, _step, _key: None)
+        resume_path = _resolve_checkpoint_path(resume) if resume is not None else None
+        pixel_only = not config.pixel_training.use_representation_guiding
+        self.representation_levels = (
+            _checkpoint_representation_levels(resume_path)
+            if pixel_only and resume_path is not None
+            else config.num_representation_levels
+        )
         manifest, self.representation_fingerprint = load_representation_manifest(config)
-        self.rgb_statistics = statistics_from_manifest(manifest, config.stage_names[-1])
+        self.rgb_statistics = statistics_from_manifest(manifest, config.pixel_training.name)
         self.data_fingerprint = data_fingerprint(config.data)
         self.batch_preprocessor = RepresentationBatchPreprocessor(
-            config, manifest, self.device
+            config,
+            manifest,
+            self.device,
+            pixel_only=pixel_only,
+            representation_levels=self.representation_levels,
         )
         self.rng = RNGStreams.create(config.experiment.seed, self.device)
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self.rng.initialization.initial_seed())
             self.model: DDT = build_model(
-                config.model, config.num_representation_levels
+                config.model, self.representation_levels
             ).to(self.device)
         configure_trainability(self.model)
         torch.manual_seed(config.experiment.seed + 90_000)
@@ -109,19 +177,31 @@ class ExperimentRunner:
             keep_last_n=config.checkpoint.keep_last_n,
         )
         self.completed_epoch = 0
+        self.pixel_completed_epoch = 0
         self.global_step = 0
         self.stage_index = (
-            config.num_representation_levels - 1
-            if config.experiment.mode == "pixel_baseline"
+            self.representation_levels - 1
+            if pixel_only
             else 0
         )
-        self.optimizer = build_optimizer(self.model, config.optimizer)
+        self.optimizer: torch.optim.AdamW | None = None
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self._pending_scheduler_state: dict[str, object] | None = None
+        self._pending_optimizer_state: dict[str, object] | None = None
         self.images_seen = 0
         self.estimated_flops = 0
         self.started_at = time.perf_counter()
         self.elapsed_before_resume = 0.0
+        if resume_path is not None:
+            self.resume(resume_path)
+        if self._pixel_is_active() and config.pixel_training.lora.use_lora:
+            self._activate_lora()
+        else:
+            configure_trainability(self.model)
+        self.optimizer = build_optimizer(self.model, config.optimizer)
+        if self._pending_optimizer_state is not None:
+            self.optimizer.load_state_dict(self._pending_optimizer_state)
+            self._pending_optimizer_state = None
         self.validation_plan = self._initialize_validation_plan()
 
     def _initialize_validation_plan(self) -> ValidationPlan:
@@ -236,7 +316,11 @@ class ExperimentRunner:
             )
             weights = torch.zeros(
                 batch_labels.shape[0],
-                self.config.num_representation_levels,
+                getattr(
+                    self,
+                    "representation_levels",
+                    self.config.num_representation_levels,
+                ),
                 device=self.device,
             )
             weights[:, -1] = 1
@@ -316,11 +400,32 @@ class ExperimentRunner:
 
     @property
     def stage_name(self) -> str:
+        if self.stage_index == self.representation_levels - 1:
+            return self.config.pixel_training.name
         return self.config.stage_names[self.stage_index]
 
+    def _pixel_is_active(self) -> bool:
+        return (
+            not self.config.pixel_training.use_representation_guiding
+            or self.stage_index == self.representation_levels - 1
+        )
+
+    def _activate_lora(self) -> None:
+        if has_lora(self.model):
+            return
+        ema_state = merged_state_dict(self.model, self.ema.state_dict())
+        apply_lora(self.model, self.config.pixel_training.lora)
+        reparameterized = EMA(self.model, self.config.optimizer.ema_decay)
+        reparameterized.load_merged_state_dict(self.model, ema_state)
+        self.ema = reparameterized
+        self.optimizer = None
+        self.scheduler = None
+        self._pending_optimizer_state = None
+        self._pending_scheduler_state = None
+
     def _epoch_within_stage(self) -> int:
-        if self.config.experiment.mode == "pixel_baseline":
-            return self.completed_epoch
+        if not self.config.pixel_training.use_representation_guiding:
+            return self.pixel_completed_epoch
         beginning = sum(stage.epochs for stage in self.config.stages[: self.stage_index])
         return min(
             max(self.completed_epoch - beginning, 0),
@@ -344,53 +449,140 @@ class ExperimentRunner:
             wall_clock_seconds=(
                 self.elapsed_before_resume + time.perf_counter() - self.started_at
             ),
-            optimizer=self.optimizer.state_dict(),
-            scheduler=self.scheduler.state_dict() if self.scheduler is not None else None,
+            optimizer=(
+                None
+                if has_lora(self.model) or self.optimizer is None
+                else self.optimizer.state_dict()
+            ),
+            scheduler=(
+                None
+                if has_lora(self.model) or self.scheduler is None
+                else self.scheduler.state_dict()
+            ),
             rng_streams=self.rng.state_dict(),
             data_fingerprint=self.data_fingerprint,
             representation_fingerprint=self.representation_fingerprint,
         )
 
     def resume(self, checkpoint: str | Path) -> None:
-        path = Path(checkpoint)
-        if path.name == "last" or not (path / "metadata.json").is_file():
-            if (path / "last").is_dir():
-                path = (path / "last").resolve()
-            elif path.name == "last":
-                path = path.resolve()
-        saved_config = load_checkpoint_config(path / "config.json")
-        for name in (
-            "data",
-            "encoder",
-            "representations",
-            "model",
-            "curriculum",
-            "objective",
-            "optimizer",
+        path = _resolve_checkpoint_path(checkpoint)
+        config_matches = False
+        config_path = path / "config.json"
+        try:
+            raw_config = json.loads(config_path.read_text())
+            if not isinstance(raw_config, dict):
+                raise TypeError("checkpoint config is not an object")
+            if raw_config.get("schema_version") == self.config.schema_version:
+                saved_config = load_checkpoint_config(config_path)
+                fields = (
+                    "data",
+                    "encoder",
+                    "pixel_training",
+                    "model",
+                    "curriculum",
+                    "objective",
+                    "optimizer",
+                )
+                active_values = self.config.as_dict()
+                saved_values = saved_config.as_dict()
+                differences = []
+                for name in fields:
+                    differences.extend(
+                        _different_config_fields(
+                            active_values[name], saved_values[name], name
+                        )
+                    )
+                config_matches = not differences
+                if differences and self.rank == 0:
+                    warnings.warn(
+                        "active training configuration overrides checkpoint fields: "
+                        + ", ".join(differences),
+                        stacklevel=2,
+                    )
+            elif self.rank == 0:
+                warnings.warn(
+                    "checkpoint configuration uses an older schema; active YAML settings "
+                    "will be used and optimizer/scheduler state will be reset",
+                    stacklevel=2,
+                )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            if self.rank == 0:
+                warnings.warn(
+                    f"checkpoint configuration could not be compared ({error}); "
+                    "active YAML settings will be used",
+                    stacklevel=2,
+                )
+        try:
+            metadata = json.loads((path / "metadata.json").read_text())
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            metadata = {}
+        if (
+            self.rank == 0
+            and metadata.get("model_format") == "lora_merged"
+            and self.config.pixel_training.lora.use_lora
         ):
-            if getattr(self.config, name) != getattr(saved_config, name):
-                raise ValueError(f"checkpoint {name} configuration mismatch")
-        if self.config.experiment.mode != saved_config.experiment.mode:
-            raise ValueError("checkpoint experiment mode mismatch")
+            warnings.warn(
+                "checkpoint contains merged LoRA weights; they will be used as the new "
+                "base with fresh zero-delta adapters",
+                stacklevel=2,
+            )
         self.ema = EMA(self.model, self.config.optimizer.ema_decay)
         state = self.manager.load(
             path,
             self.model,
             self.ema,
-            expected_data_fingerprint=self.data_fingerprint,
-            expected_representation_fingerprint=self.representation_fingerprint,
         )
+        if self.rank == 0 and state.data_fingerprint != self.data_fingerprint:
+            warnings.warn(
+                "active dataset differs from the checkpoint; active data will be used",
+                stacklevel=2,
+            )
+        if self.rank == 0 and state.representation_fingerprint != self.representation_fingerprint:
+            warnings.warn(
+                "active representation manifest differs from the checkpoint; active RGB "
+                "statistics and representations will be used",
+                stacklevel=2,
+            )
         self.completed_epoch = state.completed_epoch
         self.global_step = state.global_step
-        self.stage_index = state.stage_index
         self.images_seen = state.images_seen
         self.estimated_flops = state.estimated_flops
         self.elapsed_before_resume = state.wall_clock_seconds
         self.started_at = time.perf_counter()
         self.rng.load_state_dict(state.rng_streams)
-        if state.optimizer is not None:
-            self.optimizer.load_state_dict(state.optimizer)
-        self._pending_scheduler_state = state.scheduler
+        if self.config.pixel_training.use_representation_guiding:
+            if self.completed_epoch < self.config.total_epochs:
+                position = stage_at_epoch(self.completed_epoch, self.config)
+                self.stage_index = position.index
+                self.pixel_completed_epoch = (
+                    position.epoch_within_stage
+                    if position.index == self.config.num_representation_levels - 1
+                    else 0
+                )
+            else:
+                self.stage_index = self.config.num_representation_levels - 1
+                self.pixel_completed_epoch = self.config.pixel_training.epochs
+        else:
+            self.stage_index = self.representation_levels - 1
+            self.pixel_completed_epoch = (
+                min(state.epoch_within_stage, self.config.pixel_training.epochs)
+                if state.stage == self.config.pixel_training.name
+                else 0
+            )
+        restorable = (
+            config_matches
+            and not self.config.pixel_training.lora.use_lora
+            and state.optimizer is not None
+        )
+        if restorable:
+            self._pending_optimizer_state = state.optimizer
+            self._pending_scheduler_state = state.scheduler
+        elif self.rank == 0 and (state.optimizer is not None or state.scheduler is not None):
+            warnings.warn(
+                "checkpoint optimizer/scheduler state is incompatible with active training "
+                "and will be reset",
+                stacklevel=2,
+            )
 
     def _save_stage_boundary(self, target_index: int) -> None:
         self.stage_index = target_index
@@ -407,13 +599,27 @@ class ExperimentRunner:
             torch.distributed.barrier()
 
     def _build_execution(self, steps_per_epoch: int) -> nn.Module:
+        if self.optimizer is None:
+            self.optimizer = build_optimizer(self.model, self.config.optimizer)
         if self.scheduler is None:
             scheduler = self.config.optimizer.scheduler
+            reset_pixel_schedule = (
+                has_lora(self.model)
+                or (
+                    not self.config.pixel_training.use_representation_guiding
+                    and self._pending_scheduler_state is None
+                )
+            )
+            scheduler_epochs = (
+                max(self.config.pixel_training.epochs - self.pixel_completed_epoch, 1)
+                if reset_pixel_schedule
+                else self.config.total_epochs
+            )
             self.scheduler = build_training_scheduler(
                 self.optimizer,
                 kind=scheduler.kind,
                 steps_per_epoch=steps_per_epoch,
-                total_epochs=self.config.total_epochs,
+                total_epochs=scheduler_epochs,
                 warmup_epochs=scheduler.warmup_epochs,
                 min_lr_ratio=scheduler.min_lr_ratio,
             )
@@ -428,34 +634,50 @@ class ExperimentRunner:
             )
         return execution
 
+    def _epochs(self):
+        if self.config.pixel_training.use_representation_guiding:
+            for epoch in range(self.completed_epoch, self.config.total_epochs):
+                position = stage_at_epoch(epoch, self.config)
+                yield epoch, position.index, position.name, position.epoch_within_stage
+            return
+        initial_global = self.completed_epoch
+        initial_pixel = self.pixel_completed_epoch
+        for pixel_epoch in range(initial_pixel, self.config.pixel_training.epochs):
+            yield (
+                initial_global + pixel_epoch - initial_pixel,
+                self.representation_levels - 1,
+                self.config.pixel_training.name,
+                pixel_epoch,
+            )
+
     def run(self, *, max_steps: int | None = None) -> None:
         execution: nn.Module | None = None
-        for epoch in range(self.completed_epoch, self.config.total_epochs):
-            pixel_baseline = self.config.experiment.mode == "pixel_baseline"
-            if pixel_baseline:
-                stage_index = self.config.num_representation_levels - 1
-                stage_name = self.config.stage_names[-1]
-                epoch_in_stage = epoch
-            else:
-                position = stage_at_epoch(epoch, self.config)
-                stage_index = position.index
-                stage_name = position.name
-                epoch_in_stage = position.epoch_within_stage
-                if stage_index != self.stage_index:
-                    self._save_stage_boundary(stage_index)
+        pixel_only = not self.config.pixel_training.use_representation_guiding
+        for epoch, stage_index, stage_name, epoch_in_stage in self._epochs():
+            pixel_stage = stage_index == self.representation_levels - 1
+            if not pixel_only and stage_index != self.stage_index:
+                self._save_stage_boundary(stage_index)
+                if pixel_stage and self.config.pixel_training.lora.use_lora:
+                    self._activate_lora()
+                    self.optimizer = build_optimizer(self.model, self.config.optimizer)
+                    execution = None
             loader = make_stage_loader(
                 self.config,
                 stage_index,
                 rank=self.rank,
                 world_size=self.world_size,
-                epoch=epoch,
-                pixel_baseline=pixel_baseline,
+                epoch=epoch_in_stage if pixel_only else epoch,
+                pixel_only=pixel_only,
+                representation_levels=self.representation_levels,
             )
             if execution is None:
                 execution = self._build_execution(len(loader))
             execution.train()
             source_model = None
-            if self.config.curriculum.source_consistency_weight:
+            if (
+                self.config.pixel_training.use_representation_guiding
+                and self.config.curriculum.source_consistency_weight
+            ):
                 source_model = self.ema.to_model(self.model).to(self.device).eval()
 
             loader_iterator = iter(loader)
@@ -471,7 +693,13 @@ class ExperimentRunner:
                 labels = batch.labels
                 weights = batch.representation_weights
                 modes = batch.modes
+                assert self.optimizer is not None
                 self.optimizer.zero_grad(set_to_none=True)
+                timestep_shift = (
+                    self.config.pixel_training.timestep_shift
+                    if pixel_stage
+                    else self.config.stages[stage_index].timestep_shift
+                )
                 with torch.autocast(
                     device_type=self.device.type,
                     dtype=torch.bfloat16,
@@ -484,7 +712,7 @@ class ExperimentRunner:
                         weights,
                         self.rng,
                         self.config,
-                        timestep_shift=self.config.stages[stage_index].timestep_shift,
+                        timestep_shift=timestep_shift,
                         source_model=source_model,
                     )
                 result.loss.total.backward()
@@ -509,7 +737,7 @@ class ExperimentRunner:
                     "lr": self.optimizer.param_groups[0]["lr"],
                     "gradient_norm": float(gradient_norm),
                     "load_time": float(load_time),
-                    "timestep_shift": self.config.stages[stage_index].timestep_shift,
+                    "timestep_shift": timestep_shift,
                 }
                 for mode, name in enumerate(MIXTURE_MODE_NAMES):
                     metrics[f"mode/{name}"] = int((modes == mode).sum())
@@ -519,7 +747,13 @@ class ExperimentRunner:
                     return
             del source_model
             self.completed_epoch = epoch + 1
-            complete = self.completed_epoch == self.config.total_epochs
+            if pixel_stage:
+                self.pixel_completed_epoch = epoch_in_stage + 1
+            complete = (
+                self.completed_epoch == self.config.total_epochs
+                if not pixel_only
+                else self.pixel_completed_epoch == self.config.pixel_training.epochs
+            )
             interval = self.config.validation.interval_epochs
             final_evaluation: tuple[dict[str, float], int] | None = None
             if complete or (interval > 0 and self.completed_epoch % interval == 0):
@@ -532,6 +766,8 @@ class ExperimentRunner:
                     stage_index=stage_index,
                     epoch=epoch,
                     device=self.device,
+                    timestep_shift=timestep_shift,
+                    preview_features=not pixel_stage,
                 )
                 validation_metrics: dict[str, float | int | str] = {
                     "stage": stage_name,
@@ -635,7 +871,14 @@ class ExperimentRunner:
         output.mkdir(parents=True, exist_ok=True)
         metrics = {
             "complete": complete,
-            "mode": self.config.experiment.mode,
+            "mode": (
+                "representation_guided"
+                if self.config.pixel_training.use_representation_guiding
+                else "pixel_only"
+            ),
+            "use_representation_guiding": (
+                self.config.pixel_training.use_representation_guiding
+            ),
             "global_step": self.global_step,
             "completed_epoch": self.completed_epoch,
             "images_seen": self.images_seen,
