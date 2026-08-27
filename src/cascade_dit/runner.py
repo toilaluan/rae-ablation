@@ -28,7 +28,11 @@ from .evaluation import evaluate_npz, save_evaluation
 from .flops import model_flops_per_step
 from .model import DDT, build_model
 from .model.compile import compile_model_regions
-from .objective import build_lpips
+from .objective import (
+    build_lpips,
+    pixel_reconstruction_loss,
+    semantic_flow_loss,
+)
 from .optim import (
     build_optimizer,
     build_training_scheduler,
@@ -49,7 +53,7 @@ from .sample_runtime import (
     state_dict_sha256,
 )
 from .sampling import sample_semantic_then_pixel
-from .training import compute_training_loss
+from .training import ScheduledTrainingModel, compute_training_loss, prepare_training_path
 from .validation import ValidationPlan, create_validation_plan, validate_joint_loss
 
 ImageLog = Callable[[str, str, int, str], None]
@@ -405,12 +409,136 @@ class ExperimentRunner:
                 self.scheduler.load_state_dict(self._pending_scheduler_state)
                 self._pending_scheduler_state = None
         execution: nn.Module = compile_model_regions(self.model, self.config.compile)
+        decoder = self.config.training.decoder
+        scheduled_decoder = (
+            decoder.update_interval != 1
+            or decoder.updates_per_active_step != 1
+            or not decoder.backpropagate_to_flow
+        )
+        if scheduled_decoder:
+            execution = ScheduledTrainingModel(execution)
         if self.world_size > 1:
             execution = torch.nn.parallel.DistributedDataParallel(
                 execution,
                 device_ids=[self.device.index] if self.device.type == "cuda" else None,
+                find_unused_parameters=scheduled_decoder,
             )
         return execution
+
+    def _run_scheduled_training_step(
+        self,
+        execution: nn.Module,
+        batch: object,
+    ) -> dict[str, float | int | str]:
+        decoder = self.config.training.decoder
+        active = self.global_step % decoder.update_interval == 0
+        prepared = prepare_training_path(batch, self.rng, self.config)
+        path = prepared.path
+        self.optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.bfloat16,
+            enabled=self.device.type == "cuda",
+        ):
+            if active:
+                result = execution(
+                    path.noisy,
+                    path.timestep,
+                    batch.labels,
+                    mode="joint",
+                    force_class_drop=prepared.force_class_drop,
+                    detach_flow=not decoder.backpropagate_to_flow,
+                )
+                if not isinstance(result, tuple) or len(result) != 2:
+                    raise TypeError("joint training execution returned an invalid result")
+                output, cached_features = result
+                semantic_loss = semantic_flow_loss(path, output, self.config.objective)
+                if output.rgb is None:
+                    raise TypeError("joint training execution did not decode RGB")
+                pixel_loss = pixel_reconstruction_loss(
+                    output.rgb,
+                    batch.pixels,
+                    self.lpips_model,
+                    self.config.objective,
+                )
+                total = semantic_loss.total + pixel_loss.total
+                pixel_losses = [pixel_loss]
+            else:
+                output = execution(
+                    path.noisy,
+                    path.timestep,
+                    batch.labels,
+                    mode="semantic",
+                    force_class_drop=prepared.force_class_drop,
+                )
+                semantic_loss = semantic_flow_loss(path, output, self.config.objective)
+                total = semantic_loss.total
+                cached_features = None
+                pixel_losses = []
+        total.backward()
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), self.config.optimizer.gradient_clip
+        )
+        self.optimizer.step()
+        if active:
+            self.ema.update(self.model)
+        else:
+            self.ema.update(self.model, self.model.flow_parameter_names())
+
+        if active:
+            assert cached_features is not None
+            pixel_names = self.model.pixel_parameter_names()
+            pixel_parameters = [
+                parameter
+                for name, parameter in self.model.named_parameters()
+                if name in pixel_names
+            ]
+            for _ in range(1, decoder.updates_per_active_step):
+                self.optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(
+                    device_type=self.device.type,
+                    dtype=torch.bfloat16,
+                    enabled=self.device.type == "cuda",
+                ):
+                    pixels = execution(
+                        mode="decoder",
+                        pixel_features=cached_features,
+                    )
+                    extra_pixel_loss = pixel_reconstruction_loss(
+                        pixels,
+                        batch.pixels,
+                        self.lpips_model,
+                        self.config.objective,
+                    )
+                extra_pixel_loss.total.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    pixel_parameters, self.config.optimizer.gradient_clip
+                )
+                self.optimizer.step()
+                self.ema.update(self.model, pixel_names)
+                pixel_losses.append(extra_pixel_loss)
+
+        metrics: dict[str, float | int | str] = {
+            "loss": float(total.detach()),
+            "full_velocity_mse": float(semantic_loss.full_velocity_mse.detach()),
+            "base_velocity_mse": float(semantic_loss.base_velocity_mse.detach()),
+            "decoder_active": int(active),
+            "decoder_updates": len(pixel_losses),
+            "decoder_update_ratio": (
+                decoder.updates_per_active_step / decoder.update_interval
+            ),
+            "gradient_norm": float(gradient_norm),
+        }
+        if pixel_losses:
+            metrics["pixel_l1"] = sum(
+                float(loss.pixel_l1.detach()) for loss in pixel_losses
+            ) / len(pixel_losses)
+            metrics["pixel_lpips"] = sum(
+                float(loss.pixel_lpips.detach()) for loss in pixel_losses
+            ) / len(pixel_losses)
+            metrics["pixel_l1_final"] = float(pixel_losses[-1].pixel_l1.detach())
+            metrics["pixel_lpips_final"] = float(pixel_losses[-1].pixel_lpips.detach())
+        return metrics
 
     def run(self, *, max_steps: int | None = None) -> None:
         loader = make_joint_loader(
@@ -426,38 +554,65 @@ class ExperimentRunner:
             execution.train()
             for raw_batch in loader:
                 batch = self.batch_preprocessor(raw_batch)
-                self.optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(
-                    device_type=self.device.type,
-                    dtype=torch.bfloat16,
-                    enabled=self.device.type == "cuda",
-                ):
-                    result = compute_training_loss(
-                        execution,
-                        batch,
-                        self.rng,
-                        self.config,
-                        self.lpips_model,
-                    )
-                result.loss.total.backward()
-                gradient_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.optimizer.gradient_clip
+                decoder = self.config.training.decoder
+                scheduled_decoder = (
+                    decoder.update_interval != 1
+                    or decoder.updates_per_active_step != 1
+                    or not decoder.backpropagate_to_flow
                 )
-                self.optimizer.step()
+                if scheduled_decoder:
+                    step_metrics = self._run_scheduled_training_step(execution, batch)
+                    decoder_active = bool(step_metrics["decoder_active"])
+                    decoder_updates = int(step_metrics["decoder_updates"])
+                else:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    with torch.autocast(
+                        device_type=self.device.type,
+                        dtype=torch.bfloat16,
+                        enabled=self.device.type == "cuda",
+                    ):
+                        result = compute_training_loss(
+                            execution,
+                            batch,
+                            self.rng,
+                            self.config,
+                            self.lpips_model,
+                        )
+                    result.loss.total.backward()
+                    gradient_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.config.optimizer.gradient_clip
+                    )
+                    self.optimizer.step()
+                    self.ema.update(self.model)
+                    step_metrics = {
+                        "loss": float(result.loss.total.detach()),
+                        "full_velocity_mse": float(
+                            result.loss.full_velocity_mse.detach()
+                        ),
+                        "base_velocity_mse": float(
+                            result.loss.base_velocity_mse.detach()
+                        ),
+                        "pixel_l1": float(result.loss.pixel_l1.detach()),
+                        "pixel_lpips": float(result.loss.pixel_lpips.detach()),
+                        "decoder_active": 1,
+                        "decoder_updates": 1,
+                        "decoder_update_ratio": 1.0,
+                        "gradient_norm": float(gradient_norm),
+                    }
+                    decoder_active = True
+                    decoder_updates = 1
                 assert self.scheduler is not None
                 self.scheduler.step()
-                self.ema.update(self.model)
                 self.global_step += 1
                 self.images_seen += batch.semantic.shape[0] * self.world_size
-                self.estimated_flops += model_flops_per_step(self.config)
+                self.estimated_flops += model_flops_per_step(
+                    self.config,
+                    decoder_active=decoder_active,
+                    decoder_updates=decoder_updates,
+                )
                 metrics: dict[str, float | int | str] = {
                     "epoch": epoch,
                     "step": self.global_step,
-                    "loss": float(result.loss.total.detach()),
-                    "full_velocity_mse": float(result.loss.full_velocity_mse.detach()),
-                    "base_velocity_mse": float(result.loss.base_velocity_mse.detach()),
-                    "pixel_l1": float(result.loss.pixel_l1.detach()),
-                    "pixel_lpips": float(result.loss.pixel_lpips.detach()),
                     "semantic_target_rms": float(
                         batch.semantic.float().square().mean().sqrt()
                     ),
@@ -465,8 +620,7 @@ class ExperimentRunner:
                     "internal_guidance_t_min": guidance.t_min,
                     "internal_guidance_t_max": guidance.t_max,
                     "lr": self.optimizer.param_groups[0]["lr"],
-                    "gradient_norm": float(gradient_norm),
-                }
+                } | step_metrics
                 self.log(metrics)
                 if max_steps is not None and self.global_step >= max_steps:
                     self._write_run_metrics(complete=False)

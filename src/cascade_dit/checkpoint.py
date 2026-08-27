@@ -40,11 +40,15 @@ class EMA:
         }
 
     @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
+    def update(self, model: nn.Module, names: set[str] | None = None) -> None:
         state = _tensor_state(clean_state_dict(model))
         if state.keys() != self.shadow.keys():
             raise ValueError("EMA keys changed during training")
+        if names is not None and not names <= state.keys():
+            raise ValueError("EMA update names are not present in the model state")
         for name, source in state.items():
+            if names is not None and name not in names:
+                continue
             target = self.shadow[name]
             if source.is_floating_point():
                 target.lerp_(source.to(target), 1 - self.decay)

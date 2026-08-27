@@ -12,7 +12,11 @@ from cascade_dit.config import (
     SemanticDecoderConfig,
 )
 from cascade_dit.model import DDT, DDTOutput, build_model
-from cascade_dit.model.ddt import DiPPatchDecoder, PixelTransformerBlock
+from cascade_dit.model.ddt import (
+    DiPPatchDecoder,
+    LayerAttentionFusion,
+    PixelTransformerBlock,
+)
 
 
 class FastDetailer(nn.Module):
@@ -113,6 +117,62 @@ def test_pixel_loss_reaches_flow_trunk_without_detachment() -> None:
     assert _has_gradient(model.encoder_blocks)
     assert _has_gradient(model.pixel_blocks)
     assert _has_gradient(model.coarse_patch_projection)
+
+
+def test_layer_attention_fusion_uses_mean_and_separate_context_token() -> None:
+    model = _model()
+    config = model.config
+    config.pixel_decoder.fusion.kind = "layer_attention"
+    config.pixel_decoder.fusion.layer_attention.width = 32
+    config.pixel_decoder.fusion.layer_attention.heads = 2
+    config.pixel_decoder.encoder_features = [1]
+    config.pixel_decoder.decoder_features = [1]
+    model = build_model(config)
+    fusion = model.pixel_layer_fusion
+    assert isinstance(fusion, LayerAttentionFusion)
+    fusion.blocks = nn.ModuleList([nn.Identity()])
+    fusion.source_norms = nn.ModuleList([nn.Identity(), nn.Identity()])
+    fusion.final_norm = nn.Identity()
+    fusion.spatial_projection = nn.Identity()
+    fusion.context_projection = nn.Identity()
+    with torch.no_grad():
+        fusion.source_embeddings.zero_()
+        fusion.context_token.fill_(7)
+        for index, projection in enumerate(fusion.source_projections, start=1):
+            projection.weight.zero_()
+            projection.bias.fill_(index)
+    features = (torch.randn(1, 64, 16), torch.randn(1, 64, 32))
+    spatial, context = fusion(features)
+    assert torch.equal(spatial, torch.full_like(spatial, 1.5))
+    assert torch.equal(context, torch.full_like(context, 7))
+
+
+def test_layer_attention_decoder_replaces_only_legacy_fusion_modules() -> None:
+    config = _model().config
+    config.pixel_decoder.fusion.kind = "layer_attention"
+    config.pixel_decoder.fusion.layer_attention.width = 32
+    config.pixel_decoder.fusion.layer_attention.heads = 2
+    model = build_model(config)
+    model.patch_detailer = FastDetailer()
+    assert hasattr(model, "pixel_layer_fusion")
+    assert not hasattr(model, "pixel_token_projection")
+    assert not hasattr(model, "pixel_context_projection")
+    assert len(model.pixel_blocks) == 3
+    output = model(*_arguments(), decode_pixels=True)
+    assert output.rgb is not None and output.rgb.shape == (1, 3, 128, 128)
+
+
+def test_detached_pixel_features_do_not_backpropagate_to_flow() -> None:
+    model = _model()
+    semantic, features = model.forward_semantic(
+        *_arguments(), capture_pixel_features=True
+    )
+    assert semantic.rgb is None and features is not None
+    pixels = model.decode_pixel_features(features, detach_flow=True)
+    pixels.square().mean().backward()
+    assert not _has_gradient(model.encoder_blocks)
+    assert not _has_gradient(model.semantic_decoder_blocks)
+    assert _has_gradient(model.pixel_blocks)
 
 
 def test_dip_patch_decoder_is_patch_isolated() -> None:

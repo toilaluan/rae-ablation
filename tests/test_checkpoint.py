@@ -123,3 +123,21 @@ def test_completed_joint_checkpoint_records_single_schedule_completion(tmp_path)
     bundle = load_checkpoint_bundle(saved)
     assert bundle.metadata["training_complete"] is True
     assert bundle.metadata["completed_epoch"] == config.training.epochs
+
+
+def test_ema_can_update_only_decoder_parameters() -> None:
+    config = _config()
+    model = _model(config)
+    ema = EMA(model, decay=0.5)
+    before = {name: value.clone() for name, value in ema.state_dict().items()}
+    pixel_names = model.pixel_parameter_names()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(1)
+    ema.update(model, pixel_names)
+    after = ema.state_dict()
+    assert any(not torch.equal(after[name], before[name]) for name in pixel_names)
+    assert all(
+        torch.equal(after[name], before[name])
+        for name in model.flow_parameter_names()
+    )

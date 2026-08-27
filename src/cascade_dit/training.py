@@ -7,8 +7,14 @@ from torch import Tensor, nn
 
 from .config import ExperimentConfig
 from .data import PreparedJointBatch
-from .model import DDTOutput
-from .objective import JointLoss, flow_matching_loss, gaussian_flow_path, sample_timesteps
+from .model import DDT, DDTOutput, PixelFeatureBundle
+from .objective import (
+    GaussianFlowPath,
+    JointLoss,
+    flow_matching_loss,
+    gaussian_flow_path,
+    sample_timesteps,
+)
 from .rng import RNGStreams
 
 
@@ -20,15 +26,62 @@ class TrainingStep:
     timesteps: Tensor
 
 
-def compute_training_loss(
-    model: nn.Module,
+@dataclass(frozen=True)
+class PreparedTrainingPath:
+    path: GaussianFlowPath
+    force_class_drop: Tensor
+
+
+class ScheduledTrainingModel(nn.Module):
+    """DDP-visible execution modes for sparse and repeated pixel updates."""
+
+    def __init__(self, model: DDT) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        noisy_tokens: Tensor | None = None,
+        timestep: Tensor | None = None,
+        labels: Tensor | None = None,
+        *,
+        mode: str,
+        force_class_drop: Tensor | None = None,
+        pixel_features: PixelFeatureBundle | None = None,
+        detach_flow: bool = False,
+    ) -> DDTOutput | tuple[DDTOutput, PixelFeatureBundle] | Tensor:
+        if mode == "decoder":
+            if pixel_features is None:
+                raise ValueError("decoder-only execution requires cached pixel features")
+            return self.model.decode_pixel_features(pixel_features)
+        if mode not in {"semantic", "joint"}:
+            raise ValueError("training execution mode must be semantic, joint, or decoder")
+        if noisy_tokens is None or timestep is None or labels is None:
+            raise ValueError("semantic and joint execution require flow inputs")
+        semantic, features = self.model.forward_semantic(
+            noisy_tokens,
+            timestep,
+            labels,
+            capture_pixel_features=mode == "joint",
+            force_class_drop=force_class_drop,
+        )
+        if mode == "semantic":
+            return semantic
+        assert features is not None
+        pixels = self.model.decode_pixel_features(features, detach_flow=detach_flow)
+        return (
+            DDTOutput(semantic.full_x0, semantic.base_x0, pixels),
+            features.detached(),
+        )
+
+
+def prepare_training_path(
     batch: PreparedJointBatch,
     rng: RNGStreams,
     config: ExperimentConfig,
-    lpips_model: nn.Module,
     *,
     timestep_shift: float | None = None,
-) -> TrainingStep:
+) -> PreparedTrainingPath:
     active_shift = config.training.timestep_shift
     if timestep_shift is not None:
         active_shift = timestep_shift
@@ -52,12 +105,31 @@ def compute_training_loss(
         generator=rng.label_dropout,
         device=batch.labels.device,
     ) < config.model.class_dropout_probability
+    return PreparedTrainingPath(path, drop)
+
+
+def compute_training_loss(
+    model: nn.Module,
+    batch: PreparedJointBatch,
+    rng: RNGStreams,
+    config: ExperimentConfig,
+    lpips_model: nn.Module,
+    *,
+    timestep_shift: float | None = None,
+) -> TrainingStep:
+    prepared = prepare_training_path(
+        batch,
+        rng,
+        config,
+        timestep_shift=timestep_shift,
+    )
+    path = prepared.path
     output = model(
         path.noisy,
-        timesteps,
+        path.timestep,
         batch.labels,
         decode_pixels=True,
-        force_class_drop=drop,
+        force_class_drop=prepared.force_class_drop,
     )
     if not isinstance(output, DDTOutput):
         raise TypeError("DDT training requires a DDTOutput")
@@ -68,4 +140,4 @@ def compute_training_loss(
         lpips_model,
         config.objective,
     )
-    return TrainingStep(loss, output, path.noisy, timesteps)
+    return TrainingStep(loss, output, path.noisy, path.timestep)

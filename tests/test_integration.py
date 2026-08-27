@@ -23,7 +23,8 @@ from cascade_dit.data import PreparedJointBatch
 from cascade_dit.model import DDT, build_model
 from cascade_dit.optim import build_optimizer
 from cascade_dit.rng import RNGStreams
-from cascade_dit.training import compute_training_loss
+from cascade_dit.runner import ExperimentRunner
+from cascade_dit.training import ScheduledTrainingModel, compute_training_loss
 
 
 class FastDetailer(nn.Module):
@@ -114,6 +115,87 @@ def test_cpu_ddp_joint_training_has_no_unused_phase_parameters(tmp_path) -> None
         assert model.full_head.projection.weight.grad is not None
         assert model.base_head.projection.weight.grad is not None
         assert model.coarse_patch_projection.weight.grad is not None
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_sparse_decoder_schedule_reuses_features_for_inner_updates() -> None:
+    config = _config()
+    config.training.decoder.update_interval = 2
+    config.training.decoder.updates_per_active_step = 3
+    model = _model(config)
+    runner = object.__new__(ExperimentRunner)
+    runner.config = config
+    runner.device = torch.device("cpu")
+    runner.global_step = 0
+    runner.model = model
+    runner.optimizer = build_optimizer(model, config.optimizer)
+    runner.ema = EMA(model)
+    runner.rng = RNGStreams.create(10)
+    runner.lpips_model = LPIPSStub()
+    execution = ScheduledTrainingModel(model)
+
+    optimizer_steps = 0
+    original_step = runner.optimizer.step
+
+    def counted_step(*args, **kwargs):
+        nonlocal optimizer_steps
+        optimizer_steps += 1
+        return original_step(*args, **kwargs)
+
+    runner.optimizer.step = counted_step
+    active = runner._run_scheduled_training_step(execution, _batch())
+    assert active["decoder_active"] == 1
+    assert active["decoder_updates"] == 3
+    assert optimizer_steps == 3
+
+    pixel_before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if name in model.pixel_parameter_names()
+    }
+    runner.global_step = 1
+    inactive = runner._run_scheduled_training_step(execution, _batch())
+    assert inactive["decoder_active"] == 0
+    assert inactive["decoder_updates"] == 0
+    assert optimizer_steps == 4
+    assert all(
+        torch.equal(pixel_before[name], parameter)
+        for name, parameter in model.named_parameters()
+        if name in pixel_before
+    )
+
+
+def test_cpu_ddp_sparse_decoder_modes_support_unused_parameters(tmp_path) -> None:
+    if torch.distributed.is_initialized():
+        return
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{tmp_path / 'scheduled-ddp-init'}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        config = _config()
+        config.training.decoder.update_interval = 2
+        config.training.decoder.updates_per_active_step = 2
+        model = _model(config)
+        execution = torch.nn.parallel.DistributedDataParallel(
+            ScheduledTrainingModel(model), find_unused_parameters=True
+        )
+        runner = object.__new__(ExperimentRunner)
+        runner.config = config
+        runner.device = torch.device("cpu")
+        runner.model = model
+        runner.optimizer = build_optimizer(model, config.optimizer)
+        runner.ema = EMA(model)
+        runner.rng = RNGStreams.create(11)
+        runner.lpips_model = LPIPSStub()
+        for step in range(3):
+            runner.global_step = step
+            metrics = runner._run_scheduled_training_step(execution, _batch())
+            assert metrics["decoder_active"] == int(step % 2 == 0)
     finally:
         torch.distributed.destroy_process_group()
 

@@ -34,6 +34,23 @@ class JointLoss:
 FlowLoss = JointLoss
 
 
+@dataclass(frozen=True)
+class SemanticLoss:
+    total: Tensor
+    full_velocity_mse: Tensor
+    base_velocity_mse: Tensor
+    weighted_base_velocity_mse: Tensor
+
+
+@dataclass(frozen=True)
+class PixelLoss:
+    total: Tensor
+    pixel_l1: Tensor
+    pixel_lpips: Tensor
+    weighted_pixel_l1: Tensor
+    weighted_pixel_lpips: Tensor
+
+
 def _broadcast_timestep(timestep: Tensor, values: Tensor) -> Tensor:
     if timestep.ndim != 1 or timestep.shape[0] != values.shape[0]:
         raise ValueError("timesteps must have shape [B]")
@@ -95,6 +112,48 @@ def build_lpips(device: torch.device | str) -> nn.Module:
     return perceptual
 
 
+def semantic_flow_loss(
+    path: GaussianFlowPath,
+    output: DDTOutput,
+    config: ObjectiveConfig,
+) -> SemanticLoss:
+    """Compute the full and base semantic flow-matching objectives."""
+    full_velocity = x0_to_velocity(
+        path.noisy, output.full_x0, path.timestep, config.denominator_floor
+    )
+    base_velocity = x0_to_velocity(
+        path.noisy, output.base_x0, path.timestep, config.denominator_floor
+    )
+    full_mse = F.mse_loss(full_velocity.float(), path.velocity.float())
+    base_mse = F.mse_loss(base_velocity.float(), path.velocity.float())
+    weighted_base = config.base_velocity_weight * base_mse
+    return SemanticLoss(full_mse + weighted_base, full_mse, base_mse, weighted_base)
+
+
+def pixel_reconstruction_loss(
+    prediction: Tensor,
+    pixel_target: Tensor,
+    lpips_model: nn.Module,
+    config: ObjectiveConfig,
+) -> PixelLoss:
+    """Compute raw-RGB reconstruction losses for a decoded image batch."""
+    if pixel_target.ndim != 4 or pixel_target.shape != prediction.shape:
+        raise ValueError("pixel targets and RGB predictions must have equal BCHW shapes")
+    pixel_l1 = F.l1_loss(prediction.float(), pixel_target.float())
+    predicted_lpips = prediction.float().mul(2).sub(1)
+    target_lpips = pixel_target.float().mul(2).sub(1)
+    pixel_lpips = lpips_model(predicted_lpips, target_lpips).float().mean()
+    weighted_l1 = config.pixel_l1_weight * pixel_l1
+    weighted_lpips = config.pixel_lpips_weight * pixel_lpips
+    return PixelLoss(
+        weighted_l1 + weighted_lpips,
+        pixel_l1,
+        pixel_lpips,
+        weighted_l1,
+        weighted_lpips,
+    )
+
+
 def flow_matching_loss(
     path: GaussianFlowPath,
     output: DDTOutput,
@@ -105,30 +164,15 @@ def flow_matching_loss(
     """Compute full/base semantic flow loss and raw-RGB reconstruction loss."""
     if output.rgb is None:
         raise ValueError("joint training requires RGB decoding")
-    if pixel_target.ndim != 4 or pixel_target.shape != output.rgb.shape:
-        raise ValueError("pixel targets and RGB predictions must have equal BCHW shapes")
-    full_velocity = x0_to_velocity(
-        path.noisy, output.full_x0, path.timestep, config.denominator_floor
-    )
-    base_velocity = x0_to_velocity(
-        path.noisy, output.base_x0, path.timestep, config.denominator_floor
-    )
-    full_mse = F.mse_loss(full_velocity.float(), path.velocity.float())
-    base_mse = F.mse_loss(base_velocity.float(), path.velocity.float())
-    pixel_l1 = F.l1_loss(output.rgb.float(), pixel_target.float())
-    predicted_lpips = output.rgb.float().mul(2).sub(1)
-    target_lpips = pixel_target.float().mul(2).sub(1)
-    pixel_lpips = lpips_model(predicted_lpips, target_lpips).float().mean()
-    weighted_base = config.base_velocity_weight * base_mse
-    weighted_l1 = config.pixel_l1_weight * pixel_l1
-    weighted_lpips = config.pixel_lpips_weight * pixel_lpips
+    semantic = semantic_flow_loss(path, output, config)
+    pixel = pixel_reconstruction_loss(output.rgb, pixel_target, lpips_model, config)
     return JointLoss(
-        full_mse + weighted_base + weighted_l1 + weighted_lpips,
-        full_mse,
-        base_mse,
-        pixel_l1,
-        pixel_lpips,
-        weighted_base,
-        weighted_l1,
-        weighted_lpips,
+        semantic.total + pixel.total,
+        semantic.full_velocity_mse,
+        semantic.base_velocity_mse,
+        pixel.pixel_l1,
+        pixel.pixel_lpips,
+        semantic.weighted_base_velocity_mse,
+        pixel.weighted_pixel_l1,
+        pixel.weighted_pixel_lpips,
     )

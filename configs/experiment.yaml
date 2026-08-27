@@ -26,6 +26,10 @@ encoder:
 training:
   epochs: 200
   timestep_shift: 4.0
+  decoder:
+    update_interval: 1
+    updates_per_active_step: 1
+    backpropagate_to_flow: true
 
 representations:
   directory: data/direct-representations
@@ -55,6 +59,13 @@ model:
     heads: 16
     encoder_features: [4, 8, 12]
     decoder_features: [1, 2]
+    fusion:
+      kind: concatenate
+      layer_attention:
+        width: 768
+        depth: 1
+        heads: 12
+        mlp_ratio: 2.0
   feedforward:
     mlp_ratio: 4.0
   attention:

@@ -93,7 +93,9 @@ def test_runner_reuses_one_loader_and_one_execution_wrapper(monkeypatch) -> None
         "set_joint_loader_epoch",
         lambda _loader, epoch: advances.append(epoch),
     )
-    monkeypatch.setattr(runner_module, "model_flops_per_step", lambda *_args: 0)
+    monkeypatch.setattr(
+        runner_module, "model_flops_per_step", lambda *_args, **_kwargs: 0
+    )
 
     runner = object.__new__(ExperimentRunner)
     runner.config = config

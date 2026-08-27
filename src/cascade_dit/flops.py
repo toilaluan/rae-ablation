@@ -61,13 +61,34 @@ def ddt_forward_flops(config: ExperimentConfig, *, decode_pixels: bool = True) -
         len(pixel.encoder_features) * encoder.width
         + len(pixel.decoder_features) * semantic.width
     )
-    total += 4 * TOKEN_COUNT * fusion * pixel.width
+    if pixel.fusion.kind == "concatenate":
+        total += 4 * TOKEN_COUNT * fusion * pixel.width
+        total += _swiglu_flops(TOKEN_COUNT, pixel.width, ratio)
+    else:
+        layer = pixel.fusion.layer_attention
+        layer_tokens = (
+            len(pixel.encoder_features) + len(pixel.decoder_features) + 1
+        )
+        total += 2 * TOKEN_COUNT * fusion * layer.width
+        total += TOKEN_COUNT * layer.depth * _transformer_flops(
+            layer_tokens, layer.width, layer.mlp_ratio
+        )
+        total += 4 * TOKEN_COUNT * layer.width * pixel.width
     total += pixel.depth * _transformer_flops(TOKEN_COUNT, pixel.width, ratio)
-    total += _swiglu_flops(TOKEN_COUNT, pixel.width, ratio)
     total += 2 * TOKEN_COUNT * pixel.width * (3 * PATCH_SIZE * PATCH_SIZE)
     total += TOKEN_COUNT * _dip_patch_flops(pixel.width)
     return total
 
 
-def model_flops_per_step(config: ExperimentConfig) -> int:
-    return config.optimizer.global_batch_size * 3 * ddt_forward_flops(config)
+def model_flops_per_step(
+    config: ExperimentConfig,
+    *,
+    decoder_active: bool = True,
+    decoder_updates: int = 1,
+) -> int:
+    if decoder_updates < 0 or (not decoder_active and decoder_updates):
+        raise ValueError("decoder update count is inconsistent with decoder activity")
+    semantic = ddt_forward_flops(config, decode_pixels=False)
+    decoder = ddt_forward_flops(config, decode_pixels=True) - semantic
+    updates = decoder_updates if decoder_active else 0
+    return config.optimizer.global_batch_size * 3 * (semantic + updates * decoder)

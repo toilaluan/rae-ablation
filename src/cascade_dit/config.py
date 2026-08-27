@@ -60,9 +60,19 @@ class EncoderConfig:
 
 
 @dataclass
+class DecoderOptimizationConfig:
+    update_interval: int = 1
+    updates_per_active_step: int = 1
+    backpropagate_to_flow: bool = True
+
+
+@dataclass
 class TrainingConfig:
     epochs: int = 200
     timestep_shift: float = 4.0
+    decoder: DecoderOptimizationConfig = field(
+        default_factory=DecoderOptimizationConfig
+    )
 
 
 @dataclass
@@ -96,12 +106,29 @@ class SemanticDecoderConfig:
 
 
 @dataclass
+class LayerAttentionFusionConfig:
+    width: int = 768
+    depth: int = 1
+    heads: int = 12
+    mlp_ratio: float = 2.0
+
+
+@dataclass
+class PixelFusionConfig:
+    kind: str = "concatenate"
+    layer_attention: LayerAttentionFusionConfig = field(
+        default_factory=LayerAttentionFusionConfig
+    )
+
+
+@dataclass
 class PixelDecoderConfig:
     width: int = 2048
     depth: int = 3
     heads: int = 16
     encoder_features: list[int] = field(default_factory=lambda: [4, 8, 12])
     decoder_features: list[int] = field(default_factory=lambda: [1, 2])
+    fusion: PixelFusionConfig = field(default_factory=PixelFusionConfig)
 
 
 # Retained as a constructor alias; the phase-era ``decoder`` field itself is gone.
@@ -275,6 +302,11 @@ class ExperimentConfig:
                 f"schema_version: {CONFIG_SCHEMA_VERSION} is required"
             )
         _positive("training settings", self.training.epochs, self.training.timestep_shift)
+        _positive(
+            "decoder optimization settings",
+            self.training.decoder.update_interval,
+            self.training.decoder.updates_per_active_step,
+        )
         if self.data.image_size != IMAGE_SIZE:
             raise ValueError("data.image_size must be 128")
         if (self.data.repository, self.data.revision) != (
@@ -375,6 +407,26 @@ class ExperimentConfig:
                 raise ValueError(f"model.pixel_decoder.{name} must contain unique blocks")
             if any(not 1 <= block <= depth for block in selected):
                 raise ValueError(f"model.pixel_decoder.{name} contains an out-of-range block")
+        fusion = model.pixel_decoder.fusion
+        if fusion.kind not in {"concatenate", "layer_attention"}:
+            raise ValueError(
+                "model.pixel_decoder.fusion.kind must be concatenate or layer_attention"
+            )
+        layer_attention = fusion.layer_attention
+        _positive(
+            "model.pixel_decoder.fusion.layer_attention",
+            layer_attention.width,
+            layer_attention.depth,
+            layer_attention.heads,
+            layer_attention.mlp_ratio,
+        )
+        if (
+            layer_attention.width % layer_attention.heads
+            or (layer_attention.width // layer_attention.heads) % 4
+        ):
+            raise ValueError(
+                "model.pixel_decoder.fusion.layer_attention head width must be divisible by four"
+            )
         _positive(
             "model settings",
             model.feedforward.mlp_ratio,

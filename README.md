@@ -18,12 +18,20 @@ mixing, direct pixel flow, or phased training.
 
 ## Pixel decoder
 
-Post-block encoder features `[4, 8, 12]` and semantic-decoder features `[1, 2]` are
-concatenated. Independent width-2048 paths produce transformer-refined coarse RGB
-patches and per-patch context. The coarse `3x16x16` patches are decoded independently
-by the DiP four-pool U-Net topology and folded into an absolute `[B,3,128,128]` RGB
-prediction. Pixel L1 and frozen VGG LPIPS losses update the pixel path and flow trunk
-without detachment.
+Post-block encoder features `[4, 8, 12]` and semantic-decoder features `[1, 2]` use
+the configured pixel fusion. `concatenate` is the default and retains the original
+independent width-2048 token and context paths. `layer_attention` normalizes and
+projects each source to width 768, mixes the five sources plus a learned DiP-context
+token with one 12-head depth-axis transformer, averages the normalized source outputs,
+and projects both results to width 2048. The existing three spatial transformers then
+produce coarse `3x16x16` RGB patches, while the learned-token result conditions the
+patch-isolated DiP four-pool U-Net.
+
+Use the alternative fusion with:
+
+```bash
+--override model.pixel_decoder.fusion.kind=layer_attention
+```
 
 ## Preparation and training
 
@@ -48,6 +56,13 @@ full_velocity_mse + base_velocity_mse + pixel_l1 + pixel_lpips
 
 All weights default to `1.0`. RGB L1 uses `[0,1]`; LPIPS receives prediction and
 target mapped to `[-1,1]`.
+
+Decoder optimization defaults to every outer step with one update and pixel gradients
+flowing into the semantic trunk. `training.decoder.update_interval=N` runs pixels only
+every `N` outer steps; `updates_per_active_step=K` reuses detached hidden states for
+the remaining `K-1` decoder-only updates. Average decoder work therefore scales with
+`K/N`. Set `backpropagate_to_flow=false` to isolate all pixel gradients from the flow
+trunk.
 
 ## Sampling
 

@@ -20,6 +20,18 @@ def test_checked_in_joint_schema_config() -> None:
     assert config.model.pixel_decoder.depth == 3
     assert config.model.pixel_decoder.encoder_features == [4, 8, 12]
     assert config.model.pixel_decoder.decoder_features == [1, 2]
+    assert config.model.pixel_decoder.fusion.kind == "concatenate"
+    assert vars(config.model.pixel_decoder.fusion.layer_attention) == {
+        "width": 768,
+        "depth": 1,
+        "heads": 12,
+        "mlp_ratio": 2.0,
+    }
+    assert vars(config.training.decoder) == {
+        "update_interval": 1,
+        "updates_per_active_step": 1,
+        "backpropagate_to_flow": True,
+    }
     assert vars(config.sampling.internal_guidance) == {
         "scale": 1.78,
         "t_min": 0.1,
@@ -72,6 +84,16 @@ def test_feature_base_and_weight_validation() -> None:
     config = ExperimentConfig()
     config.objective.pixel_lpips_weight = -1
     with pytest.raises(ValueError, match="non-negative"):
+        config.validate()
+
+    config = ExperimentConfig()
+    config.model.pixel_decoder.fusion.kind = "unknown"
+    with pytest.raises(ValueError, match=r"fusion\.kind"):
+        config.validate()
+
+    config = ExperimentConfig()
+    config.training.decoder.update_interval = 0
+    with pytest.raises(ValueError, match="decoder optimization"):
         config.validate()
 
 

@@ -177,6 +177,110 @@ class PixelTransformerBlock(nn.Module):
         return values + self.mlp(self.norm_mlp(values))
 
 
+class LayerAttentionBlock(nn.Module):
+    """A transformer block that mixes feature depth, not spatial positions."""
+
+    def __init__(
+        self,
+        width: int,
+        heads: int,
+        mlp_ratio: float,
+        *,
+        layer_tokens: int,
+        qk_norm: bool,
+        sdpa: bool,
+    ) -> None:
+        super().__init__()
+        self.norm_attention = RMSNorm(width)
+        self.attention = Attention(
+            width,
+            heads,
+            token_count=layer_tokens,
+            spatial_tokens=0,
+            qk_norm=qk_norm,
+            rope=False,
+            sdpa=sdpa,
+        )
+        self.norm_mlp = RMSNorm(width)
+        self.mlp = SwiGLU(width, mlp_ratio)
+
+    def forward(self, values: Tensor) -> Tensor:
+        values = values + self.attention(self.norm_attention(values))
+        return values + self.mlp(self.norm_mlp(values))
+
+
+class LayerAttentionFusion(nn.Module):
+    """Fuse aligned flow states with attention over their network depths."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        fusion = config.pixel_decoder.fusion.layer_attention
+        source_widths = (
+            [config.encoder.width] * len(config.pixel_decoder.encoder_features)
+            + [config.semantic_decoder.width]
+            * len(config.pixel_decoder.decoder_features)
+        )
+        self.source_norms = nn.ModuleList(RMSNorm(width) for width in source_widths)
+        self.source_projections = nn.ModuleList(
+            nn.Linear(width, fusion.width) for width in source_widths
+        )
+        self.source_embeddings = nn.Parameter(
+            torch.randn(len(source_widths), fusion.width) / fusion.width**0.5
+        )
+        self.context_token = nn.Parameter(
+            torch.randn(fusion.width) / fusion.width**0.5
+        )
+        layer_tokens = len(source_widths) + 1
+        self.blocks = nn.ModuleList(
+            LayerAttentionBlock(
+                fusion.width,
+                fusion.heads,
+                fusion.mlp_ratio,
+                layer_tokens=layer_tokens,
+                qk_norm=config.attention.qk_norm,
+                sdpa=config.attention.sdpa,
+            )
+            for _ in range(fusion.depth)
+        )
+        self.final_norm = RMSNorm(fusion.width)
+        self.spatial_projection = nn.Linear(fusion.width, config.pixel_decoder.width)
+        self.context_projection = nn.Linear(fusion.width, config.pixel_decoder.width)
+        self.gradient_checkpointing = config.gradient_checkpointing
+
+    def forward(self, features: tuple[Tensor, ...]) -> tuple[Tensor, Tensor]:
+        if len(features) != len(self.source_projections):
+            raise ValueError("layer fusion received the wrong number of feature tensors")
+        projected = [
+            projection(norm(values))
+            for values, norm, projection in zip(
+                features, self.source_norms, self.source_projections, strict=True
+            )
+        ]
+        shape = projected[0].shape[:2]
+        if any(values.shape[:2] != shape for values in projected):
+            raise ValueError("layer fusion features must share batch and spatial dimensions")
+        states = torch.stack(projected, dim=2)
+        states = states + self.source_embeddings[None, None].to(states)
+        context = self.context_token[None, None, None].expand(
+            states.shape[0], states.shape[1], 1, -1
+        )
+        states = torch.cat((states, context.to(states)), dim=2)
+        batch, spatial, layers, width = states.shape
+        states = states.reshape(batch * spatial, layers, width)
+        for block in self.blocks:
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                states = checkpoint(block, states, use_reentrant=False)
+            else:
+                states = block(states)
+        states = self.final_norm(states).reshape(batch, spatial, layers, width)
+        spatial_tokens = states[:, :, :-1].mean(dim=2)
+        context_tokens = states[:, :, -1]
+        return (
+            self.spatial_projection(spatial_tokens),
+            self.context_projection(context_tokens),
+        )
+
+
 class DDTFinalLayer(nn.Module):
     def __init__(self, width: int, output_width: int) -> None:
         super().__init__()
@@ -298,6 +402,22 @@ class DDTOutput:
         return self.rgb
 
 
+@dataclass(frozen=True)
+class PixelFeatureBundle:
+    encoder: tuple[Tensor, ...]
+    decoder: tuple[Tensor, ...]
+
+    @property
+    def all(self) -> tuple[Tensor, ...]:
+        return self.encoder + self.decoder
+
+    def detached(self) -> PixelFeatureBundle:
+        return PixelFeatureBundle(
+            tuple(values.detach() for values in self.encoder),
+            tuple(values.detach() for values in self.decoder),
+        )
+
+
 class DDT(nn.Module):
     """Joint semantic flow with RAEv2 base prediction and DiP RGB decoding."""
 
@@ -340,13 +460,19 @@ class DDT(nn.Module):
             len(config.pixel_decoder.encoder_features) * encoder_width
             + len(config.pixel_decoder.decoder_features) * semantic_width
         )
-        self.pixel_token_projection = nn.Linear(fusion_width, pixel_width)
+        self.pixel_fusion_kind = config.pixel_decoder.fusion.kind
+        if self.pixel_fusion_kind == "concatenate":
+            self.pixel_token_projection = nn.Linear(fusion_width, pixel_width)
+            self.pixel_context_projection = nn.Linear(fusion_width, pixel_width)
+            self.pixel_context_norm = RMSNorm(pixel_width)
+            self.pixel_context_mlp = SwiGLU(
+                pixel_width, config.feedforward.mlp_ratio
+            )
+        else:
+            self.pixel_layer_fusion = LayerAttentionFusion(config)
         self.pixel_blocks = nn.ModuleList(
             PixelTransformerBlock(config) for _ in range(config.pixel_decoder.depth)
         )
-        self.pixel_context_projection = nn.Linear(fusion_width, pixel_width)
-        self.pixel_context_norm = RMSNorm(pixel_width)
-        self.pixel_context_mlp = SwiGLU(pixel_width, config.feedforward.mlp_ratio)
         self.coarse_patch_projection = nn.Linear(pixel_width, 3 * PATCH_SIZE * PATCH_SIZE)
         self.patch_detailer = DiPPatchDecoder(pixel_width)
         self.gradient_checkpointing = config.gradient_checkpointing
@@ -364,10 +490,35 @@ class DDT(nn.Module):
     def pixel_transformer_blocks(self) -> nn.ModuleList:
         return self.pixel_blocks
 
+    def pixel_parameter_names(self) -> set[str]:
+        prefixes = ("pixel_", "coarse_patch_projection.", "patch_detailer.")
+        return {
+            name
+            for name, _parameter in self.named_parameters()
+            if name.startswith(prefixes)
+        }
+
+    def flow_parameter_names(self) -> set[str]:
+        pixel = self.pixel_parameter_names()
+        return {name for name, _parameter in self.named_parameters() if name not in pixel}
+
     @staticmethod
     def _validate_config(config: ModelConfig) -> None:
         if not 1 <= config.base_prediction_depth <= config.encoder.depth:
             raise ValueError("base_prediction_depth must select an encoder block")
+        fusion = config.pixel_decoder.fusion
+        if fusion.kind not in {"concatenate", "layer_attention"}:
+            raise ValueError("pixel fusion kind must be concatenate or layer_attention")
+        layer = fusion.layer_attention
+        if (
+            layer.width <= 0
+            or layer.depth <= 0
+            or layer.heads <= 0
+            or layer.mlp_ratio <= 0
+            or layer.width % layer.heads
+            or (layer.width // layer.heads) % 4
+        ):
+            raise ValueError("layer-attention fusion dimensions are invalid")
         for name, selected, depth in (
             ("encoder_features", config.pixel_decoder.encoder_features, config.encoder.depth),
             (
@@ -419,13 +570,17 @@ class DDT(nn.Module):
             return torch.autocast("cuda", dtype=torch.bfloat16)
         return nullcontext()
 
-    def _decode_pixels(self, features: Tensor) -> Tensor:
-        batch = features.shape[0]
-        pixel_tokens = self.pixel_token_projection(features)
+    def _decode_pixels(self, features: PixelFeatureBundle) -> Tensor:
+        batch = features.all[0].shape[0]
+        if self.pixel_fusion_kind == "concatenate":
+            concatenated = torch.cat(features.all, dim=-1)
+            pixel_tokens = self.pixel_token_projection(concatenated)
+            context = self.pixel_context_projection(concatenated)
+            context = context + self.pixel_context_mlp(self.pixel_context_norm(context))
+        else:
+            pixel_tokens, context = self.pixel_layer_fusion(features.all)
         for block in self.pixel_blocks:
             pixel_tokens = self._plain_block(block, pixel_tokens)
-        context = self.pixel_context_projection(features)
-        context = context + self.pixel_context_mlp(self.pixel_context_norm(context))
         coarse = self.coarse_patch_projection(pixel_tokens).reshape(
             batch * TOKEN_COUNT, 3, PATCH_SIZE, PATCH_SIZE
         )
@@ -440,15 +595,16 @@ class DDT(nn.Module):
             stride=PATCH_SIZE,
         )
 
-    def forward(
+    def forward_semantic(
         self,
         noisy_tokens: Tensor,
         timestep: Tensor,
         labels: Tensor,
         *,
-        decode_pixels: bool,
+        capture_pixel_features: bool,
         force_class_drop: Tensor | None = None,
-    ) -> DDTOutput:
+    ) -> tuple[DDTOutput, PixelFeatureBundle | None]:
+        """Run semantic flow and optionally retain the selected raw hidden states."""
         if noisy_tokens.ndim != 3 or noisy_tokens.shape[1:] != (
             TOKEN_COUNT,
             self.config.token_dim,
@@ -471,7 +627,7 @@ class DDT(nn.Module):
                 states = self._plain_block(block, states)
                 if depth == self.config.base_prediction_depth:
                     base_spatial = states[:, :TOKEN_COUNT]
-                if decode_pixels and depth in selected_encoder:
+                if capture_pixel_features and depth in selected_encoder:
                     encoder_features[depth] = states[:, :TOKEN_COUNT]
             assert base_spatial is not None
             final_spatial = states[:, :TOKEN_COUNT]
@@ -484,20 +640,58 @@ class DDT(nn.Module):
             selected_decoder = set(self.config.pixel_decoder.decoder_features)
             for depth, block in enumerate(self.semantic_decoder_blocks, start=1):
                 decoded = self._decoder_block(block, decoded, conditioning)
-                if decode_pixels and depth in selected_decoder:
+                if capture_pixel_features and depth in selected_decoder:
                     decoder_features[depth] = decoded
             full_x0 = self.full_head(decoded, conditioning)
-            if not decode_pixels:
-                return DDTOutput(full_x0, base_x0)
-
-            features = torch.cat(
-                [
-                    *(encoder_features[index] for index in self.config.pixel_decoder.encoder_features),
-                    *(decoder_features[index] for index in self.config.pixel_decoder.decoder_features),
-                ],
-                dim=-1,
+            output = DDTOutput(full_x0, base_x0)
+            if not capture_pixel_features:
+                return output, None
+            features = PixelFeatureBundle(
+                tuple(
+                    encoder_features[index]
+                    for index in self.config.pixel_decoder.encoder_features
+                ),
+                tuple(
+                    decoder_features[index]
+                    for index in self.config.pixel_decoder.decoder_features
+                ),
             )
-            return DDTOutput(full_x0, base_x0, self._decode_pixels(features))
+            return output, features
+
+    def decode_pixel_features(
+        self,
+        features: PixelFeatureBundle,
+        *,
+        detach_flow: bool = False,
+    ) -> Tensor:
+        if detach_flow:
+            features = features.detached()
+        with self._autocast(features.all[0]):
+            return self._decode_pixels(features)
+
+    def forward(
+        self,
+        noisy_tokens: Tensor,
+        timestep: Tensor,
+        labels: Tensor,
+        *,
+        decode_pixels: bool,
+        force_class_drop: Tensor | None = None,
+    ) -> DDTOutput:
+        semantic, features = self.forward_semantic(
+            noisy_tokens,
+            timestep,
+            labels,
+            capture_pixel_features=decode_pixels,
+            force_class_drop=force_class_drop,
+        )
+        if features is None:
+            return semantic
+        return DDTOutput(
+            semantic.full_x0,
+            semantic.base_x0,
+            self.decode_pixel_features(features),
+        )
 
 
 def build_model(config: ModelConfig) -> DDT:

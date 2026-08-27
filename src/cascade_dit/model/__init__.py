@@ -4,7 +4,9 @@ from .ddt import (
     DDTEncoderBlock,
     DDTOutput,
     DiPPatchDecoder,
+    LayerAttentionFusion,
     LocalDecoder,
+    PixelFeatureBundle,
     PixelTransformerBlock,
     build_model,
 )
@@ -15,7 +17,9 @@ __all__ = [
     "DDTEncoderBlock",
     "DDTOutput",
     "DiPPatchDecoder",
+    "LayerAttentionFusion",
     "LocalDecoder",
+    "PixelFeatureBundle",
     "PixelTransformerBlock",
     "build_model",
 ]
