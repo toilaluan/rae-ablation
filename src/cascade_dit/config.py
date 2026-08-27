@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 9
+CONFIG_SCHEMA_VERSION = 10
 
 IMAGE_SIZE = 128
 PATCH_SIZE = 16
@@ -265,8 +265,19 @@ class SamplingConfig:
     solver: str = "euler"
     timestep_shift: float = 1.0
     internal_guidance: InternalGuidanceConfig = field(default_factory=InternalGuidanceConfig)
+    final_decode_timestep: float = 0.5
     batch_size: int = 32
     seed: int = 0
+
+
+@dataclass
+class ReconstructionValidationConfig:
+    split: str = "validation"
+    cache_directory: str = "data/reconstruction-validation"
+    manifest: str = "manifest.json"
+    samples_per_class: int = 1
+    batch_size: int = 32
+    preview_samples: int = 8
 
 
 @dataclass
@@ -274,6 +285,9 @@ class ValidationConfig:
     interval_epochs: int = 5
     batches: int = 32
     periodic_samples: int = 10_000
+    reconstruction: ReconstructionValidationConfig = field(
+        default_factory=ReconstructionValidationConfig
+    )
 
 
 @dataclass
@@ -417,6 +431,9 @@ class ExperimentConfig:
         guidance = self.sampling.internal_guidance
         if not 0 <= guidance.t_min < guidance.t_max <= 1:
             raise ValueError("internal-guidance interval must satisfy 0 <= t_min < t_max <= 1")
+        decode_timestep = self.sampling.final_decode_timestep
+        if not math.isfinite(decode_timestep) or not 0 <= decode_timestep <= 1:
+            raise ValueError("sampling.final_decode_timestep must be in [0,1]")
         if self.data.workers < 0 or self.data.prefetch_factor < 1:
             raise ValueError("data workers must be non-negative and prefetch_factor positive")
         if self.data.max_samples is not None and self.data.max_samples < 1:
@@ -436,6 +453,21 @@ class ExperimentConfig:
         )
         if self.validation.periodic_samples > self.evaluation.num_samples:
             raise ValueError("periodic validation samples cannot exceed final evaluation samples")
+        reconstruction = self.validation.reconstruction
+        if not all(
+            (
+                reconstruction.split,
+                reconstruction.cache_directory,
+                reconstruction.manifest,
+            )
+        ):
+            raise ValueError("reconstruction validation paths and split cannot be empty")
+        _positive(
+            "reconstruction validation settings",
+            reconstruction.samples_per_class,
+            reconstruction.batch_size,
+            reconstruction.preview_samples,
+        )
 
     def _validate_model(self) -> None:
         model = self.model
@@ -610,4 +642,11 @@ def load_config(
 
 
 def load_checkpoint_config(path: str | Path) -> ExperimentConfig:
-    return _structured_config(_require_current(json.loads(Path(path).read_text()), path))
+    values = json.loads(Path(path).read_text())
+    if isinstance(values, dict) and values.get("schema_version") == 9:
+        values = dict(values)
+        sampling = dict(values.get("sampling", {}))
+        sampling["final_decode_timestep"] = 0.0
+        values["sampling"] = sampling
+        values["schema_version"] = CONFIG_SCHEMA_VERSION
+    return _structured_config(_require_current(values, path))

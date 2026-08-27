@@ -116,9 +116,12 @@ def sample_semantic_then_pixel(
     internal_guidance_scale: float = 1.78,
     internal_guidance_t_min: float = 0.10,
     internal_guidance_t_max: float = 1.0,
+    final_decode_timestep: float = 0.5,
     denominator_floor: float = 0.05,
 ) -> Tensor:
-    """Integrate semantics, then run one un-guided conditional t=0 RGB decode."""
+    """Integrate semantics, then run one conditional RGB decode at a fixed time."""
+    if not math.isfinite(final_decode_timestep) or not 0 <= final_decode_timestep <= 1:
+        raise ValueError("final decode timestep must be in [0,1]")
     semantic = sample_tokens(
         model,
         noise,
@@ -131,8 +134,13 @@ def sample_semantic_then_pixel(
         internal_guidance_t_max=internal_guidance_t_max,
         denominator_floor=denominator_floor,
     )
-    zero = torch.zeros(noise.shape[0], device=noise.device, dtype=torch.float32)
-    output = model(semantic, zero, labels, decode_pixels=True)
+    decode_time = torch.full(
+        (noise.shape[0],),
+        final_decode_timestep,
+        device=noise.device,
+        dtype=torch.float32,
+    )
+    output = model(semantic, decode_time, labels, decode_pixels=True)
     pixels = getattr(output, "rgb", None)
     if not isinstance(pixels, Tensor):
         pixels = getattr(output, "pixels", None)

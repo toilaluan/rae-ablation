@@ -5,13 +5,18 @@ import json
 import pytest
 
 import cascade_dit
-from cascade_dit.config import CONFIG_SCHEMA_VERSION, ExperimentConfig, load_config
+from cascade_dit.config import (
+    CONFIG_SCHEMA_VERSION,
+    ExperimentConfig,
+    load_checkpoint_config,
+    load_config,
+)
 
 
 def test_checked_in_joint_schema_config() -> None:
     assert set(cascade_dit.__all__) == {"DDT", "DDTOutput", "build_model", "load_config"}
     config = load_config("configs/experiment.yaml")
-    assert config.schema_version == CONFIG_SCHEMA_VERSION == 9
+    assert config.schema_version == CONFIG_SCHEMA_VERSION == 10
     assert config.total_epochs == config.training.epochs == 200
     assert config.training.timestep_shift == 4
     assert config.model.base_prediction_depth == 4
@@ -45,11 +50,20 @@ def test_checked_in_joint_schema_config() -> None:
         "t_min": 0.1,
         "t_max": 1.0,
     }
+    assert config.sampling.final_decode_timestep == 0.5
+    assert vars(config.validation.reconstruction) == {
+        "split": "validation",
+        "cache_directory": "data/reconstruction-validation",
+        "manifest": "manifest.json",
+        "samples_per_class": 1,
+        "batch_size": 32,
+        "preview_samples": 8,
+    }
     assert not hasattr(config.training, "mode")
     assert not hasattr(config.model, "decoder")
 
 
-@pytest.mark.parametrize("version", [5, 6, 7, 8])
+@pytest.mark.parametrize("version", [5, 6, 7, 8, 9])
 def test_old_config_schemas_are_rejected(tmp_path, version: int) -> None:
     path = tmp_path / f"v{version}.json"
     path.write_text(json.dumps({"schema_version": version}))
@@ -69,8 +83,23 @@ def test_old_config_schemas_are_rejected(tmp_path, version: int) -> None:
     ],
 )
 def test_removed_fields_are_rejected(field: str) -> None:
-    with pytest.raises(ValueError, match="schema-v9"):
+    with pytest.raises(ValueError, match="schema-v10"):
         load_config("configs/experiment.yaml", [field])
+
+
+def test_schema_v9_checkpoint_config_preserves_legacy_decode_timestep(tmp_path) -> None:
+    values = ExperimentConfig().as_dict()
+    values["schema_version"] = 9
+    values["sampling"].pop("final_decode_timestep")
+    values["validation"].pop("reconstruction")
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(values))
+
+    migrated = load_checkpoint_config(path)
+
+    assert migrated.schema_version == 10
+    assert migrated.sampling.final_decode_timestep == 0.0
+    assert migrated.validation.reconstruction.samples_per_class == 1
 
 
 def test_feature_base_and_weight_validation() -> None:
@@ -124,4 +153,9 @@ def test_internal_guidance_interval_validation() -> None:
     config = ExperimentConfig()
     config.sampling.internal_guidance.t_min = 1
     with pytest.raises(ValueError, match="internal-guidance interval"):
+        config.validate()
+
+    config = ExperimentConfig()
+    config.sampling.final_decode_timestep = float("nan")
+    with pytest.raises(ValueError, match="final_decode_timestep"):
         config.validate()

@@ -1,4 +1,4 @@
-schema_version: 9
+schema_version: 10
 
 experiment:
   name: joint-semantic-pixel-ddt
@@ -150,6 +150,7 @@ sampling:
     scale: 1.78
     t_min: 0.10
     t_max: 1.0
+  final_decode_timestep: 0.5
   batch_size: 32
   seed: 0
 
@@ -157,6 +158,13 @@ validation:
   interval_epochs: 5
   batches: 32
   periodic_samples: 10000
+  reconstruction:
+    split: validation
+    cache_directory: data/reconstruction-validation
+    manifest: manifest.json
+    samples_per_class: 1
+    batch_size: 32
+    preview_samples: 8
 
 checkpoint:
   directory: checkpoints

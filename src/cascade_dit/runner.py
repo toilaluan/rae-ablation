@@ -44,6 +44,11 @@ from .preparation import (
     representation_manifest_fingerprint,
     validate_manifest_compatibility,
 )
+from .reconstruction import (
+    ReconstructionBatchPreprocessor,
+    load_reconstruction_manifest,
+    make_reconstruction_loader,
+)
 from .representations import RepresentationManifest
 from .rng import RNGStreams
 from .sample_runtime import (
@@ -60,7 +65,14 @@ from .training import (
     compute_training_loss,
     prepare_training_path,
 )
-from .validation import ValidationPlan, create_validation_plan, validate_joint_loss
+from .validation import (
+    ValidationPlan,
+    create_validation_plan,
+    save_reconstruction_evaluation,
+    save_reconstruction_preview,
+    validate_joint_loss,
+    validate_reconstruction,
+)
 
 ImageLog = Callable[[str, str, int, str], None]
 
@@ -215,6 +227,7 @@ class ExperimentRunner:
             internal_guidance_scale=guidance.scale,
             internal_guidance_t_min=guidance.t_min,
             internal_guidance_t_max=guidance.t_max,
+            final_decode_timestep=values.final_decode_timestep,
             batch_size=values.batch_size,
             seed=values.seed,
         )
@@ -263,6 +276,7 @@ class ExperimentRunner:
         *,
         completed_epoch: int,
         training_complete: bool,
+        checkpoint_hash: str | None = None,
     ) -> tuple[Path | None, Path, int, dict[str, float] | None]:
         model.eval()
         sample_count = (
@@ -276,8 +290,10 @@ class ExperimentRunner:
             / f"epoch-{completed_epoch:04d}"
         )
         parameters = self._sampling_parameters()
-        digest = state_dict_sha256(self.ema.state_dict()) if self.rank == 0 else None
-        digest = broadcast_string(digest, self.rank)
+        digest = checkpoint_hash
+        if digest is None:
+            digest = state_dict_sha256(self.ema.state_dict()) if self.rank == 0 else None
+            digest = broadcast_string(digest, self.rank)
         cached = self._cached_evaluation(output, sample_count, digest, parameters)
         if cached is not None:
             return None, output, sample_count, cached
@@ -309,6 +325,7 @@ class ExperimentRunner:
                     internal_guidance_scale=parameters.internal_guidance_scale,
                     internal_guidance_t_min=parameters.internal_guidance_t_min,
                     internal_guidance_t_max=parameters.internal_guidance_t_max,
+                    final_decode_timestep=parameters.final_decode_timestep,
                     denominator_floor=self.config.objective.denominator_floor,
                 )
             return pixels.float().clamp(0, 1)
@@ -362,6 +379,27 @@ class ExperimentRunner:
         if not isinstance(payload[0], dict):
             raise RuntimeError("evaluation did not produce metrics")
         return {str(name): float(value) for name, value in payload[0].items()}
+
+    def _reconstruction_validation_inputs(self) -> tuple[object, object, str]:
+        loader = getattr(self, "reconstruction_loader", None)
+        preprocessor = getattr(self, "reconstruction_batch_preprocessor", None)
+        fingerprint = getattr(self, "reconstruction_fingerprint", None)
+        if loader is None or preprocessor is None or fingerprint is None:
+            manifest = load_reconstruction_manifest(self.config)
+            loader = make_reconstruction_loader(
+                self.config,
+                rank=self.rank,
+                world_size=self.world_size,
+            )
+            preprocessor = ReconstructionBatchPreprocessor(
+                self.batch_preprocessor.semantic_statistics,
+                self.device,
+            )
+            fingerprint = manifest.preparation_fingerprint
+            self.reconstruction_loader = loader
+            self.reconstruction_batch_preprocessor = preprocessor
+            self.reconstruction_fingerprint = fingerprint
+        return loader, preprocessor, str(fingerprint)
 
     def _decoder_phase(self, completed_epoch: int | None = None) -> str:
         epoch = self.completed_epoch if completed_epoch is None else completed_epoch
@@ -735,6 +773,12 @@ class ExperimentRunner:
             final_evaluation: tuple[dict[str, float], int] | None = None
             if complete or (interval > 0 and self.completed_epoch % interval == 0):
                 ema_model = self.ema.to_model(self.model).to(self.device)
+                ema_digest = (
+                    state_dict_sha256(self.ema.state_dict())
+                    if self.rank == 0
+                    else None
+                )
+                ema_digest = broadcast_string(ema_digest, self.rank)
                 validation = validate_joint_loss(
                     ema_model,
                     loader,
@@ -748,11 +792,64 @@ class ExperimentRunner:
                     {"epoch": epoch, "step": self.global_step}
                     | {f"validation/{name}": value for name, value in validation.items()}
                 )
+                (
+                    reconstruction_loader,
+                    reconstruction_preprocessor,
+                    reconstruction_fingerprint,
+                ) = self._reconstruction_validation_inputs()
+                reconstruction = validate_reconstruction(
+                    ema_model,
+                    reconstruction_loader,
+                    reconstruction_preprocessor,
+                    self.config,
+                    self.lpips_model,
+                    device=self.device,
+                )
+                reconstruction_output = (
+                    Path(self.config.experiment.output_directory)
+                    / "validation"
+                    / f"epoch-{self.completed_epoch:04d}"
+                )
+                self.log(
+                    {
+                        "epoch": epoch,
+                        "step": self.global_step,
+                        "validation/reconstruction_samples": reconstruction.sample_count,
+                        "validation/reconstruction_timestep": (
+                            self.config.sampling.final_decode_timestep
+                        ),
+                    }
+                    | {
+                        f"validation/reconstruction_{name}": value
+                        for name, value in reconstruction.metrics.items()
+                    }
+                )
+                if self.rank == 0:
+                    preview_path = reconstruction_output / "reconstructions.png"
+                    save_reconstruction_preview(reconstruction, preview_path)
+                    save_reconstruction_evaluation(
+                        reconstruction_output / "reconstruction.json",
+                        reconstruction,
+                        timestep=self.config.sampling.final_decode_timestep,
+                        cache_fingerprint=reconstruction_fingerprint,
+                        ema_sha256=ema_digest,
+                    )
+                    self.log_image(
+                        str(preview_path),
+                        (
+                            "EMA validation reconstructions, "
+                            f"epoch={self.completed_epoch}, "
+                            f"t={self.config.sampling.final_decode_timestep:g}"
+                        ),
+                        self.global_step,
+                        "validation/reconstructions",
+                    )
                 archive, evaluation_output, sample_count, cached = (
                     self._generate_evaluation(
                         ema_model,
                         completed_epoch=self.completed_epoch,
                         training_complete=complete,
+                        checkpoint_hash=ema_digest,
                     )
                 )
                 del ema_model
@@ -821,6 +918,7 @@ class ExperimentRunner:
                 "t_min": guidance.t_min,
                 "t_max": guidance.t_max,
             },
+            "final_decode_timestep": self.config.sampling.final_decode_timestep,
             "wall_clock_seconds": (
                 self.elapsed_before_resume + time.perf_counter() - self.started_at
             ),

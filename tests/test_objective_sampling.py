@@ -108,7 +108,7 @@ class JointOracle(nn.Module):
         return DDTOutput(full, base, rgb)
 
 
-def test_sampling_uses_one_conditional_call_per_ode_call_and_one_t0_decode() -> None:
+def test_sampling_uses_one_conditional_call_per_ode_call_and_fixed_time_decode() -> None:
     model = JointOracle()
     noise = torch.zeros(2, 3, 4)
     sampled = sample_semantic_then_pixel(
@@ -117,13 +117,14 @@ def test_sampling_uses_one_conditional_call_per_ode_call_and_one_t0_decode() -> 
         torch.tensor([1, 2]),
         steps=3,
         internal_guidance_scale=1.78,
+        final_decode_timestep=0.25,
     )
     ode_calls = [call for call in model.calls if not call[2]]
     pixel_calls = [call for call in model.calls if call[2]]
     assert len(ode_calls) == 3
     assert all(values.shape[0] == 2 for values, _time, _decode in ode_calls)
     assert len(pixel_calls) == 1
-    assert torch.equal(pixel_calls[0][1], torch.zeros(2))
+    assert torch.equal(pixel_calls[0][1], torch.full((2,), 0.25))
     assert torch.all(sampled == 6)
 
 

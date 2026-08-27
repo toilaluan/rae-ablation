@@ -12,6 +12,7 @@ from cascade_dit.sample_runtime import (
     SamplingParameters,
     prune_sample_archive,
     sample_to_archive,
+    sampling_output_name,
 )
 
 LABELS = torch.tensor([0, 1, 0, 1, 0, 1], dtype=torch.int64)
@@ -101,3 +102,11 @@ def test_two_process_sampling_matches_single_process(tmp_path) -> None:
     manifest = json.loads((distributed_output / "samples.json").read_text())
     assert manifest["completed_samples"] == 6
     assert manifest["sampling_plan_hash"] == "plan"
+
+
+def test_final_decode_timestep_is_part_of_sampling_artifact_identity() -> None:
+    first = SamplingParameters(final_decode_timestep=0.0)
+    second = SamplingParameters(final_decode_timestep=0.5)
+    assert sampling_output_name(1000, first) != sampling_output_name(1000, second)
+    with pytest.raises(ValueError, match="final decode timestep"):
+        SamplingParameters(final_decode_timestep=1.1).validate()

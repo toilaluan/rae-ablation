@@ -69,9 +69,12 @@ Use the alternative fusion with:
 
 ## Flow preparation and training
 
-Fresh preparation writes only the selected DINO BF16 cache and its channel
-statistics. Manifest schema v3 remains reusable when an existing compatible manifest
-also contains unused RGB stages or statistics.
+Fresh preparation writes the selected training DINO BF16 cache and its channel
+statistics. It also writes a separate approximately 94 MiB reconstruction-validation
+cache containing the first ImageNet validation example from each class. Existing
+compatible training caches remain reusable; only the held-out cache is added.
+Manifest schema v3 remains reusable when an existing training manifest also contains
+unused RGB stages or statistics.
 
 ```bash
 torchrun --standalone --nproc-per-node=8 scripts/prepare_representations.py \
@@ -107,11 +110,20 @@ trunk. `samples_per_batch=M` selects the `M` lowest-timestep (cleanest) samples 
 rank with fixed-shape `topk` indices and runs the pixel decoder only on that subset.
 The checked-in preset uses `64`; setting it to `null` uses the full local batch.
 
+At every validation interval, the EMA model also reconstructs the deterministic
+1,000-image held-out set. Clean DINO tokens are passed unchanged while the model is
+conditioned at `sampling.final_decode_timestep` (`0.5` by default). Validation logs
+sample-weighted RGB L1, VGG-LPIPS, and PSNR, and saves an eight-row original versus
+reconstruction preview. The stochastic joint-loss validation and periodic 10k FID
+remain enabled.
+
 ## Sampling
 
 Sampling integrates only the internally guided semantic flow. It then performs one
-conditional, un-guided `t=0` forward with pixel decoding enabled. RGB is clamped only
-while writing previews and sample archives.
+conditional forward at `sampling.final_decode_timestep` with pixel decoding enabled.
+The checked configuration uses `0.5`; `scripts/sample.py` exposes
+`--final-decode-timestep` for explicit overrides. RGB is clamped only while writing
+previews and sample archives.
 
 ```bash
 torchrun --standalone --nproc-per-node=8 scripts/sample.py \
@@ -120,8 +132,10 @@ torchrun --standalone --nproc-per-node=8 scripts/sample.py \
   --evaluate
 ```
 
-Configuration schema v9 and checkpoint/training-state schema v7 reject older joint
-configurations and checkpoints. Standalone decoder artifacts use schema v1. Joint checkpoints embed all decoder weights,
+Configuration schema v10 and checkpoint/training-state schema v7 reject older user
+configurations. Schema-v9 checkpoint configs are migrated with a legacy final-decode
+timestep of `0.0`, preserving their previous sampling behavior. Standalone decoder
+artifacts use schema v1. Joint checkpoints embed all decoder weights,
 normalization buffers, and the selected pretraining-weight checksum, so sampling and
 resume do not require the original standalone checkpoint.
 

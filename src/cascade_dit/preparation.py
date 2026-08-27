@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -14,6 +15,14 @@ from .data import (
     data_fingerprint,
     load_imagenet,
     validate_joint_manifest,
+)
+from .reconstruction import (
+    ReconstructionCacheManifest,
+    ReconstructionPreparationDataset,
+    load_reconstruction_manifest,
+    reconstruction_data_config,
+    reconstruction_preparation_fingerprint,
+    select_class_balanced_indices,
 )
 from .representations import (
     ChannelStatistics,
@@ -368,3 +377,113 @@ def prepare_representations(
         manifest.save(manifest_path)
     _barrier()
     return RepresentationManifest.load(manifest_path)
+
+
+def _reconstruction_loader(
+    dataset: ReconstructionPreparationDataset,
+    positions: Tensor,
+    config: ExperimentConfig,
+) -> DataLoader:
+    workers = config.data.workers
+    return DataLoader(
+        Subset(dataset, positions.tolist()),
+        batch_size=config.representations.cache_batch_size,
+        shuffle=False,
+        num_workers=workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=workers > 0,
+        prefetch_factor=config.data.prefetch_factor if workers > 0 else None,
+    )
+
+
+def prepare_reconstruction_representations(
+    config: ExperimentConfig,
+    *,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> ReconstructionCacheManifest:
+    values = config.validation.reconstruction
+    root = Path(values.cache_directory)
+    manifest_path = root / values.manifest
+    data = reconstruction_data_config(config)
+    dataset = load_imagenet(data, data.image_size)
+    source_indices, labels = select_class_balanced_indices(
+        dataset,
+        num_classes=config.model.num_classes,
+        samples_per_class=values.samples_per_class,
+    )
+    semantic = config.representations.semantic
+    expected = ReconstructionCacheManifest(
+        dataset_size=len(source_indices),
+        dataset_fingerprint=data_fingerprint(data, data.image_size),
+        encoder_fingerprint=encoder_fingerprint(config.encoder, [semantic.layer]),
+        preparation_fingerprint=reconstruction_preparation_fingerprint(
+            config, source_indices, labels
+        ),
+        representation_name=semantic.name,
+        layer=semantic.layer,
+        source_indices=source_indices,
+        labels=labels,
+        cache_file=f"{semantic.name}.bf16",
+        completion_file=f"{semantic.name}.completion.u8",
+    )
+    if manifest_path.is_file():
+        existing = load_reconstruction_manifest(config, require_complete=False)
+        if existing.complete:
+            return load_reconstruction_manifest(config)
+        if existing != expected:
+            raise ValueError("unfinished reconstruction cache identity changed")
+
+    error: list[str | None] = [None]
+    if rank == 0:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            if not manifest_path.is_file() and any(root.iterdir()):
+                raise ValueError(
+                    "untracked reconstruction-cache files already exist; choose a fresh "
+                    "directory or move them explicitly"
+                )
+            preflight_representation_capacity(root, len(source_indices), [semantic.name])
+            LayerMemmap.initialize(root, semantic.name, len(source_indices))
+            if not manifest_path.is_file():
+                expected.save(manifest_path)
+        except Exception as exception:
+            error[0] = f"{type(exception).__name__}: {exception}"
+    if world_size > 1:
+        torch.distributed.broadcast_object_list(error, src=0)
+    if error[0] is not None:
+        raise RuntimeError(error[0])
+    _barrier()
+
+    manifest = load_reconstruction_manifest(config, require_complete=False)
+    cache = LayerMemmap.initialize(root, semantic.name, manifest.dataset_size)
+    positions = torch.from_numpy(cache.pending_indices(rank, world_size))
+    if positions.numel():
+        selected = ReconstructionPreparationDataset(dataset, source_indices, labels)
+        encoder = load_dino_encoder(
+            config.encoder,
+            [semantic.layer],
+            device,
+            compile_config=config.compile,
+        )
+        processed = 0
+        for pixels, cache_positions in _reconstruction_loader(
+            selected, positions, config
+        ):
+            processed += len(cache_positions)
+            if rank == 0:
+                print(
+                    f"reconstruction semantic cache: {processed}/{len(positions)}",
+                    flush=True,
+                )
+            outputs = encoder(pixels.to(device, non_blocking=True))[semantic.layer]
+            cache.write(cache_positions, outputs)
+        del encoder
+    _barrier()
+    if rank == 0:
+        if cache.pending_indices().size:
+            raise RuntimeError("reconstruction semantic cache is incomplete")
+        replace(manifest, complete=True).save(manifest_path)
+    _barrier()
+    return load_reconstruction_manifest(config)

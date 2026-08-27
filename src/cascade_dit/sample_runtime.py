@@ -17,7 +17,7 @@ import torch
 from PIL import Image, ImageDraw
 from torch import Tensor
 
-SAMPLING_MANIFEST_SCHEMA_VERSION = 4
+SAMPLING_MANIFEST_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,7 @@ class SamplingParameters:
     internal_guidance_scale: float = 1.78
     internal_guidance_t_min: float = 0.10
     internal_guidance_t_max: float = 1.0
+    final_decode_timestep: float = 0.5
     batch_size: int = 32
     seed: int = 0
 
@@ -47,6 +48,11 @@ class SamplingParameters:
             raise ValueError(
                 "internal-guidance interval must satisfy 0 <= t_min < t_max <= 1"
             )
+        if (
+            not math.isfinite(self.final_decode_timestep)
+            or not 0 <= self.final_decode_timestep <= 1
+        ):
+            raise ValueError("final decode timestep must be in [0,1]")
 
 
 def checkpoint_sha256(path: str | Path) -> str:
@@ -104,6 +110,7 @@ def sampling_output_name(num_samples: int, parameters: SamplingParameters) -> st
     return (
         f"samples-{parameters.solver}-n{num_samples}-steps{parameters.steps}"
         f"-ig{parameters.internal_guidance_scale:g}-shift{parameters.timestep_shift:g}"
+        f"-decode{parameters.final_decode_timestep:g}"
     )
 
 

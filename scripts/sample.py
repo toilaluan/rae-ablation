@@ -34,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--internal-guidance-scale", type=float)
     parser.add_argument("--internal-guidance-t-min", type=float)
     parser.add_argument("--internal-guidance-t-max", type=float)
+    parser.add_argument("--final-decode-timestep", type=float)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--evaluate", action="store_true")
     parser.add_argument("--reference-npz", type=Path)
@@ -61,6 +62,9 @@ def main() -> None:
         ),
         internal_guidance_t_max=float(
             _pick(arguments.internal_guidance_t_max, defaults.internal_guidance.t_max)
+        ),
+        final_decode_timestep=float(
+            _pick(arguments.final_decode_timestep, defaults.final_decode_timestep)
         ),
         batch_size=int(_pick(arguments.batch_size, defaults.batch_size)),
         seed=int(_pick(arguments.seed, defaults.seed)),
@@ -92,6 +96,7 @@ def main() -> None:
                 internal_guidance_scale=parameters.internal_guidance_scale,
                 internal_guidance_t_min=parameters.internal_guidance_t_min,
                 internal_guidance_t_max=parameters.internal_guidance_t_max,
+                final_decode_timestep=parameters.final_decode_timestep,
                 denominator_floor=config.objective.denominator_floor,
             )
         return pixels.float().clamp(0, 1)
