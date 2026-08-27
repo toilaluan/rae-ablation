@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cascade-dit"
-version = "0.5.0"
-description = "Joint semantic-flow DDT with internal guidance and DiP RGB decoding"
+version = "0.6.0"
+description = "Semantic-pretrained pixel decoder with flow-conditioned DDT generation"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

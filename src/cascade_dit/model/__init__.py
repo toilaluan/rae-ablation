@@ -6,8 +6,10 @@ from .ddt import (
     DiPPatchDecoder,
     LayerAttentionFusion,
     LocalDecoder,
+    PixelDecoderBackbone,
     PixelFeatureBundle,
     PixelTransformerBlock,
+    SemanticPixelDecoder,
     build_model,
 )
 
@@ -19,7 +21,9 @@ __all__ = [
     "DiPPatchDecoder",
     "LayerAttentionFusion",
     "LocalDecoder",
+    "PixelDecoderBackbone",
     "PixelFeatureBundle",
     "PixelTransformerBlock",
+    "SemanticPixelDecoder",
     "build_model",
 ]

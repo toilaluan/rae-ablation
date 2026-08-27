@@ -34,6 +34,31 @@ def _dip_patch_flops(context_width: int) -> int:
     return total
 
 
+def _pixel_backbone_flops(config: ExperimentConfig) -> int:
+    model = config.model
+    pixel = model.pixel_decoder
+    ratio = model.feedforward.mlp_ratio
+    total = _swiglu_flops(TOKEN_COUNT, pixel.width, ratio)
+    total += pixel.depth * _transformer_flops(TOKEN_COUNT, pixel.width, ratio)
+    total += 2 * TOKEN_COUNT * pixel.width * (3 * PATCH_SIZE * PATCH_SIZE)
+    total += TOKEN_COUNT * _dip_patch_flops(pixel.width)
+    return total
+
+
+def semantic_pixel_decoder_forward_flops(config: ExperimentConfig) -> int:
+    pixel = config.model.pixel_decoder
+    projections = 4 * TOKEN_COUNT * TOKEN_DIM * pixel.width
+    return projections + _pixel_backbone_flops(config)
+
+
+def pixel_pretraining_flops_per_step(config: ExperimentConfig) -> int:
+    return (
+        config.pixel_pretraining.optimizer.global_batch_size
+        * 3
+        * semantic_pixel_decoder_forward_flops(config)
+    )
+
+
 def ddt_forward_flops(config: ExperimentConfig, *, decode_pixels: bool = True) -> int:
     model = config.model
     encoder = model.encoder
@@ -63,7 +88,6 @@ def ddt_forward_flops(config: ExperimentConfig, *, decode_pixels: bool = True) -
     )
     if pixel.fusion.kind == "concatenate":
         total += 4 * TOKEN_COUNT * fusion * pixel.width
-        total += _swiglu_flops(TOKEN_COUNT, pixel.width, ratio)
     else:
         layer = pixel.fusion.layer_attention
         layer_tokens = (
@@ -74,9 +98,8 @@ def ddt_forward_flops(config: ExperimentConfig, *, decode_pixels: bool = True) -
             layer_tokens, layer.width, layer.mlp_ratio
         )
         total += 4 * TOKEN_COUNT * layer.width * pixel.width
-    total += pixel.depth * _transformer_flops(TOKEN_COUNT, pixel.width, ratio)
-    total += 2 * TOKEN_COUNT * pixel.width * (3 * PATCH_SIZE * PATCH_SIZE)
-    total += TOKEN_COUNT * _dip_patch_flops(pixel.width)
+    total += 4 * TOKEN_COUNT * (TOKEN_DIM + pixel.width) * pixel.width
+    total += _pixel_backbone_flops(config)
     return total
 
 
@@ -86,6 +109,7 @@ def model_flops_per_step(
     decoder_active: bool = True,
     decoder_updates: int = 1,
     decoder_sample_fraction: float = 1.0,
+    decoder_backbone_trainable: bool = True,
 ) -> int:
     if decoder_updates < 0 or (not decoder_active and decoder_updates):
         raise ValueError("decoder update count is inconsistent with decoder activity")
@@ -94,5 +118,13 @@ def model_flops_per_step(
     semantic = ddt_forward_flops(config, decode_pixels=False)
     decoder = ddt_forward_flops(config, decode_pixels=True) - semantic
     updates = decoder_updates if decoder_active else 0
-    decoder_cost = int(updates * decoder_sample_fraction * decoder)
-    return config.optimizer.global_batch_size * 3 * (semantic + decoder_cost)
+    backbone = _pixel_backbone_flops(config)
+    if decoder_backbone_trainable:
+        decoder_multiplier = 3 * decoder
+    else:
+        integration = decoder - backbone
+        decoder_multiplier = 3 * integration + 2 * backbone
+    decoder_cost = int(
+        updates * decoder_sample_fraction * decoder_multiplier
+    )
+    return config.optimizer.global_batch_size * (3 * semantic + decoder_cost)

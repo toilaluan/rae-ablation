@@ -11,28 +11,35 @@ from cascade_dit.config import CONFIG_SCHEMA_VERSION, ExperimentConfig, load_con
 def test_checked_in_joint_schema_config() -> None:
     assert set(cascade_dit.__all__) == {"DDT", "DDTOutput", "build_model", "load_config"}
     config = load_config("configs/experiment.yaml")
-    assert config.schema_version == CONFIG_SCHEMA_VERSION == 8
+    assert config.schema_version == CONFIG_SCHEMA_VERSION == 9
     assert config.total_epochs == config.training.epochs == 200
     assert config.training.timestep_shift == 4
-    assert config.model.base_prediction_depth == 8
+    assert config.model.base_prediction_depth == 4
     assert config.model.semantic_decoder.width == 2048
     assert config.model.semantic_decoder.depth == 2
-    assert config.model.pixel_decoder.depth == 3
-    assert config.model.pixel_decoder.encoder_features == [4, 8, 12]
+    assert config.model.pixel_decoder.depth == 8
+    assert config.model.pixel_decoder.encoder_features == [2, 4, 6, 8, 12]
     assert config.model.pixel_decoder.decoder_features == [1, 2]
-    assert config.model.pixel_decoder.fusion.kind == "concatenate"
+    assert config.model.pixel_decoder.fusion.kind == "layer_attention"
     assert vars(config.model.pixel_decoder.fusion.layer_attention) == {
-        "width": 768,
-        "depth": 1,
-        "heads": 12,
-        "mlp_ratio": 2.0,
+        "width": 1024,
+        "depth": 2,
+        "heads": 16,
+        "mlp_ratio": 4.0,
     }
     assert vars(config.training.decoder) == {
+        "pretrained_checkpoint": "artifacts/pixel-decoder/checkpoints/epoch-0050",
+        "pretrained_weights": "ema",
+        "frozen_epochs": 20,
         "update_interval": 1,
         "updates_per_active_step": 1,
         "backpropagate_to_flow": True,
-        "samples_per_batch": None,
+        "samples_per_batch": 64,
     }
+    assert config.pixel_pretraining.epochs == 50
+    assert config.pixel_pretraining.semantic_input_mode == "cached"
+    assert config.pixel_pretraining.data.image_column == "image"
+    assert config.pixel_pretraining.optimizer.scheduler.warmup_epochs == 5
     assert vars(config.sampling.internal_guidance) == {
         "scale": 1.78,
         "t_min": 0.1,
@@ -42,7 +49,7 @@ def test_checked_in_joint_schema_config() -> None:
     assert not hasattr(config.model, "decoder")
 
 
-@pytest.mark.parametrize("version", [5, 6, 7])
+@pytest.mark.parametrize("version", [5, 6, 7, 8])
 def test_old_config_schemas_are_rejected(tmp_path, version: int) -> None:
     path = tmp_path / f"v{version}.json"
     path.write_text(json.dumps({"schema_version": version}))
@@ -62,7 +69,7 @@ def test_old_config_schemas_are_rejected(tmp_path, version: int) -> None:
     ],
 )
 def test_removed_fields_are_rejected(field: str) -> None:
-    with pytest.raises(ValueError, match="schema-v8"):
+    with pytest.raises(ValueError, match="schema-v9"):
         load_config("configs/experiment.yaml", [field])
 
 
@@ -100,6 +107,16 @@ def test_feature_base_and_weight_validation() -> None:
     config = ExperimentConfig()
     config.training.decoder.samples_per_batch = 0
     with pytest.raises(ValueError, match="samples_per_batch"):
+        config.validate()
+
+    config = ExperimentConfig()
+    config.training.decoder.pretrained_weights = "best"
+    with pytest.raises(ValueError, match="pretrained_weights"):
+        config.validate()
+
+    config = ExperimentConfig()
+    config.pixel_pretraining.semantic_input_mode = "unknown"
+    with pytest.raises(ValueError, match="semantic_input_mode"):
         config.validate()
 
 

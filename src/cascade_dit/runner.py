@@ -34,11 +34,12 @@ from .objective import (
     semantic_flow_loss,
 )
 from .optim import (
-    build_optimizer,
+    build_joint_optimizer,
     build_training_scheduler,
     parameter_count,
     trainable_parameter_count,
 )
+from .pixel_artifact import load_pixel_decoder_artifact
 from .preparation import (
     representation_manifest_fingerprint,
     validate_manifest_compatibility,
@@ -112,7 +113,7 @@ def _different_config_fields(active: object, saved: object, prefix: str) -> list
 
 
 class ExperimentRunner:
-    """Single-phase joint semantic-flow and RGB-reconstruction training."""
+    """Semantic flow training with frozen-adapter and joint decoder stages."""
 
     def __init__(
         self,
@@ -138,6 +139,27 @@ class ExperimentRunner:
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self.rng.initialization.initial_seed())
             self.model: DDT = build_model(config.model).to(self.device)
+        self.pixel_decoder_fingerprint = ""
+        if resume is None:
+            artifact = load_pixel_decoder_artifact(
+                config.training.decoder.pretrained_checkpoint,
+                expected_config=config.model,
+                weights_kind=config.training.decoder.pretrained_weights,
+                device=self.device,
+            )
+            flow_statistics = self.batch_preprocessor.semantic_statistics
+            self.model.initialize_pretrained_pixel_decoder(
+                artifact.model,
+                flow_mean=flow_statistics.mean.to(self.device),
+                flow_std=flow_statistics.std.to(self.device),
+                decoder_mean=artifact.statistics.mean.to(self.device),
+                decoder_std=artifact.statistics.std.to(self.device),
+            )
+            self.pixel_decoder_fingerprint = artifact.weights_sha256
+            del artifact
+        self.model.set_pixel_decoder_frozen(
+            config.training.decoder.frozen_epochs > 0
+        )
         self.lpips_model = build_lpips(self.device)
         torch.manual_seed(config.experiment.seed + 90_000)
         if self.device.type == "cuda":
@@ -146,7 +168,7 @@ class ExperimentRunner:
         self.manager = CheckpointManager(
             Path(config.experiment.output_directory) / config.checkpoint.directory
         )
-        self.optimizer = build_optimizer(self.model, config.optimizer)
+        self.optimizer = build_joint_optimizer(self.model, config.optimizer)
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self._pending_scheduler_state: dict[str, object] | None = None
         self.completed_epoch = 0
@@ -157,6 +179,7 @@ class ExperimentRunner:
         self.elapsed_before_resume = 0.0
         if resume is not None:
             self.resume(_resolve_checkpoint_path(resume))
+        self._apply_decoder_phase()
         self.validation_plan = self._initialize_validation_plan()
 
     def _initialize_validation_plan(self) -> ValidationPlan:
@@ -340,6 +363,19 @@ class ExperimentRunner:
             raise RuntimeError("evaluation did not produce metrics")
         return {str(name): float(value) for name, value in payload[0].items()}
 
+    def _decoder_phase(self, completed_epoch: int | None = None) -> str:
+        epoch = self.completed_epoch if completed_epoch is None else completed_epoch
+        return (
+            "adapter_warmup"
+            if epoch < self.config.training.decoder.frozen_epochs
+            else "joint"
+        )
+
+    def _apply_decoder_phase(self) -> None:
+        self.model.set_pixel_decoder_frozen(
+            self._decoder_phase() == "adapter_warmup"
+        )
+
     def _resume_state(self, *, training_complete: bool) -> ResumeState:
         return ResumeState(
             schema_version=TRAINING_STATE_SCHEMA_VERSION,
@@ -356,6 +392,8 @@ class ExperimentRunner:
             rng_streams=self.rng.state_dict(),
             data_fingerprint=self.data_fingerprint,
             representation_fingerprint=self.representation_fingerprint,
+            pixel_decoder_fingerprint=self.pixel_decoder_fingerprint,
+            decoder_phase=self._decoder_phase(),
         )
 
     def resume(self, checkpoint: str | Path) -> None:
@@ -377,6 +415,13 @@ class ExperimentRunner:
             differences.extend(
                 _different_config_fields(active_values[name], saved_values[name], name)
             )
+        embedded_artifact_fields = {
+            "training.decoder.pretrained_checkpoint",
+            "training.decoder.pretrained_weights",
+        }
+        differences = [
+            name for name in differences if name not in embedded_artifact_fields
+        ]
         if differences and self.rank == 0:
             warnings.warn(
                 "active training configuration overrides checkpoint fields: "
@@ -404,6 +449,12 @@ class ExperimentRunner:
         self.estimated_flops = state.estimated_flops
         self.elapsed_before_resume = state.wall_clock_seconds
         self.started_at = time.perf_counter()
+        expected_phase = self._decoder_phase(state.completed_epoch)
+        if state.decoder_phase != expected_phase:
+            raise ValueError("checkpoint decoder phase is inconsistent with its epoch")
+        if not state.pixel_decoder_fingerprint:
+            raise ValueError("checkpoint has no pretrained pixel decoder provenance")
+        self.pixel_decoder_fingerprint = state.pixel_decoder_fingerprint
         self.rng.load_state_dict(state.rng_streams)
         if not differences and state.optimizer is not None:
             self.optimizer.load_state_dict(state.optimizer)
@@ -586,6 +637,14 @@ class ExperimentRunner:
         execution = self._build_execution(len(loader))
         guidance = self.config.sampling.internal_guidance
         for epoch in range(self.completed_epoch, self.config.total_epochs):
+            should_freeze = epoch < self.config.training.decoder.frozen_epochs
+            if (
+                isinstance(self.model, DDT)
+                and self.model.pixel_decoder_is_frozen() != should_freeze
+            ):
+                self.model.set_pixel_decoder_frozen(should_freeze)
+                del execution
+                execution = self._build_execution(len(loader))
             set_joint_loader_epoch(loader, epoch)
             execution.train()
             for raw_batch in loader:
@@ -649,6 +708,7 @@ class ExperimentRunner:
                     decoder_active=decoder_active,
                     decoder_updates=decoder_updates,
                     decoder_sample_fraction=decoder_sample_fraction,
+                    decoder_backbone_trainable=not should_freeze,
                 )
                 metrics: dict[str, float | int | str] = {
                     "epoch": epoch,
@@ -660,6 +720,10 @@ class ExperimentRunner:
                     "internal_guidance_t_min": guidance.t_min,
                     "internal_guidance_t_max": guidance.t_max,
                     "lr": self.optimizer.param_groups[0]["lr"],
+                    "decoder_phase": (
+                        "adapter_warmup" if should_freeze else "joint"
+                    ),
+                    "decoder_backbone_trainable": int(not should_freeze),
                 } | step_metrics
                 self.log(metrics)
                 if max_steps is not None and self.global_step >= max_steps:

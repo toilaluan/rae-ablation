@@ -14,8 +14,8 @@ from torch import Tensor, nn
 from .config import CONFIG_SCHEMA_VERSION, ExperimentConfig
 from .model.compile import clean_state_dict
 
-CHECKPOINT_SCHEMA_VERSION = 6
-TRAINING_STATE_SCHEMA_VERSION = 6
+CHECKPOINT_SCHEMA_VERSION = 7
+TRAINING_STATE_SCHEMA_VERSION = 7
 
 
 def _tensor_state(state: dict[str, object]) -> dict[str, Tensor]:
@@ -84,6 +84,8 @@ class ResumeState:
     rng_streams: dict[str, Any]
     data_fingerprint: str
     representation_fingerprint: str
+    pixel_decoder_fingerprint: str
+    decoder_phase: str
 
 
 class CheckpointManager:
@@ -114,6 +116,8 @@ class CheckpointManager:
             "wall_clock_seconds": state.wall_clock_seconds,
             "data_fingerprint": state.data_fingerprint,
             "representation_fingerprint": state.representation_fingerprint,
+            "pixel_decoder_fingerprint": state.pixel_decoder_fingerprint,
+            "decoder_phase": state.decoder_phase,
             "model_format": "plain",
             "optimizer_restorable": state.optimizer is not None,
         }
@@ -127,6 +131,8 @@ class CheckpointManager:
                 "global_step",
                 "data_fingerprint",
                 "representation_fingerprint",
+                "pixel_decoder_fingerprint",
+                "decoder_phase",
             )
             if idempotent and isinstance(existing, dict) and all(
                 existing.get(key) == metadata.get(key) for key in stable
@@ -202,6 +208,8 @@ class CheckpointManager:
             "training_complete",
             "data_fingerprint",
             "representation_fingerprint",
+            "pixel_decoder_fingerprint",
+            "decoder_phase",
         ):
             if metadata.get(name) != getattr(state, name):
                 raise ValueError(f"checkpoint {name} metadata is inconsistent")
@@ -210,6 +218,10 @@ class CheckpointManager:
             or state.global_step < 0
         ):
             raise ValueError("checkpoint training progress is invalid")
+        if state.decoder_phase not in {"adapter_warmup", "joint"}:
+            raise ValueError("checkpoint decoder phase is invalid")
+        if not state.pixel_decoder_fingerprint:
+            raise ValueError("checkpoint pixel decoder provenance is missing")
         for name, expected in (
             ("data_fingerprint", expected_data_fingerprint),
             ("representation_fingerprint", expected_representation_fingerprint),

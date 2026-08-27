@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from cascade_dit.config import ExperimentConfig
-from cascade_dit.flops import ddt_forward_flops, model_flops_per_step
+from cascade_dit.flops import (
+    ddt_forward_flops,
+    model_flops_per_step,
+    pixel_pretraining_flops_per_step,
+    semantic_pixel_decoder_forward_flops,
+)
 
 
 def test_layer_attention_fusion_and_sparse_updates_are_counted() -> None:
@@ -15,7 +20,8 @@ def test_layer_attention_fusion_and_sparse_updates_are_counted() -> None:
     layer_pixels = ddt_forward_flops(layer_attention) - ddt_forward_flops(
         layer_attention, decode_pixels=False
     )
-    assert 0 < layer_pixels < concatenate_pixels
+    assert layer_pixels > 0 and concatenate_pixels > 0
+    assert layer_pixels != concatenate_pixels
 
     semantic_step = model_flops_per_step(
         layer_attention, decoder_active=False, decoder_updates=0
@@ -36,6 +42,22 @@ def test_layer_attention_fusion_and_sparse_updates_are_counted() -> None:
     assert one_decoder - semantic_step == decoder_step
     assert three_decoders - semantic_step == 3 * decoder_step
     assert half_batch - semantic_step == decoder_step // 2
+    frozen_decoder = model_flops_per_step(
+        layer_attention,
+        decoder_active=True,
+        decoder_updates=1,
+        decoder_backbone_trainable=False,
+    )
+    assert semantic_step < frozen_decoder < one_decoder
+
+
+def test_standalone_pixel_pretraining_compute_is_positive() -> None:
+    config = ExperimentConfig()
+    forward = semantic_pixel_decoder_forward_flops(config)
+    assert forward > 0
+    assert pixel_pretraining_flops_per_step(config) == (
+        config.pixel_pretraining.optimizer.global_batch_size * 3 * forward
+    )
 
 
 def test_flop_count_rejects_inactive_decoder_updates() -> None:

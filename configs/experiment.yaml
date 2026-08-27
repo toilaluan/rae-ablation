@@ -1,4 +1,4 @@
-schema_version: 8
+schema_version: 9
 
 experiment:
   name: joint-semantic-pixel-ddt
@@ -27,6 +27,9 @@ training:
   epochs: 200
   timestep_shift: 4.0
   decoder:
+    pretrained_checkpoint: artifacts/pixel-decoder/checkpoints/epoch-0050
+    pretrained_weights: ema
+    frozen_epochs: 20
     update_interval: 1
     updates_per_active_step: 1
     backpropagate_to_flow: true
@@ -101,6 +104,43 @@ optimizer:
   gradient_clip: 1.0
   global_batch_size: 1024
   ema_decay: 0.999
+
+pixel_pretraining:
+  epochs: 50
+  semantic_input_mode: cached
+  data:
+    repository: benjamin-paine/imagenet-1k-256x256
+    revision: 1bd0400450249a7fe90c0aece37d0d03e7ea956a
+    train_split: train
+    validation_split: validation
+    image_column: image
+    image_size: 128
+    workers: 8
+    prefetch_factor: 2
+    max_train_samples: null
+    max_validation_samples: null
+    shuffle: true
+  train_cache_directory: data/direct-representations
+  validation_cache_directory: data/pixel-pretraining/validation
+  manifest: manifest.json
+  cache_batch_size: 256
+  normalization_epsilon: 1.0e-6
+  validation_interval_epochs: 1
+  validation_batches: 32
+  checkpoint_interval_epochs: 5
+  optimizer:
+    kind: adamw
+    adamw:
+      lr: 2.0e-4
+      betas: [0.9, 0.95]
+      weight_decay: 0.0
+    scheduler:
+      kind: cosine
+      warmup_epochs: 5
+      min_lr_ratio: 0.0
+    gradient_clip: 1.0
+    global_batch_size: 1024
+    ema_decay: 0.9999
 
 sampling:
   steps: 50

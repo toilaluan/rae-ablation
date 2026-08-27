@@ -387,6 +387,87 @@ class DiPPatchDecoder(nn.Module):
 LocalDecoder = DiPPatchDecoder
 
 
+class PixelDecoderBackbone(nn.Module):
+    """Pixel transformer and DiP detailer shared by pretraining and joint DDT."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        width = config.pixel_decoder.width
+        self.blocks = nn.ModuleList(
+            PixelTransformerBlock(config) for _ in range(config.pixel_decoder.depth)
+        )
+        self.context_norm = RMSNorm(width)
+        self.context_mlp = SwiGLU(width, config.feedforward.mlp_ratio)
+        self.coarse_patch_projection = nn.Linear(
+            width, 3 * PATCH_SIZE * PATCH_SIZE
+        )
+        self.patch_detailer = DiPPatchDecoder(width)
+        self.gradient_checkpointing = config.gradient_checkpointing
+
+    def _block(self, block: nn.Module, values: Tensor) -> Tensor:
+        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+            return checkpoint(block, values, use_reentrant=False)
+        return block(values)
+
+    def forward(self, tokens: Tensor, context: Tensor) -> Tensor:
+        if tokens.ndim != 3 or context.shape != tokens.shape:
+            raise ValueError(
+                "pixel decoder tokens and context must have equal [B,64,D] shapes"
+            )
+        if tokens.shape[1] != TOKEN_COUNT:
+            raise ValueError("pixel decoder requires 64 spatial tokens")
+        batch = tokens.shape[0]
+        context = context + self.context_mlp(self.context_norm(context))
+        for block in self.blocks:
+            tokens = self._block(block, tokens)
+        coarse = self.coarse_patch_projection(tokens).reshape(
+            batch * TOKEN_COUNT, 3, PATCH_SIZE, PATCH_SIZE
+        )
+        detailed = self.patch_detailer(
+            coarse, context.reshape(batch * TOKEN_COUNT, context.shape[-1])
+        )
+        patch_tokens = detailed.reshape(batch, TOKEN_COUNT, -1)
+        return F.fold(
+            patch_tokens.transpose(1, 2),
+            output_size=(GRID_SIZE * PATCH_SIZE, GRID_SIZE * PATCH_SIZE),
+            kernel_size=PATCH_SIZE,
+            stride=PATCH_SIZE,
+        )
+
+
+class SemanticPixelDecoder(nn.Module):
+    """Standalone normalized-DINO-to-RGB decoder used for pretraining."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.config = config
+        width = config.pixel_decoder.width
+        self.token_projection = nn.Linear(config.token_dim, width)
+        self.context_projection = nn.Linear(config.token_dim, width)
+        self.backbone = PixelDecoderBackbone(config)
+        self.initialize_weights()
+
+    def initialize_weights(self) -> None:
+        def initialize(module: nn.Module) -> None:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        self.apply(initialize)
+
+    def forward(self, semantic_tokens: Tensor) -> Tensor:
+        if semantic_tokens.ndim != 3 or semantic_tokens.shape[1:] != (
+            TOKEN_COUNT,
+            self.config.token_dim,
+        ):
+            raise ValueError("semantic pixel decoder input must have shape [B,64,768]")
+        return self.backbone(
+            self.token_projection(semantic_tokens),
+            self.context_projection(semantic_tokens),
+        )
+
+
 @dataclass(frozen=True)
 class DDTOutput:
     full_x0: Tensor
@@ -406,6 +487,7 @@ class DDTOutput:
 class PixelFeatureBundle:
     encoder: tuple[Tensor, ...]
     decoder: tuple[Tensor, ...]
+    semantic: Tensor | None = None
 
     @property
     def all(self) -> tuple[Tensor, ...]:
@@ -415,6 +497,7 @@ class PixelFeatureBundle:
         return PixelFeatureBundle(
             tuple(values.detach() for values in self.encoder),
             tuple(values.detach() for values in self.decoder),
+            None if self.semantic is None else self.semantic.detach(),
         )
 
     def index_select(self, indices: Tensor) -> PixelFeatureBundle:
@@ -423,11 +506,23 @@ class PixelFeatureBundle:
         return PixelFeatureBundle(
             tuple(values.index_select(0, indices) for values in self.encoder),
             tuple(values.index_select(0, indices) for values in self.decoder),
+            None
+            if self.semantic is None
+            else self.semantic.index_select(0, indices),
         )
 
 
 class DDT(nn.Module):
     """Joint semantic flow with RAEv2 base prediction and DiP RGB decoding."""
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "patch_detailer":
+            modules = self.__dict__.get("_modules", {})
+            decoder = modules.get("pixel_decoder")
+            if decoder is not None:
+                decoder.patch_detailer = value
+                return
+        super().__setattr__(name, value)
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -470,21 +565,23 @@ class DDT(nn.Module):
         )
         self.pixel_fusion_kind = config.pixel_decoder.fusion.kind
         if self.pixel_fusion_kind == "concatenate":
-            self.pixel_token_projection = nn.Linear(fusion_width, pixel_width)
-            self.pixel_context_projection = nn.Linear(fusion_width, pixel_width)
-            self.pixel_context_norm = RMSNorm(pixel_width)
-            self.pixel_context_mlp = SwiGLU(
-                pixel_width, config.feedforward.mlp_ratio
-            )
+            self.pixel_flow_token_projection = nn.Linear(fusion_width, pixel_width)
+            self.pixel_flow_context_projection = nn.Linear(fusion_width, pixel_width)
         else:
             self.pixel_layer_fusion = LayerAttentionFusion(config)
-        self.pixel_blocks = nn.ModuleList(
-            PixelTransformerBlock(config) for _ in range(config.pixel_decoder.depth)
+        joint_width = config.token_dim + pixel_width
+        self.pixel_input_projection = nn.Linear(joint_width, pixel_width)
+        self.pixel_detail_context_projection = nn.Linear(joint_width, pixel_width)
+        self.pixel_decoder = PixelDecoderBackbone(config)
+        self.register_buffer(
+            "pixel_semantic_scale", torch.ones(config.token_dim), persistent=True
         )
-        self.coarse_patch_projection = nn.Linear(pixel_width, 3 * PATCH_SIZE * PATCH_SIZE)
-        self.patch_detailer = DiPPatchDecoder(pixel_width)
+        self.register_buffer(
+            "pixel_semantic_bias", torch.zeros(config.token_dim), persistent=True
+        )
         self.gradient_checkpointing = config.gradient_checkpointing
         self.initialize_weights()
+        self._zero_initialize_flow_slices()
 
     @property
     def semantic_head(self) -> DDTFinalLayer:
@@ -496,19 +593,51 @@ class DDT(nn.Module):
 
     @property
     def pixel_transformer_blocks(self) -> nn.ModuleList:
-        return self.pixel_blocks
+        return self.pixel_decoder.blocks
+
+    @property
+    def pixel_blocks(self) -> nn.ModuleList:
+        return self.pixel_decoder.blocks
+
+    @property
+    def coarse_patch_projection(self) -> nn.Linear:
+        return self.pixel_decoder.coarse_patch_projection
+
+    @property
+    def patch_detailer(self) -> DiPPatchDecoder:
+        return self.pixel_decoder.patch_detailer
+
+    def set_pixel_detailer(self, detailer: nn.Module) -> None:
+        """Replace the DiP detailer, primarily for lightweight tests."""
+        self.pixel_decoder.patch_detailer = detailer
 
     def pixel_parameter_names(self) -> set[str]:
-        prefixes = ("pixel_", "coarse_patch_projection.", "patch_detailer.")
         return {
             name
             for name, _parameter in self.named_parameters()
-            if name.startswith(prefixes)
+            if name.startswith("pixel_")
         }
+
+    def pixel_decoder_parameter_names(self) -> set[str]:
+        return {
+            name
+            for name, _parameter in self.named_parameters()
+            if name.startswith("pixel_decoder.")
+        }
+
+    def pixel_adapter_parameter_names(self) -> set[str]:
+        return self.pixel_parameter_names() - self.pixel_decoder_parameter_names()
 
     def flow_parameter_names(self) -> set[str]:
         pixel = self.pixel_parameter_names()
         return {name for name, _parameter in self.named_parameters() if name not in pixel}
+
+    def set_pixel_decoder_frozen(self, frozen: bool) -> None:
+        self.pixel_decoder.requires_grad_(not frozen)
+
+    def pixel_decoder_is_frozen(self) -> bool:
+        parameters = tuple(self.pixel_decoder.parameters())
+        return bool(parameters) and not any(parameter.requires_grad for parameter in parameters)
 
     @staticmethod
     def _validate_config(config: ModelConfig) -> None:
@@ -560,6 +689,62 @@ class DDT(nn.Module):
             nn.init.zeros_(head.projection.weight)
             nn.init.zeros_(head.projection.bias)
 
+    def _zero_initialize_flow_slices(self) -> None:
+        semantic_width = self.config.token_dim
+        with torch.no_grad():
+            self.pixel_input_projection.weight[:, semantic_width:].zero_()
+            self.pixel_detail_context_projection.weight[:, semantic_width:].zero_()
+
+    def initialize_pretrained_pixel_decoder(
+        self,
+        decoder: SemanticPixelDecoder,
+        *,
+        flow_mean: Tensor,
+        flow_std: Tensor,
+        decoder_mean: Tensor,
+        decoder_std: Tensor,
+    ) -> None:
+        """Install a standalone decoder and its semantic normalization contract."""
+        decoder_path = decoder.config.pixel_decoder
+        active_path = self.config.pixel_decoder
+        if (
+            decoder_path.width,
+            decoder_path.depth,
+            decoder_path.heads,
+        ) != (
+            active_path.width,
+            active_path.depth,
+            active_path.heads,
+        ):
+            raise ValueError("pretrained pixel decoder architecture does not match the DDT")
+        if decoder.config.feedforward != self.config.feedforward:
+            raise ValueError("pretrained pixel feedforward configuration does not match")
+        if decoder.config.attention != self.config.attention:
+            raise ValueError("pretrained pixel attention configuration does not match")
+        expected = (self.config.token_dim,)
+        for name, values in (
+            ("flow mean", flow_mean),
+            ("flow std", flow_std),
+            ("decoder mean", decoder_mean),
+            ("decoder std", decoder_std),
+        ):
+            if values.shape != expected or not torch.isfinite(values).all():
+                raise ValueError(f"{name} must be a finite width-768 tensor")
+        if torch.any(flow_std <= 0) or torch.any(decoder_std <= 0):
+            raise ValueError("semantic normalization standard deviations must be positive")
+        self.pixel_decoder.load_state_dict(decoder.backbone.state_dict())
+        semantic_width = self.config.token_dim
+        with torch.no_grad():
+            for target, source in (
+                (self.pixel_input_projection, decoder.token_projection),
+                (self.pixel_detail_context_projection, decoder.context_projection),
+            ):
+                target.weight.zero_()
+                target.weight[:, :semantic_width].copy_(source.weight)
+                target.bias.copy_(source.bias)
+            self.pixel_semantic_scale.copy_(flow_std / decoder_std)
+            self.pixel_semantic_bias.copy_((flow_mean - decoder_mean) / decoder_std)
+
     def _plain_block(self, block: nn.Module, values: Tensor) -> Tensor:
         if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
             return checkpoint(block, values, use_reentrant=False)
@@ -579,29 +764,28 @@ class DDT(nn.Module):
         return nullcontext()
 
     def _decode_pixels(self, features: PixelFeatureBundle) -> Tensor:
-        batch = features.all[0].shape[0]
+        if features.semantic is None:
+            raise ValueError("pixel decoding requires detached predicted-clean tokens")
+        semantic = features.semantic.detach()
+        if semantic.shape[1:] != (TOKEN_COUNT, self.config.token_dim):
+            raise ValueError("pixel semantic conditioning must have shape [B,64,768]")
+        semantic = (
+            semantic * self.pixel_semantic_scale.to(semantic)
+            + self.pixel_semantic_bias.to(semantic)
+        )
         if self.pixel_fusion_kind == "concatenate":
             concatenated = torch.cat(features.all, dim=-1)
-            pixel_tokens = self.pixel_token_projection(concatenated)
-            context = self.pixel_context_projection(concatenated)
-            context = context + self.pixel_context_mlp(self.pixel_context_norm(context))
+            pooled_tokens = self.pixel_flow_token_projection(concatenated)
+            pooled_context = self.pixel_flow_context_projection(concatenated)
         else:
-            pixel_tokens, context = self.pixel_layer_fusion(features.all)
-        for block in self.pixel_blocks:
-            pixel_tokens = self._plain_block(block, pixel_tokens)
-        coarse = self.coarse_patch_projection(pixel_tokens).reshape(
-            batch * TOKEN_COUNT, 3, PATCH_SIZE, PATCH_SIZE
+            pooled_tokens, pooled_context = self.pixel_layer_fusion(features.all)
+        pixel_tokens = self.pixel_input_projection(
+            torch.cat((semantic, pooled_tokens), dim=-1)
         )
-        detailed = self.patch_detailer(
-            coarse, context.reshape(batch * TOKEN_COUNT, context.shape[-1])
+        context = self.pixel_detail_context_projection(
+            torch.cat((semantic, pooled_context), dim=-1)
         )
-        patch_tokens = detailed.reshape(batch, TOKEN_COUNT, -1)
-        return F.fold(
-            patch_tokens.transpose(1, 2),
-            output_size=(GRID_SIZE * PATCH_SIZE, GRID_SIZE * PATCH_SIZE),
-            kernel_size=PATCH_SIZE,
-            stride=PATCH_SIZE,
-        )
+        return self.pixel_decoder(pixel_tokens, context)
 
     def forward_semantic(
         self,
@@ -663,6 +847,7 @@ class DDT(nn.Module):
                     decoder_features[index]
                     for index in self.config.pixel_decoder.decoder_features
                 ),
+                full_x0.detach(),
             )
             return output, features
 

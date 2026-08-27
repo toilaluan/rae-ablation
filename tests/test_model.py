@@ -11,7 +11,13 @@ from cascade_dit.config import (
     PixelDecoderConfig,
     SemanticDecoderConfig,
 )
-from cascade_dit.model import DDT, DDTOutput, build_model
+from cascade_dit.model import (
+    DDT,
+    DDTOutput,
+    PixelFeatureBundle,
+    SemanticPixelDecoder,
+    build_model,
+)
 from cascade_dit.model.ddt import (
     DiPPatchDecoder,
     LayerAttentionFusion,
@@ -43,6 +49,7 @@ def _model(*, base_depth: int = 2) -> DDT:
     config.conditioning.class_tokens = 3
     model = build_model(config)
     model.patch_detailer = FastDetailer()
+    assert not any(name.startswith("patch_detailer.") for name in model.state_dict())
     return model
 
 
@@ -110,6 +117,11 @@ def test_isolated_base_loss_stops_after_selected_encoder_block() -> None:
 
 def test_pixel_loss_reaches_flow_trunk_without_detachment() -> None:
     model = _model()
+    with torch.no_grad():
+        nn.init.normal_(
+            model.pixel_input_projection.weight[:, model.config.token_dim :],
+            std=0.02,
+        )
     output = model(*_arguments(), decode_pixels=True)
     assert output.rgb is not None
     output.rgb.square().mean().backward()
@@ -117,6 +129,64 @@ def test_pixel_loss_reaches_flow_trunk_without_detachment() -> None:
     assert _has_gradient(model.encoder_blocks)
     assert _has_gradient(model.pixel_blocks)
     assert _has_gradient(model.coarse_patch_projection)
+
+
+def test_zero_hidden_slice_preserves_pretrained_decoder_at_initialization() -> None:
+    config = _model().config
+    model = build_model(config)
+    pretrained = SemanticPixelDecoder(model.config)
+    flow_mean = torch.randn(768)
+    flow_std = torch.rand(768).add(0.5)
+    decoder_mean = torch.randn(768)
+    decoder_std = torch.rand(768).add(0.5)
+    model.initialize_pretrained_pixel_decoder(
+        pretrained,
+        flow_mean=flow_mean,
+        flow_std=flow_std,
+        decoder_mean=decoder_mean,
+        decoder_std=decoder_std,
+    )
+    model.set_pixel_detailer(FastDetailer())
+    pretrained.backbone.patch_detailer = FastDetailer()
+    semantic = torch.randn(1, 64, 768)
+    features = PixelFeatureBundle(
+        tuple(torch.randn(1, 64, 16) for _ in range(3)),
+        tuple(torch.randn(1, 64, 32) for _ in range(2)),
+        semantic,
+    )
+    converted = semantic * (flow_std / decoder_std) + (
+        flow_mean - decoder_mean
+    ) / decoder_std
+    assert torch.equal(
+        model.decode_pixel_features(features), pretrained(converted)
+    )
+
+
+def test_predicted_clean_tokens_are_detached_but_hidden_path_can_train_flow() -> None:
+    model = _model()
+    with torch.no_grad():
+        nn.init.normal_(model.full_head.projection.weight, std=0.02)
+        nn.init.normal_(
+            model.pixel_input_projection.weight[:, model.config.token_dim :],
+            std=0.02,
+        )
+    output = model(*_arguments(), decode_pixels=True)
+    assert output.rgb is not None
+    output.rgb.square().mean().backward()
+    assert not _has_gradient(model.full_head)
+    assert _has_gradient(model.encoder_blocks)
+
+
+def test_pixel_bundle_carries_detached_predicted_clean_tokens() -> None:
+    model = _model()
+    with torch.no_grad():
+        nn.init.normal_(model.full_head.projection.weight, std=0.02)
+    semantic, features = model.forward_semantic(
+        *_arguments(), capture_pixel_features=True
+    )
+    assert features is not None and features.semantic is not None
+    assert torch.equal(features.semantic, semantic.full_x0)
+    assert not features.semantic.requires_grad
 
 
 def test_layer_attention_fusion_uses_mean_and_separate_context_token() -> None:
@@ -153,7 +223,7 @@ def test_layer_attention_decoder_replaces_only_legacy_fusion_modules() -> None:
     config.pixel_decoder.fusion.layer_attention.width = 32
     config.pixel_decoder.fusion.layer_attention.heads = 2
     model = build_model(config)
-    model.patch_detailer = FastDetailer()
+    model.set_pixel_detailer(FastDetailer())
     assert hasattr(model, "pixel_layer_fusion")
     assert not hasattr(model, "pixel_token_projection")
     assert not hasattr(model, "pixel_context_projection")
@@ -164,6 +234,11 @@ def test_layer_attention_decoder_replaces_only_legacy_fusion_modules() -> None:
 
 def test_detached_pixel_features_do_not_backpropagate_to_flow() -> None:
     model = _model()
+    with torch.no_grad():
+        nn.init.normal_(
+            model.pixel_input_projection.weight[:, model.config.token_dim :],
+            std=0.02,
+        )
     semantic, features = model.forward_semantic(
         *_arguments(), capture_pixel_features=True
     )

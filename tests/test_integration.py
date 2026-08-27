@@ -21,7 +21,7 @@ from cascade_dit.config import (
 )
 from cascade_dit.data import PreparedJointBatch
 from cascade_dit.model import DDT, build_model
-from cascade_dit.optim import build_optimizer
+from cascade_dit.optim import build_joint_optimizer, build_optimizer
 from cascade_dit.rng import RNGStreams
 from cascade_dit.runner import ExperimentRunner
 from cascade_dit.training import (
@@ -44,6 +44,7 @@ class LPIPSStub(nn.Module):
 def _config() -> ExperimentConfig:
     config = ExperimentConfig()
     config.training.epochs = 2
+    config.training.decoder.frozen_epochs = 1
     config.model = ModelConfig(
         base_prediction_depth=1,
         encoder=DDTPathConfig(16, 1, 1),
@@ -61,7 +62,7 @@ def _config() -> ExperimentConfig:
 
 def _model(config: ExperimentConfig) -> DDT:
     model = build_model(config.model)
-    model.patch_detailer = FastDetailer()
+    model.set_pixel_detailer(FastDetailer())
     return model
 
 
@@ -92,6 +93,35 @@ def test_cpu_joint_training_smoke_updates_one_model_and_ema() -> None:
     assert torch.isfinite(result.loss.total)
     assert result.output.rgb is not None
     assert result.output.rgb.shape == (1, 3, 128, 128)
+
+
+def test_decoder_phase_unfreezes_without_rebuilding_optimizer() -> None:
+    config = _config()
+    model = _model(config)
+    model.set_pixel_decoder_frozen(True)
+    optimizer = build_joint_optimizer(model, config.optimizer)
+    assert [group["name"] for group in optimizer.param_groups] == [
+        "flow",
+        "pixel_adapter",
+        "pixel_decoder",
+    ]
+    optimized = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    runner = object.__new__(ExperimentRunner)
+    runner.config = config
+    runner.model = model
+    runner.completed_epoch = 0
+    runner._apply_decoder_phase()
+    assert model.pixel_decoder_is_frozen()
+    assert all(id(parameter) in optimized for parameter in model.pixel_decoder.parameters())
+
+    runner.completed_epoch = config.training.decoder.frozen_epochs
+    runner._apply_decoder_phase()
+    assert not model.pixel_decoder_is_frozen()
+    assert all(id(parameter) in optimized for parameter in model.pixel_decoder.parameters())
 
 
 def test_cpu_ddp_joint_training_has_no_unused_phase_parameters(tmp_path) -> None:
@@ -189,6 +219,7 @@ def test_cleanest_fixed_size_subset_limits_decoder_batch() -> None:
     assert output.full_x0.shape[0] == 4
     assert output.rgb is not None and output.rgb.shape[0] == 2
     assert all(values.shape[0] == 2 for values in cached.all)
+    assert cached.semantic is not None and cached.semantic.shape[0] == 2
 
 
 def test_cleanest_subset_selection_compiles_without_dynamic_shapes() -> None:
@@ -244,7 +275,7 @@ def test_cpu_ddp_sparse_decoder_modes_support_unused_parameters(tmp_path) -> Non
         torch.distributed.destroy_process_group()
 
 
-def test_checkpoint_resume_state_is_single_phase(tmp_path) -> None:
+def test_checkpoint_resume_state_records_joint_decoder_phase(tmp_path) -> None:
     config = _config()
     model = _model(config)
     manager = CheckpointManager(tmp_path)
@@ -261,9 +292,11 @@ def test_checkpoint_resume_state_is_single_phase(tmp_path) -> None:
         rng_streams=RNGStreams.create(4).state_dict(),
         data_fingerprint="data",
         representation_fingerprint="representations",
+        pixel_decoder_fingerprint="pixel",
+        decoder_phase="joint",
     )
     saved = manager.save(model=model, ema=EMA(model), state=state, config=config)
     loaded = manager.load(saved, model, EMA(model))
     assert loaded.completed_epoch == 1
     assert not loaded.training_complete
-    assert not hasattr(loaded, "phase")
+    assert loaded.decoder_phase == "joint"

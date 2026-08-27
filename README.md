@@ -1,10 +1,11 @@
 # Joint Semantic-Flow DDT
 
-This repository trains one class-conditional ImageNet-128 model for 200 epochs. The
-flow trunk denoises normalized DINOv3-B/16 layer-12 tokens, while a jointly trained
-pixel branch reconstructs raw RGB from selected flow hidden states.
+This repository pretrains a semantic-to-RGB pixel decoder, then trains one
+class-conditional ImageNet-128 flow model for 200 epochs. The flow trunk denoises
+normalized DINOv3-B/16 layer-12 tokens. Its pixel branch begins from the standalone
+decoder and learns additional conditioning from selected flow hidden states.
 
-The 12-block flow encoder has a zero-initialized RAEv2 base prediction at block 8 and
+The 12-block flow encoder has a zero-initialized RAEv2 base prediction at block 4 and
 a two-block AdaLN semantic decoder for the full prediction. Both heads predict clean
 semantic tokens and receive independent flow-matching velocity losses. Sampling uses
 single-pass internal guidance over raw timesteps in `[0.10, 1.0]`:
@@ -14,26 +15,59 @@ guided_x0 = base_x0 + 1.78 * (full_x0 - base_x0)
 ```
 
 There is no classifier-free guidance evaluation, unconditional batch, endpoint
-mixing, direct pixel flow, or phased training.
+mixing, or direct pixel flow.
 
-## Pixel decoder
+## Pixel decoder pretraining
 
-Post-block encoder features `[4, 8, 12]` and semantic-decoder features `[1, 2]` use
-the configured pixel fusion. `concatenate` is the default and retains the original
-independent width-2048 token and context paths. `layer_attention` normalizes and
-projects each source to width 768, mixes the five sources plus a learned DiP-context
-token with one 12-head depth-axis transformer, averages the normalized source outputs,
-and projects both results to width 2048. The existing three spatial transformers then
-produce coarse `3x16x16` RGB patches, while the learned-token result conditions the
-patch-isolated DiP four-pool U-Net.
+The standalone decoder maps normalized `[B,64,768]` DINO tokens to RGB using two
+semantic input projections, the configured spatial pixel transformers, a coarse
+`3x16x16` patch projection, and the patch-isolated DiP U-Net. Its objective is the
+same RGB L1 plus VGG-LPIPS loss used during flow training. Class labels are neither
+loaded nor required.
+
+The default cached mode reuses the existing ImageNet training cache and prepares a
+validation cache. The generic dataset configuration accepts any revision-pinned
+Hugging Face image dataset and image column. Online mode avoids BF16 token caches:
+it makes one distributed DINO statistics pass, then runs the frozen encoder per
+training batch.
+
+```bash
+torchrun --standalone --nproc-per-node=8 scripts/prepare_pixel_decoder_inputs.py \
+  --config configs/experiment.yaml
+
+torchrun --standalone --nproc-per-node=8 scripts/pretrain_pixel_decoder.py \
+  --config configs/experiment.yaml \
+  --output artifacts/pixel-decoder
+```
+
+Pretraining defaults to 50 epochs. Periodic directories under `checkpoints/` contain
+raw and EMA decoder weights, semantic mean/std, optimizer/scheduler state, and exact
+dataset/DINO/architecture provenance. There is deliberately no automatic “best”
+selection; set `training.decoder.pretrained_checkpoint` to the chosen epoch and
+`pretrained_weights` to `ema` or `model`.
+
+## Flow-conditioned decoder
+
+Post-block encoder features `[2, 4, 6, 8, 12]` and semantic-decoder features `[1, 2]` use
+the configured pixel fusion. `layer_attention` normalizes and projects each source,
+mixes the sources plus a learned DiP-context token across network depth, and emits
+spatial and context pooled states. Each pooled state is concatenated with the flow
+model's predicted-clean semantic tokens and projected into the corresponding
+pretrained decoder stream.
+
+Predicted-clean tokens are always detached from the RGB objective. If the pretraining
+corpus has different DINO channel statistics, a checkpointed affine conversion maps
+flow-normalized tokens into the decoder's normalization. The new hidden-state slices
+are initialized to zero and the semantic slices are copied from pretraining, so the
+initial joint RGB function exactly matches the standalone decoder.
 
 Use the alternative fusion with:
 
 ```bash
---override model.pixel_decoder.fusion.kind=layer_attention
+--override model.pixel_decoder.fusion.kind=concatenate
 ```
 
-## Preparation and training
+## Flow preparation and training
 
 Fresh preparation writes only the selected DINO BF16 cache and its channel
 statistics. Manifest schema v3 remains reusable when an existing compatible manifest
@@ -48,7 +82,14 @@ torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --output runs/joint-seed0
 ```
 
-The per-sample objective is:
+For the first `training.decoder.frozen_epochs` (20 by default), the pretrained pixel
+transformers, context MLP, coarse head, and DiP detailer are frozen. The flow model,
+hidden-state fusion, and new input projections train, and RGB gradients may reach the
+flow trunk only through hidden states. At the boundary the decoder is unfrozen,
+compiled/DDP execution is rebuilt, and the existing optimizer and scheduler continue
+at the same learning rate.
+
+The per-sample joint objective is:
 
 ```text
 full_velocity_mse + base_velocity_mse + pixel_l1 + pixel_lpips
@@ -58,13 +99,13 @@ All weights default to `1.0`. RGB L1 uses `[0,1]`; LPIPS receives prediction and
 target mapped to `[-1,1]`.
 
 Decoder optimization defaults to every outer step with one update and pixel gradients
-flowing into the semantic trunk. `training.decoder.update_interval=N` runs pixels only
+flowing into the flow trunk through hidden states. `training.decoder.update_interval=N` runs pixels only
 every `N` outer steps; `updates_per_active_step=K` reuses detached hidden states for
 the remaining `K-1` decoder-only updates. Average decoder work therefore scales with
 `K/N`. Set `backpropagate_to_flow=false` to isolate all pixel gradients from the flow
 trunk. `samples_per_batch=M` selects the `M` lowest-timestep (cleanest) samples on each
 rank with fixed-shape `topk` indices and runs the pixel decoder only on that subset.
-The default `null` uses the full local batch.
+The checked-in preset uses `64`; setting it to `null` uses the full local batch.
 
 ## Sampling
 
@@ -79,8 +120,10 @@ torchrun --standalone --nproc-per-node=8 scripts/sample.py \
   --evaluate
 ```
 
-Configuration schema v8 and checkpoint/training-state schema v6 intentionally reject
-all phase-era artifacts.
+Configuration schema v9 and checkpoint/training-state schema v7 reject older joint
+configurations and checkpoints. Standalone decoder artifacts use schema v1. Joint checkpoints embed all decoder weights,
+normalization buffers, and the selected pretraining-weight checksum, so sampling and
+resume do not require the original standalone checkpoint.
 
 ```bash
 uv run --extra dev pytest -q

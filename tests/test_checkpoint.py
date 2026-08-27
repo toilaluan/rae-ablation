@@ -34,6 +34,7 @@ class FastDetailer(nn.Module):
 def _config() -> ExperimentConfig:
     config = ExperimentConfig()
     config.training.epochs = 2
+    config.training.decoder.frozen_epochs = 1
     config.model = ModelConfig(
         base_prediction_depth=1,
         encoder=DDTPathConfig(16, 1, 1),
@@ -49,7 +50,7 @@ def _config() -> ExperimentConfig:
 
 def _model(config: ExperimentConfig) -> DDT:
     model = build_model(config.model)
-    model.patch_detailer = FastDetailer()
+    model.set_pixel_detailer(FastDetailer())
     return model
 
 
@@ -67,6 +68,8 @@ def _state(config: ExperimentConfig, *, complete: bool = False) -> ResumeState:
         rng_streams=RNGStreams.create(4).state_dict(),
         data_fingerprint="data",
         representation_fingerprint="representations",
+        pixel_decoder_fingerprint="pixel-decoder-sha256",
+        decoder_phase="joint",
     )
 
 
@@ -93,7 +96,7 @@ def test_checkpoint_roundtrip_plain_state_and_old_schema_rejection(tmp_path) -> 
         manager.load(old, model, ema)
 
 
-def test_checkpoint_metadata_has_no_phase_and_any_joint_checkpoint_can_be_sampled(
+def test_checkpoint_metadata_records_decoder_phase_and_any_checkpoint_can_be_sampled(
     tmp_path,
 ) -> None:
     config = _config()
@@ -107,8 +110,8 @@ def test_checkpoint_metadata_has_no_phase_and_any_joint_checkpoint_can_be_sample
     )
     bundle = load_checkpoint_bundle(saved)
     assert bundle.weights.is_file()
-    assert "phase" not in bundle.metadata
-    assert "epoch_within_phase" not in bundle.metadata
+    assert bundle.metadata["decoder_phase"] == "joint"
+    assert bundle.metadata["pixel_decoder_fingerprint"] == "pixel-decoder-sha256"
 
 
 def test_completed_joint_checkpoint_records_single_schedule_completion(tmp_path) -> None:

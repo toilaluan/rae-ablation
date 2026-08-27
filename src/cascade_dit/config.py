@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 8
+CONFIG_SCHEMA_VERSION = 9
 
 IMAGE_SIZE = 128
 PATCH_SIZE = 16
@@ -50,6 +50,21 @@ class DataConfig:
 
 
 @dataclass
+class UnlabeledDataConfig:
+    repository: str = IMAGENET_REPOSITORY
+    revision: str = IMAGENET_REVISION
+    train_split: str = "train"
+    validation_split: str = "validation"
+    image_column: str = "image"
+    image_size: int = IMAGE_SIZE
+    workers: int = 16
+    prefetch_factor: int = 4
+    max_train_samples: int | None = None
+    max_validation_samples: int | None = None
+    shuffle: bool = True
+
+
+@dataclass
 class EncoderConfig:
     repository: str = DINO_REPOSITORY
     revision: str = DINO_REVISION
@@ -61,6 +76,9 @@ class EncoderConfig:
 
 @dataclass
 class DecoderOptimizationConfig:
+    pretrained_checkpoint: str = "artifacts/pixel-decoder/checkpoints/epoch-0050"
+    pretrained_weights: str = "ema"
+    frozen_epochs: int = 20
     update_interval: int = 1
     updates_per_active_step: int = 1
     backpropagate_to_flow: bool = True
@@ -212,6 +230,28 @@ class OptimizerConfig:
     ema_decay: float = 0.9999
 
 
+def _pixel_pretraining_optimizer() -> OptimizerConfig:
+    return OptimizerConfig(
+        scheduler=SchedulerConfig(kind="cosine", warmup_epochs=5, min_lr_ratio=0.0)
+    )
+
+
+@dataclass
+class PixelPretrainingConfig:
+    epochs: int = 50
+    semantic_input_mode: str = "cached"
+    data: UnlabeledDataConfig = field(default_factory=UnlabeledDataConfig)
+    train_cache_directory: str = "data/direct-representations"
+    validation_cache_directory: str = "data/pixel-pretraining/validation"
+    manifest: str = "manifest.json"
+    cache_batch_size: int = 256
+    normalization_epsilon: float = 1e-6
+    validation_interval_epochs: int = 1
+    validation_batches: int = 32
+    checkpoint_interval_epochs: int = 5
+    optimizer: OptimizerConfig = field(default_factory=_pixel_pretraining_optimizer)
+
+
 @dataclass
 class InternalGuidanceConfig:
     scale: float = 1.78
@@ -282,6 +322,9 @@ class ExperimentConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     objective: ObjectiveConfig = field(default_factory=ObjectiveConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    pixel_pretraining: PixelPretrainingConfig = field(
+        default_factory=PixelPretrainingConfig
+    )
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
@@ -308,6 +351,15 @@ class ExperimentConfig:
             self.training.decoder.update_interval,
             self.training.decoder.updates_per_active_step,
         )
+        decoder = self.training.decoder
+        if not decoder.pretrained_checkpoint:
+            raise ValueError("training.decoder.pretrained_checkpoint cannot be empty")
+        if decoder.pretrained_weights not in {"ema", "model"}:
+            raise ValueError("training.decoder.pretrained_weights must be ema or model")
+        if not 0 <= decoder.frozen_epochs < self.training.epochs:
+            raise ValueError(
+                "training.decoder.frozen_epochs must be non-negative and below total epochs"
+            )
         if (
             self.training.decoder.samples_per_batch is not None
             and self.training.decoder.samples_per_batch < 1
@@ -340,6 +392,7 @@ class ExperimentConfig:
         if not self.representations.require_complete:
             raise ValueError("joint training requires a complete semantic representation cache")
         self._validate_model()
+        self._validate_pixel_pretraining()
         _positive(
             "objective settings",
             self.objective.timestep_scale,
@@ -444,25 +497,70 @@ class ExperimentConfig:
             raise ValueError("class dropout probability must be in [0,1)")
 
     def _validate_optimizer(self) -> None:
-        values = self.optimizer
+        self._validate_optimizer_config("optimizer", self.optimizer)
+
+    @staticmethod
+    def _validate_optimizer_config(name: str, values: OptimizerConfig) -> None:
         if values.kind != "adamw":
-            raise ValueError("optimizer.kind must be adamw")
+            raise ValueError(f"{name}.kind must be adamw")
         if values.scheduler.kind not in {"constant", "cosine"}:
-            raise ValueError("optimizer.scheduler.kind must be constant or cosine")
+            raise ValueError(f"{name}.scheduler.kind must be constant or cosine")
         if len(values.adamw.betas) != 2 or not all(0 <= beta < 1 for beta in values.adamw.betas):
-            raise ValueError("optimizer.adamw.betas must contain two values in [0,1)")
+            raise ValueError(f"{name}.adamw.betas must contain two values in [0,1)")
         _positive(
-            "optimizer settings",
+            f"{name} settings",
             values.adamw.lr,
             values.global_batch_size,
             values.gradient_clip,
         )
         if values.scheduler.warmup_epochs < 0:
-            raise ValueError("scheduler warmup epochs cannot be negative")
+            raise ValueError(f"{name} scheduler warmup epochs cannot be negative")
         if not 0 <= values.scheduler.min_lr_ratio <= 1:
-            raise ValueError("scheduler min_lr_ratio must be in [0,1]")
+            raise ValueError(f"{name} scheduler min_lr_ratio must be in [0,1]")
         if not 0 < values.ema_decay < 1:
-            raise ValueError("optimizer.ema_decay must be in (0,1)")
+            raise ValueError(f"{name}.ema_decay must be in (0,1)")
+
+    def _validate_pixel_pretraining(self) -> None:
+        values = self.pixel_pretraining
+        if values.semantic_input_mode not in {"cached", "online"}:
+            raise ValueError(
+                "pixel_pretraining.semantic_input_mode must be cached or online"
+            )
+        data = values.data
+        if not all(
+            (
+                data.repository,
+                data.revision,
+                data.train_split,
+                data.validation_split,
+                data.image_column,
+            )
+        ):
+            raise ValueError("pixel pretraining data fields cannot be empty")
+        if data.image_size != IMAGE_SIZE:
+            raise ValueError("pixel pretraining images must be 128x128")
+        if data.workers < 0 or data.prefetch_factor < 1:
+            raise ValueError("pixel pretraining workers and prefetch settings are invalid")
+        for name, maximum in (
+            ("max_train_samples", data.max_train_samples),
+            ("max_validation_samples", data.max_validation_samples),
+        ):
+            if maximum is not None and maximum < 1:
+                raise ValueError(f"pixel_pretraining.data.{name} must be positive")
+        _positive(
+            "pixel pretraining settings",
+            values.epochs,
+            values.cache_batch_size,
+            values.normalization_epsilon,
+            values.validation_interval_epochs,
+            values.validation_batches,
+            values.checkpoint_interval_epochs,
+        )
+        if values.optimizer.scheduler.warmup_epochs >= values.epochs:
+            raise ValueError("pixel pretraining warmup must be below its epoch count")
+        self._validate_optimizer_config(
+            "pixel_pretraining.optimizer", values.optimizer
+        )
 
 
 def _structured_config(values: dict[str, Any]) -> ExperimentConfig:
@@ -487,7 +585,7 @@ def _require_current(values: object, source: str | Path) -> dict[str, Any]:
     if version != CONFIG_SCHEMA_VERSION:
         raise ValueError(
             f"{source} uses unsupported configuration schema {version!r}; "
-            f"schema_version: {CONFIG_SCHEMA_VERSION} is required. Phase-based "
+            f"schema_version: {CONFIG_SCHEMA_VERSION} is required. Older "
             "configurations are intentionally not migrated."
         )
     return values

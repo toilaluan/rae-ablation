@@ -12,7 +12,14 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
-from .config import IMAGE_SIZE, TOKEN_COUNT, TOKEN_DIM, DataConfig, ExperimentConfig
+from .config import (
+    IMAGE_SIZE,
+    TOKEN_COUNT,
+    TOKEN_DIM,
+    DataConfig,
+    ExperimentConfig,
+    UnlabeledDataConfig,
+)
 from .representations import ChannelStatistics, RepresentationManifest
 
 
@@ -54,6 +61,124 @@ def data_fingerprint(config: DataConfig, image_size: int = IMAGE_SIZE) -> str:
         separators=(",", ":"),
     ).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def unlabeled_preprocessing_metadata(
+    config: UnlabeledDataConfig,
+    *,
+    split: str,
+    max_samples: int | None,
+) -> dict[str, Any]:
+    return {
+        "repository": config.repository,
+        "revision": config.revision,
+        "split": split,
+        "image_column": config.image_column,
+        "max_samples": max_samples,
+        "image_size": config.image_size,
+        "augmentation": "none",
+        "preprocessing": [
+            "PIL.convert(RGB)",
+            f"PIL.resize({config.image_size}x{config.image_size}, bicubic) when needed",
+            "uint8_to_float32_[0,1]",
+        ],
+    }
+
+
+def unlabeled_data_fingerprint(
+    config: UnlabeledDataConfig,
+    *,
+    split: str,
+    max_samples: int | None,
+) -> str:
+    encoded = json.dumps(
+        unlabeled_preprocessing_metadata(
+            config, split=split, max_samples=max_samples
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def imagenet_compatible_unlabeled_fingerprint(
+    config: UnlabeledDataConfig,
+    *,
+    split: str,
+    max_samples: int | None,
+) -> str | None:
+    """Return the legacy joint-cache fingerprint when the image column is compatible."""
+    if config.image_column != "image":
+        return None
+    return data_fingerprint(
+        DataConfig(
+            repository=config.repository,
+            revision=config.revision,
+            split=split,
+            image_size=config.image_size,
+            workers=config.workers,
+            prefetch_factor=config.prefetch_factor,
+            max_samples=max_samples,
+            shuffle=config.shuffle,
+        ),
+        config.image_size,
+    )
+
+
+class UnlabeledImageDataset(Dataset[tuple[Tensor, int]]):
+    """A revision-pinned image dataset that makes no label-column assumptions."""
+
+    def __init__(self, dataset: Any, image_column: str, image_size: int) -> None:
+        self.dataset = dataset
+        self.image_column = image_column
+        self.image_size = image_size
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def get_item(self, index: int) -> tuple[Tensor, int]:
+        row: Mapping[str, Any] = self.dataset[index]
+        try:
+            value = row[self.image_column]
+        except KeyError as error:
+            raise ValueError(
+                f"unlabeled dataset row has no {self.image_column!r} image column"
+            ) from error
+        if not isinstance(value, Image.Image):
+            raise TypeError("unlabeled image column must decode to a PIL image")
+        image = value.convert("RGB")
+        if image.size != (self.image_size, self.image_size):
+            image = image.resize(
+                (self.image_size, self.image_size), Image.Resampling.BICUBIC
+            )
+        pixels = np.asarray(image, dtype=np.uint8).copy()
+        return torch.from_numpy(pixels).permute(2, 0, 1), index
+
+    def __getitem__(self, index: int) -> tuple[Tensor, int]:
+        return self.get_item(index)
+
+
+def load_unlabeled_images(
+    config: UnlabeledDataConfig,
+    *,
+    split: str,
+    max_samples: int | None,
+) -> UnlabeledImageDataset:
+    from datasets import load_dataset
+
+    dataset = load_dataset(
+        config.repository,
+        split=split,
+        num_proc=12,
+        revision=config.revision,
+    )
+    if max_samples is not None:
+        dataset = dataset.select(range(min(len(dataset), max_samples)))
+    if config.image_column not in dataset.column_names:
+        raise ValueError(
+            f"unlabeled dataset split {split!r} has no {config.image_column!r} column"
+        )
+    return UnlabeledImageDataset(dataset, config.image_column, config.image_size)
 
 
 class ImageNetDataset(Dataset[tuple[Tensor, int, int]]):

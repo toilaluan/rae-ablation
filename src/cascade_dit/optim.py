@@ -11,13 +11,58 @@ from .config import OptimizerConfig
 def build_optimizer(
     model: nn.Module,
     config: OptimizerConfig,
+    *,
+    include_frozen: bool = False,
 ) -> torch.optim.AdamW:
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    parameters = [
+        parameter
+        for parameter in model.parameters()
+        if include_frozen or parameter.requires_grad
+    ]
     if not parameters:
         raise ValueError("model has no trainable parameters")
     adamw = config.adamw
     return torch.optim.AdamW(
         parameters,
+        lr=adamw.lr,
+        betas=(adamw.betas[0], adamw.betas[1]),
+        weight_decay=adamw.weight_decay,
+    )
+
+
+def build_joint_optimizer(
+    model: nn.Module,
+    config: OptimizerConfig,
+) -> torch.optim.AdamW:
+    """Build stable flow/adapter/decoder groups, including the frozen decoder."""
+    required = (
+        "flow_parameter_names",
+        "pixel_adapter_parameter_names",
+        "pixel_decoder_parameter_names",
+    )
+    if not all(hasattr(model, name) for name in required):
+        raise TypeError("joint optimizer requires a DDT parameter partition")
+    named = dict(model.named_parameters())
+    partitions = (
+        ("flow", model.flow_parameter_names()),  # type: ignore[attr-defined]
+        ("pixel_adapter", model.pixel_adapter_parameter_names()),  # type: ignore[attr-defined]
+        ("pixel_decoder", model.pixel_decoder_parameter_names()),  # type: ignore[attr-defined]
+    )
+    groups: list[dict[str, object]] = []
+    assigned: set[str] = set()
+    for group_name, names in partitions:
+        if assigned & names:
+            raise ValueError("joint optimizer parameter partitions overlap")
+        parameters = [named[name] for name in sorted(names)]
+        if not parameters:
+            raise ValueError(f"joint optimizer {group_name} partition is empty")
+        assigned.update(names)
+        groups.append({"params": parameters, "name": group_name})
+    if assigned != set(named):
+        raise ValueError("joint optimizer parameter partitions are incomplete")
+    adamw = config.adamw
+    return torch.optim.AdamW(
+        groups,
         lr=adamw.lr,
         betas=(adamw.betas[0], adamw.betas[1]),
         weight_decay=adamw.weight_decay,
