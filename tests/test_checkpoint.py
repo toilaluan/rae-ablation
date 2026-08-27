@@ -5,6 +5,7 @@ import json
 import pytest
 import torch
 from safetensors.torch import load_file
+from torch import nn
 
 from cascade_dit.checkpoint import (
     EMA,
@@ -15,20 +16,29 @@ from cascade_dit.checkpoint import (
 from cascade_dit.checkpoint_bundle import load_checkpoint_bundle
 from cascade_dit.config import (
     DDTAttentionConfig,
-    DDTDecoderConfig,
     DDTPathConfig,
     ExperimentConfig,
     ModelConfig,
+    PixelDecoderConfig,
+    SemanticDecoderConfig,
 )
-from cascade_dit.model import build_model
+from cascade_dit.model import DDT, build_model
 from cascade_dit.rng import RNGStreams
+
+
+class FastDetailer(nn.Module):
+    def forward(self, coarse: torch.Tensor, _context: torch.Tensor) -> torch.Tensor:
+        return coarse
 
 
 def _config() -> ExperimentConfig:
     config = ExperimentConfig()
+    config.training.epochs = 2
     config.model = ModelConfig(
+        base_prediction_depth=1,
         encoder=DDTPathConfig(16, 1, 1),
-        decoder=DDTDecoderConfig(32, 2, 1, 2),
+        semantic_decoder=SemanticDecoderConfig(32, 1, 2),
+        pixel_decoder=PixelDecoderConfig(32, 3, 2, [1], [1]),
         attention=DDTAttentionConfig(rope=False),
     )
     config.model.conditioning.num_classes = 4
@@ -37,20 +47,17 @@ def _config() -> ExperimentConfig:
     return config
 
 
-def _state(
-    config: ExperimentConfig,
-    *,
-    phase: str = "semantic",
-    complete: bool = False,
-) -> ResumeState:
-    completed = config.total_epochs if complete else 1
-    epoch_in_phase = config.training.pixel.epochs if complete else 1
+def _model(config: ExperimentConfig) -> DDT:
+    model = build_model(config.model)
+    model.patch_detailer = FastDetailer()
+    return model
+
+
+def _state(config: ExperimentConfig, *, complete: bool = False) -> ResumeState:
     return ResumeState(
         schema_version=TRAINING_STATE_SCHEMA_VERSION,
-        completed_epoch=completed,
+        completed_epoch=config.total_epochs if complete else 1,
         global_step=7,
-        phase="pixel" if complete else phase,  # type: ignore[arg-type]
-        epoch_within_phase=epoch_in_phase,
         training_complete=complete,
         images_seen=1024,
         estimated_flops=123,
@@ -65,7 +72,7 @@ def _state(
 
 def test_checkpoint_roundtrip_plain_state_and_old_schema_rejection(tmp_path) -> None:
     config = _config()
-    model = build_model(config.model)
+    model = _model(config)
     ema = EMA(model)
     manager = CheckpointManager(tmp_path)
     saved = manager.save(model=model, ema=ema, state=_state(config), config=config)
@@ -73,55 +80,46 @@ def test_checkpoint_roundtrip_plain_state_and_old_schema_rejection(tmp_path) -> 
     with torch.no_grad():
         next(model.parameters()).zero_()
     restored = manager.load(saved, model, ema, expected_data_fingerprint="data")
-    assert restored.phase == "semantic"
+    assert restored.completed_epoch == 1 and not restored.training_complete
     assert all(torch.equal(model.state_dict()[name], value) for name, value in original.items())
     serialized = load_file(saved / "model.safetensors")
     assert set(serialized) == set(model.state_dict())
-    assert not any("adapter" in name or ".base." in name for name in serialized)
+    assert not any(name.startswith("lpips") for name in serialized)
 
     old = tmp_path / "old"
     old.mkdir()
-    (old / "metadata.json").write_text(json.dumps({"schema_version": 4}))
+    (old / "metadata.json").write_text(json.dumps({"schema_version": 5}))
     with pytest.raises(ValueError, match="old checkpoints"):
         manager.load(old, model, ema)
 
 
-def test_pixel_boundary_is_idempotent_and_not_sampling_eligible(tmp_path) -> None:
+def test_checkpoint_metadata_has_no_phase_and_any_joint_checkpoint_can_be_sampled(
+    tmp_path,
+) -> None:
     config = _config()
-    model = build_model(config.model)
-    ema = EMA(model)
-    manager = CheckpointManager(tmp_path)
-    state = ResumeState(
-        **(
-            vars(_state(config))
-            | {
-                "completed_epoch": config.training.semantic.epochs,
-                "phase": "pixel",
-                "epoch_within_phase": 0,
-            }
-        )
-    )
-    first = manager.save_phase_boundary(
-        model=model, ema=ema, state=state, config=config
-    )
-    second = manager.save_phase_boundary(
-        model=model, ema=ema, state=state, config=config
-    )
-    assert first == second
-    with pytest.raises(ValueError, match="completed pixel"):
-        load_checkpoint_bundle(first, require_rgb_complete=True)
-
-
-def test_completed_pixel_checkpoint_is_sampling_eligible(tmp_path) -> None:
-    config = _config()
-    model = build_model(config.model)
+    model = _model(config)
     manager = CheckpointManager(tmp_path)
     saved = manager.save(
+        model=model,
+        ema=EMA(model),
+        state=_state(config, complete=False),
+        config=config,
+    )
+    bundle = load_checkpoint_bundle(saved)
+    assert bundle.weights.is_file()
+    assert "phase" not in bundle.metadata
+    assert "epoch_within_phase" not in bundle.metadata
+
+
+def test_completed_joint_checkpoint_records_single_schedule_completion(tmp_path) -> None:
+    config = _config()
+    model = _model(config)
+    saved = CheckpointManager(tmp_path).save(
         model=model,
         ema=EMA(model),
         state=_state(config, complete=True),
         config=config,
     )
-    bundle = load_checkpoint_bundle(saved, require_rgb_complete=True)
-    assert bundle.weights.is_file()
-    assert bundle.metadata["phase"] == "pixel"
+    bundle = load_checkpoint_bundle(saved)
+    assert bundle.metadata["training_complete"] is True
+    assert bundle.metadata["completed_epoch"] == config.training.epochs

@@ -1,50 +1,35 @@
-# Semantic-to-Pixel DDT
+# Joint Semantic-Flow DDT
 
-This repository compares two class-conditional ImageNet-128 training modes with the
-same dual-head DDT architecture:
+This repository trains one class-conditional ImageNet-128 model for 200 epochs. The
+flow trunk denoises normalized DINOv3-B/16 layer-12 tokens, while a jointly trained
+pixel branch reconstructs raw RGB from selected flow hidden states.
 
-- `progressive`: train a normalized DINO semantic endpoint, then normalized RGB pixels.
-- `pixel_only`: train normalized RGB pixels directly.
+The 12-block flow encoder has a zero-initialized RAEv2 base prediction at block 8 and
+a two-block AdaLN semantic decoder for the full prediction. Both heads predict clean
+semantic tokens and receive independent flow-matching velocity losses. Sampling uses
+single-pass internal guidance over raw timesteps in `[0.10, 1.0]`:
 
-Every endpoint is an `8x8` grid of 768-dimensional tokens. The semantic endpoint is a
-configurable DINOv3-B/16 layer (layer 12 by default); RGB endpoints are flattened
-`3x16x16` patches.
+```text
+guided_x0 = base_x0 + 1.78 * (full_x0 - base_x0)
+```
 
-## Training distribution
+There is no classifier-free guidance evaluation, unconditional batch, endpoint
+mixing, direct pixel flow, or phased training.
 
-During the semantic phase, every item loads both DINO and RGB. By default, 90% are pure
-semantic (`pixel_ratio=0`) and 10% use a ratio sampled from
-`sigmoid(N(0, 1))`. The endpoints are normalized independently and then interpolated.
-Pure-semantic items use normalized RGB as an auxiliary pixel target. The pixel phase
-and `pixel_only` mode load only RGB and always use `pixel_ratio=1`.
+## Pixel decoder
 
-The item choice is deterministic from the experiment seed, epoch, and source index.
-One DataLoader is reused across phases; its shared phase/epoch state remains visible to
-persistent workers.
-
-## Model and objective
-
-The decoder is split at `model.decoder.semantic_depth`. Shared blocks feed a
-zero-initialized semantic head; remaining refinement blocks feed a separate
-zero-initialized pixel head.
-
-- `semantic` mode runs the shared decoder and semantic head only.
-- `mixed` mode runs both heads. Pixel refinement receives detached shared state and
-  conditioning, so pixel losses cannot update the encoder or shared decoder.
-- `pixel` mode skips the semantic head and trains the full trunk and pixel branch end to
-  end.
-
-The ratio-mixed clean prediction is converted to velocity for the main MSE. Only
-`pixel_ratio=0` items receive the direct auxiliary RGB MSE. One optimizer, scheduler,
-and EMA continue across the progressive boundary; only the compiled/DDP execution
-wrapper is rebuilt.
+Post-block encoder features `[4, 8, 12]` and semantic-decoder features `[1, 2]` are
+concatenated. Independent width-2048 paths produce transformer-refined coarse RGB
+patches and per-patch context. The coarse `3x16x16` patches are decoded independently
+by the DiP four-pool U-Net topology and folded into an absolute `[B,3,128,128]` RGB
+prediction. Pixel L1 and frozen VGG LPIPS losses update the pixel path and flow trunk
+without detachment.
 
 ## Preparation and training
 
-Preparation writes a resumable BF16 memmap for the selected DINO endpoint and computes
-independent DINO/RGB channel statistics over the full training set. Manifest schema v3
-is retained. An existing compatible manifest may contain extra, unused DINO layers and
-will be reused without preparation.
+Fresh preparation writes only the selected DINO BF16 cache and its channel
+statistics. Manifest schema v3 remains reusable when an existing compatible manifest
+also contains unused RGB stages or statistics.
 
 ```bash
 torchrun --standalone --nproc-per-node=8 scripts/prepare_representations.py \
@@ -52,50 +37,35 @@ torchrun --standalone --nproc-per-node=8 scripts/prepare_representations.py \
 
 torchrun --standalone --nproc-per-node=8 scripts/train.py \
   --config configs/experiment.yaml \
-  --override training.mode=progressive \
-  --output runs/progressive-seed0
-
-torchrun --standalone --nproc-per-node=8 scripts/train.py \
-  --config configs/experiment.yaml \
-  --override training.mode=pixel_only \
-  --output runs/pixel-only-seed0
+  --output runs/joint-seed0
 ```
 
-Settings support repeated dot-list overrides, for example:
+The per-sample objective is:
 
-```bash
---override training.semantic.mixed_probability=0.2 \
---override training.semantic.mix_ratio.scale=0.75 \
---override model.encoder.depth=16
+```text
+full_velocity_mse + base_velocity_mse + pixel_l1 + pixel_lpips
 ```
 
-## Sampling and evaluation
+All weights default to `1.0`. RGB L1 uses `[0,1]`; LPIPS receives prediction and
+target mapped to `[-1,1]`.
 
-During semantic training, evaluation integrates only a pure-semantic trajectory with
-`pixel_ratio=0`, then makes exactly one class-guided pixel prediction at `t=0`, also
-with `pixel_ratio=0`. Pixel training evaluates a pure-pixel trajectory with
-`pixel_ratio=1`. Both paths denormalize the final RGB tokens before previews and
-FID/IS.
+## Sampling
 
-Standalone sampling accepts a completed pixel-phase checkpoint:
+Sampling integrates only the internally guided semantic flow. It then performs one
+conditional, un-guided `t=0` forward with pixel decoding enabled. RGB is clamped only
+while writing previews and sample archives.
 
 ```bash
 torchrun --standalone --nproc-per-node=8 scripts/sample.py \
-  --checkpoint-dir runs/progressive-seed0/checkpoints/last \
+  --checkpoint-dir runs/joint-seed0/checkpoints/last \
   --num-samples 50000 \
   --evaluate
 ```
 
-Sampling is deterministic across batch sizes and rank counts. Interrupted archives
-resume from their completion maps.
-
-## Verification and compatibility
+Configuration schema v8 and checkpoint/training-state schema v6 intentionally reject
+all phase-era artifacts.
 
 ```bash
 uv run --extra dev pytest -q
 uv run --extra dev ruff check .
 ```
-
-Configuration schema v7 and checkpoint schema v5 intentionally reject older
-training artifacts. Representation manifest schema v3 remains reusable
-when it contains the selected semantic cache and RGB statistics.

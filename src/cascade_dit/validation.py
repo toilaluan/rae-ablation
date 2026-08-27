@@ -9,7 +9,7 @@ import torch
 from torch import Tensor
 
 from .config import ExperimentConfig
-from .data import EndpointBatchPreprocessor, EndpointPhase
+from .data import JointBatchPreprocessor
 from .rng import RNGStreams
 from .sampling import class_balanced_labels
 from .training import compute_training_loss
@@ -64,23 +64,22 @@ def create_validation_plan(
 
 
 @torch.inference_mode()
-def validate_phase_loss(
+def validate_joint_loss(
     model: torch.nn.Module,
     loader: object,
-    batch_preprocessor: EndpointBatchPreprocessor,
+    batch_preprocessor: JointBatchPreprocessor,
     config: ExperimentConfig,
+    lpips_model: torch.nn.Module,
     *,
-    phase: EndpointPhase,
     epoch: int,
     device: torch.device,
 ) -> dict[str, float]:
     streams = RNGStreams.create(config.experiment.seed + 1_000_003 + epoch, device)
     totals: list[float] = []
-    velocities: list[float] = []
-    auxiliary: list[float] = []
-    weighted_auxiliary: list[float] = []
-    ratios: list[Tensor] = []
-    pure_semantic_count = 0
+    full_velocities: list[float] = []
+    base_velocities: list[float] = []
+    pixel_l1: list[float] = []
+    pixel_lpips: list[float] = []
     was_training = model.training
     model.eval()
     try:
@@ -93,28 +92,21 @@ def validate_phase_loss(
                 batch,
                 streams,
                 config,
-                phase=phase,
+                lpips_model,
             )
             totals.append(float(result.loss.total))
-            velocities.append(float(result.loss.velocity_mse))
-            auxiliary.append(float(result.loss.pixel_auxiliary_mse))
-            weighted_auxiliary.append(float(result.loss.weighted_pixel_auxiliary_mse))
-            pure_semantic_count += result.loss.pure_semantic_count
-            ratios.append(batch.pixel_ratio.detach().float().cpu())
+            full_velocities.append(float(result.loss.full_velocity_mse))
+            base_velocities.append(float(result.loss.base_velocity_mse))
+            pixel_l1.append(float(result.loss.pixel_l1))
+            pixel_lpips.append(float(result.loss.pixel_lpips))
     finally:
         model.train(was_training)
     if not totals:
         raise ValueError("validation loader produced no batches")
-    all_ratios = torch.cat(ratios)
-    mixed_count = int(((all_ratios > 0) & (all_ratios < 1)).sum())
     return {
         "loss": sum(totals) / len(totals),
-        "velocity_mse": sum(velocities) / len(velocities),
-        "pixel_auxiliary_mse": sum(auxiliary) / len(auxiliary),
-        "weighted_pixel_auxiliary_mse": sum(weighted_auxiliary) / len(weighted_auxiliary),
-        "pure_semantic_count": float(pure_semantic_count),
-        "mixed_count": float(mixed_count),
-        "pixel_ratio_mean": float(all_ratios.mean()),
-        "pixel_ratio_min": float(all_ratios.min()),
-        "pixel_ratio_max": float(all_ratios.max()),
+        "full_velocity_mse": sum(full_velocities) / len(full_velocities),
+        "base_velocity_mse": sum(base_velocities) / len(base_velocities),
+        "pixel_l1": sum(pixel_l1) / len(pixel_l1),
+        "pixel_lpips": sum(pixel_lpips) / len(pixel_lpips),
     }

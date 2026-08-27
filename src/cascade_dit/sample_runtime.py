@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import time
@@ -16,7 +17,7 @@ import torch
 from PIL import Image, ImageDraw
 from torch import Tensor
 
-SAMPLING_MANIFEST_SCHEMA_VERSION = 3
+SAMPLING_MANIFEST_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -24,9 +25,9 @@ class SamplingParameters:
     steps: int = 40
     solver: str = "euler"
     timestep_shift: float = 1.0
-    guidance_scale: float = 1.0
-    guidance_start: float = 0.0
-    guidance_end: float = 1.0
+    internal_guidance_scale: float = 1.78
+    internal_guidance_t_min: float = 0.10
+    internal_guidance_t_max: float = 1.0
     batch_size: int = 32
     seed: int = 0
 
@@ -37,8 +38,15 @@ class SamplingParameters:
             raise ValueError("sampling solver must be euler or heun")
         if self.timestep_shift <= 0:
             raise ValueError("sampling timestep shift must be positive")
-        if not 0 <= self.guidance_start < self.guidance_end <= 1:
-            raise ValueError("sampling CFG interval must satisfy 0 <= start < end <= 1")
+        if (
+            not math.isfinite(self.internal_guidance_scale)
+            or self.internal_guidance_scale <= 0
+        ):
+            raise ValueError("internal-guidance scale must be positive")
+        if not 0 <= self.internal_guidance_t_min < self.internal_guidance_t_max <= 1:
+            raise ValueError(
+                "internal-guidance interval must satisfy 0 <= t_min < t_max <= 1"
+            )
 
 
 def checkpoint_sha256(path: str | Path) -> str:
@@ -95,7 +103,7 @@ def sampling_output_name(num_samples: int, parameters: SamplingParameters) -> st
     parameters.validate()
     return (
         f"samples-{parameters.solver}-n{num_samples}-steps{parameters.steps}"
-        f"-cfg{parameters.guidance_scale:g}-shift{parameters.timestep_shift:g}"
+        f"-ig{parameters.internal_guidance_scale:g}-shift{parameters.timestep_shift:g}"
     )
 
 

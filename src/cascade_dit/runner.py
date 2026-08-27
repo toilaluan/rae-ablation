@@ -17,18 +17,18 @@ from .checkpoint import (
 )
 from .config import IMAGE_SIZE, TOKEN_COUNT, TOKEN_DIM, ExperimentConfig, load_checkpoint_config
 from .data import (
-    EndpointBatchPreprocessor,
-    EndpointPhase,
+    JointBatchPreprocessor,
     data_fingerprint,
-    load_endpoint_manifest,
-    make_endpoint_loader,
-    set_endpoint_loader_epoch,
+    load_joint_manifest,
+    make_joint_loader,
+    set_joint_loader_epoch,
 )
 from .distributed import broadcast_string
 from .evaluation import evaluate_npz, save_evaluation
 from .flops import model_flops_per_step
 from .model import DDT, build_model
 from .model.compile import compile_model_regions
+from .objective import build_lpips
 from .optim import (
     build_optimizer,
     build_training_scheduler,
@@ -37,10 +37,9 @@ from .optim import (
 )
 from .preparation import (
     representation_manifest_fingerprint,
-    statistics_from_manifest,
     validate_manifest_compatibility,
 )
-from .representations import ChannelStatistics, RepresentationManifest, unpatchify_rgb
+from .representations import RepresentationManifest
 from .rng import RNGStreams
 from .sample_runtime import (
     SamplingParameters,
@@ -49,9 +48,9 @@ from .sample_runtime import (
     sample_to_archive,
     state_dict_sha256,
 )
-from .sampling import sample_semantic_then_pixel, sample_tokens
+from .sampling import sample_semantic_then_pixel
 from .training import compute_training_loss
-from .validation import ValidationPlan, create_validation_plan, validate_phase_loss
+from .validation import ValidationPlan, create_validation_plan, validate_joint_loss
 
 ImageLog = Callable[[str, str, int, str], None]
 
@@ -59,11 +58,8 @@ ImageLog = Callable[[str, str, int, str], None]
 def load_representation_manifest(
     config: ExperimentConfig,
 ) -> tuple[RepresentationManifest, str]:
-    manifest = load_endpoint_manifest(
-        config, load_semantic=config.training.mode == "progressive"
-    )
-    if config.training.mode == "progressive":
-        validate_manifest_compatibility(config, manifest)
+    manifest = load_joint_manifest(config)
+    validate_manifest_compatibility(config, manifest)
     return manifest, representation_manifest_fingerprint(manifest)
 
 
@@ -92,7 +88,7 @@ def _different_config_fields(active: object, saved: object, prefix: str) -> list
 
 
 class ExperimentRunner:
-    """Progressive semantic-to-pixel or direct-pixel DDT training."""
+    """Single-phase joint semantic-flow and RGB-reconstruction training."""
 
     def __init__(
         self,
@@ -112,20 +108,13 @@ class ExperimentRunner:
         self.log = log or (lambda _metrics: None)
         self.log_image = log_image or (lambda _path, _caption, _step, _key: None)
         manifest, self.representation_fingerprint = load_representation_manifest(config)
-        self.rgb_statistics: ChannelStatistics = statistics_from_manifest(
-            manifest, "rgb"
-        )
         self.data_fingerprint = data_fingerprint(config.data)
-        self.batch_preprocessor = EndpointBatchPreprocessor(
-            config,
-            manifest,
-            self.device,
-            load_semantic=config.training.mode == "progressive",
-        )
+        self.batch_preprocessor = JointBatchPreprocessor(config, manifest, self.device)
         self.rng = RNGStreams.create(config.experiment.seed, self.device)
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self.rng.initialization.initial_seed())
             self.model: DDT = build_model(config.model).to(self.device)
+        self.lpips_model = build_lpips(self.device)
         torch.manual_seed(config.experiment.seed + 90_000)
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(config.experiment.seed + 90_000)
@@ -145,18 +134,6 @@ class ExperimentRunner:
         if resume is not None:
             self.resume(_resolve_checkpoint_path(resume))
         self.validation_plan = self._initialize_validation_plan()
-
-    @property
-    def phase(self) -> EndpointPhase:
-        if self.completed_epoch >= self.config.total_epochs:
-            return "pixel"
-        return self.config.phase_for_epoch(self.completed_epoch)[0]
-
-    @property
-    def epoch_within_phase(self) -> int:
-        if self.completed_epoch >= self.config.total_epochs:
-            return self.config.training.pixel.epochs
-        return self.config.phase_for_epoch(self.completed_epoch)[1]
 
     def _initialize_validation_plan(self) -> ValidationPlan:
         plan = create_validation_plan(
@@ -183,13 +160,14 @@ class ExperimentRunner:
 
     def _sampling_parameters(self) -> SamplingParameters:
         values = self.config.sampling
+        guidance = values.internal_guidance
         return SamplingParameters(
             steps=values.steps,
             solver=values.solver,
             timestep_shift=values.timestep_shift,
-            guidance_scale=values.guidance_scale,
-            guidance_start=values.guidance_start,
-            guidance_end=values.guidance_end,
+            internal_guidance_scale=guidance.scale,
+            internal_guidance_t_min=guidance.t_min,
+            internal_guidance_t_max=guidance.t_max,
             batch_size=values.batch_size,
             seed=values.seed,
         )
@@ -200,7 +178,6 @@ class ExperimentRunner:
         sample_count: int,
         checkpoint_hash: str,
         parameters: SamplingParameters,
-        phase: EndpointPhase,
     ) -> dict[str, float] | None:
         payload: list[object | None] = [None, None]
         if self.rank == 0:
@@ -214,7 +191,6 @@ class ExperimentRunner:
                     if (
                         evaluation.get("sampling_plan_hash") != self.validation_plan.plan_hash
                         or evaluation.get("num_samples") != sample_count
-                        or evaluation.get("phase") != phase
                         or manifest.get("num_samples") != sample_count
                         or manifest.get("checkpoint_sha256") != checkpoint_hash
                         or manifest.get("parameters") != vars(parameters)
@@ -240,8 +216,8 @@ class ExperimentRunner:
         *,
         completed_epoch: int,
         training_complete: bool,
-        phase: EndpointPhase,
     ) -> tuple[Path | None, Path, int, dict[str, float] | None]:
+        model.eval()
         sample_count = (
             self.config.evaluation.num_samples
             if training_complete
@@ -255,9 +231,7 @@ class ExperimentRunner:
         parameters = self._sampling_parameters()
         digest = state_dict_sha256(self.ema.state_dict()) if self.rank == 0 else None
         digest = broadcast_string(digest, self.rank)
-        cached = self._cached_evaluation(
-            output, sample_count, digest, parameters, phase
-        )
+        cached = self._cached_evaluation(output, sample_count, digest, parameters)
         if cached is not None:
             return None, output, sample_count, cached
         labels, seeds = self.validation_plan.prefix(sample_count)
@@ -278,41 +252,19 @@ class ExperimentRunner:
                 dtype=torch.bfloat16,
                 enabled=self.device.type == "cuda",
             ):
-                if phase == "semantic":
-                    normalized = sample_semantic_then_pixel(
-                        execution,
-                        noise,
-                        device_labels,
-                        steps=parameters.steps,
-                        solver=parameters.solver,
-                        timestep_shift=parameters.timestep_shift,
-                        guidance_scale=parameters.guidance_scale,
-                        guidance_start=parameters.guidance_start,
-                        guidance_end=parameters.guidance_end,
-                        denominator_floor=self.config.objective.denominator_floor,
-                        num_classes=self.config.model.num_classes,
-                    )
-                else:
-                    ratio = torch.ones(
-                        batch_labels.shape[0], device=self.device, dtype=torch.float32
-                    )
-                    normalized = sample_tokens(
-                        execution,
-                        noise,
-                        device_labels,
-                        ratio,
-                        prediction_mode="pixel",
-                        steps=parameters.steps,
-                        solver=parameters.solver,
-                        timestep_shift=parameters.timestep_shift,
-                        guidance_scale=parameters.guidance_scale,
-                        guidance_start=parameters.guidance_start,
-                        guidance_end=parameters.guidance_end,
-                        denominator_floor=self.config.objective.denominator_floor,
-                        num_classes=self.config.model.num_classes,
-                    )
-            tokens = self.rgb_statistics.denormalize(normalized.float())
-            return unpatchify_rgb(tokens).clamp(0, 1)
+                pixels = sample_semantic_then_pixel(
+                    execution,
+                    noise,
+                    device_labels,
+                    steps=parameters.steps,
+                    solver=parameters.solver,
+                    timestep_shift=parameters.timestep_shift,
+                    internal_guidance_scale=parameters.internal_guidance_scale,
+                    internal_guidance_t_min=parameters.internal_guidance_t_min,
+                    internal_guidance_t_max=parameters.internal_guidance_t_max,
+                    denominator_floor=self.config.objective.denominator_floor,
+                )
+            return pixels.float().clamp(0, 1)
 
         archive = sample_to_archive(
             output_directory=output,
@@ -334,7 +286,6 @@ class ExperimentRunner:
         output: Path,
         sample_count: int,
         cached: dict[str, float] | None,
-        phase: EndpointPhase,
     ) -> dict[str, float]:
         payload: list[object | None] = [cached, None]
         if self.rank == 0 and cached is None:
@@ -352,7 +303,6 @@ class ExperimentRunner:
                     metrics,
                     self.validation_plan.plan_hash,
                     num_samples=sample_count,
-                    phase=phase,
                 )
                 prune_sample_archive(output)
                 payload[0] = metrics
@@ -371,8 +321,6 @@ class ExperimentRunner:
             schema_version=TRAINING_STATE_SCHEMA_VERSION,
             completed_epoch=self.completed_epoch,
             global_step=self.global_step,
-            phase=self.phase,
-            epoch_within_phase=self.epoch_within_phase,
             training_complete=training_complete,
             images_seen=self.images_seen,
             estimated_flops=self.estimated_flops,
@@ -422,6 +370,10 @@ class ExperimentRunner:
                 "active representation manifest differs from the checkpoint",
                 stacklevel=2,
             )
+        if state.completed_epoch > self.config.total_epochs:
+            raise ValueError("checkpoint completed epoch exceeds the active schedule")
+        if state.training_complete != (state.completed_epoch == saved_config.total_epochs):
+            raise ValueError("checkpoint completion metadata is inconsistent")
         self.completed_epoch = state.completed_epoch
         self.global_step = state.global_step
         self.images_seen = state.images_seen
@@ -429,8 +381,6 @@ class ExperimentRunner:
         self.elapsed_before_resume = state.wall_clock_seconds
         self.started_at = time.perf_counter()
         self.rng.load_state_dict(state.rng_streams)
-        if state.phase != self.phase or state.epoch_within_phase != self.epoch_within_phase:
-            raise ValueError("checkpoint phase does not match its completed epoch")
         if not differences and state.optimizer is not None:
             self.optimizer.load_state_dict(state.optimizer)
             self._pending_scheduler_state = state.scheduler
@@ -440,7 +390,7 @@ class ExperimentRunner:
                 stacklevel=2,
             )
 
-    def _build_execution(self, steps_per_epoch: int, phase: EndpointPhase) -> nn.Module:
+    def _build_execution(self, steps_per_epoch: int) -> nn.Module:
         if self.scheduler is None:
             scheduler = self.config.optimizer.scheduler
             self.scheduler = build_training_scheduler(
@@ -459,39 +409,20 @@ class ExperimentRunner:
             execution = torch.nn.parallel.DistributedDataParallel(
                 execution,
                 device_ids=[self.device.index] if self.device.type == "cuda" else None,
-                find_unused_parameters=phase == "pixel",
             )
         return execution
 
     def run(self, *, max_steps: int | None = None) -> None:
-        execution: nn.Module | None = None
-        loader = None
-        previous_phase: EndpointPhase | None = None
+        loader = make_joint_loader(
+            self.config,
+            rank=self.rank,
+            world_size=self.world_size,
+            epoch=self.completed_epoch,
+        )
+        execution = self._build_execution(len(loader))
+        guidance = self.config.sampling.internal_guidance
         for epoch in range(self.completed_epoch, self.config.total_epochs):
-            phase, epoch_in_phase = self.config.phase_for_epoch(epoch)
-            if previous_phase is not None and phase != previous_phase:
-                execution = None
-                if self.rank == 0 and self.config.checkpoint.save_phase_boundary:
-                    self.manager.save_phase_boundary(
-                        model=self.model,
-                        ema=self.ema,
-                        state=self._resume_state(training_complete=False),
-                        config=self.config,
-                    )
-                if self.world_size > 1:
-                    torch.distributed.barrier()
-            if loader is None:
-                loader = make_endpoint_loader(
-                    self.config,
-                    phase,
-                    rank=self.rank,
-                    world_size=self.world_size,
-                    epoch=epoch_in_phase,
-                )
-            else:
-                set_endpoint_loader_epoch(loader, phase, epoch_in_phase)
-            if execution is None:
-                execution = self._build_execution(len(loader), phase)
+            set_joint_loader_epoch(loader, epoch)
             execution.train()
             for raw_batch in loader:
                 batch = self.batch_preprocessor(raw_batch)
@@ -506,7 +437,7 @@ class ExperimentRunner:
                         batch,
                         self.rng,
                         self.config,
-                        phase=phase,
+                        self.lpips_model,
                     )
                 result.loss.total.backward()
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
@@ -517,28 +448,22 @@ class ExperimentRunner:
                 self.scheduler.step()
                 self.ema.update(self.model)
                 self.global_step += 1
-                self.images_seen += batch.clean.shape[0] * self.world_size
-                self.estimated_flops += model_flops_per_step(self.config, phase)
-                ratios = batch.pixel_ratio.detach().float()
+                self.images_seen += batch.semantic.shape[0] * self.world_size
+                self.estimated_flops += model_flops_per_step(self.config)
                 metrics: dict[str, float | int | str] = {
-                    "phase": phase,
                     "epoch": epoch,
-                    "epoch_within_phase": epoch_in_phase,
                     "step": self.global_step,
                     "loss": float(result.loss.total.detach()),
-                    "velocity_mse": float(result.loss.velocity_mse.detach()),
-                    "pixel_auxiliary_mse": float(
-                        result.loss.pixel_auxiliary_mse.detach()
+                    "full_velocity_mse": float(result.loss.full_velocity_mse.detach()),
+                    "base_velocity_mse": float(result.loss.base_velocity_mse.detach()),
+                    "pixel_l1": float(result.loss.pixel_l1.detach()),
+                    "pixel_lpips": float(result.loss.pixel_lpips.detach()),
+                    "semantic_target_rms": float(
+                        batch.semantic.float().square().mean().sqrt()
                     ),
-                    "weighted_pixel_auxiliary_mse": float(
-                        result.loss.weighted_pixel_auxiliary_mse.detach()
-                    ),
-                    "pure_semantic_count": result.loss.pure_semantic_count,
-                    "mixed_count": int(((ratios > 0) & (ratios < 1)).sum()),
-                    "pixel_ratio_mean": float(ratios.mean()),
-                    "pixel_ratio_min": float(ratios.min()),
-                    "pixel_ratio_max": float(ratios.max()),
-                    "target_rms": float(batch.clean.float().square().mean().sqrt()),
+                    "internal_guidance_scale": guidance.scale,
+                    "internal_guidance_t_min": guidance.t_min,
+                    "internal_guidance_t_max": guidance.t_max,
                     "lr": self.optimizer.param_groups[0]["lr"],
                     "gradient_norm": float(gradient_norm),
                 }
@@ -552,21 +477,17 @@ class ExperimentRunner:
             final_evaluation: tuple[dict[str, float], int] | None = None
             if complete or (interval > 0 and self.completed_epoch % interval == 0):
                 ema_model = self.ema.to_model(self.model).to(self.device)
-                validation = validate_phase_loss(
+                validation = validate_joint_loss(
                     ema_model,
                     loader,
                     self.batch_preprocessor,
                     self.config,
-                    phase=phase,
+                    self.lpips_model,
                     epoch=epoch,
                     device=self.device,
                 )
                 self.log(
-                    {
-                        "phase": phase,
-                        "epoch": epoch,
-                        "step": self.global_step,
-                    }
+                    {"epoch": epoch, "step": self.global_step}
                     | {f"validation/{name}": value for name, value in validation.items()}
                 )
                 archive, evaluation_output, sample_count, cached = (
@@ -574,21 +495,19 @@ class ExperimentRunner:
                         ema_model,
                         completed_epoch=self.completed_epoch,
                         training_complete=complete,
-                        phase=phase,
                     )
                 )
                 del ema_model
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
                 generated_metrics = self._evaluate_archive(
-                    archive, evaluation_output, sample_count, cached, phase
+                    archive, evaluation_output, sample_count, cached
                 )
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
                 if self.rank == 0:
                     self.log(
                         {
-                            "phase": phase,
                             "epoch": epoch,
                             "step": self.global_step,
                             "validation/pixel_sample_count": sample_count,
@@ -600,7 +519,7 @@ class ExperimentRunner:
                     )
                     self.log_image(
                         str(evaluation_output / "preview.png"),
-                        f"RGB EMA samples, phase={phase}, epoch={self.completed_epoch}",
+                        f"RGB EMA samples, epoch={self.completed_epoch}",
                         self.global_step,
                         "validation/pixel_samples",
                     )
@@ -622,11 +541,9 @@ class ExperimentRunner:
                         metrics,
                         self.validation_plan.plan_hash,
                         num_samples=sample_count,
-                        phase=phase,
                     )
             if self.world_size > 1:
                 torch.distributed.barrier()
-            previous_phase = phase
         self._write_run_metrics(complete=True)
 
     def _write_run_metrics(self, *, complete: bool) -> None:
@@ -634,14 +551,18 @@ class ExperimentRunner:
             return
         output = Path(self.config.experiment.output_directory)
         output.mkdir(parents=True, exist_ok=True)
+        guidance = self.config.sampling.internal_guidance
         metrics = {
             "complete": complete,
-            "mode": self.config.training.mode,
-            "phase": self.phase,
             "global_step": self.global_step,
             "completed_epoch": self.completed_epoch,
             "images_seen": self.images_seen,
             "estimated_flops": self.estimated_flops,
+            "internal_guidance": {
+                "scale": guidance.scale,
+                "t_min": guidance.t_min,
+                "t_max": guidance.t_max,
+            },
             "wall_clock_seconds": (
                 self.elapsed_before_resume + time.perf_counter() - self.started_at
             ),

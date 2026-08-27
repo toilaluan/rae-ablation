@@ -28,20 +28,15 @@ def resolve_checkpoint_directory(path: str | Path) -> Path:
     return resolved
 
 
-def load_checkpoint_bundle(path: str | Path, *, require_rgb_complete: bool = False) -> CheckpointBundle:
+def load_checkpoint_bundle(path: str | Path) -> CheckpointBundle:
     directory = resolve_checkpoint_directory(path)
     metadata_path = directory / "metadata.json"
     if not metadata_path.is_file():
-        raise ValueError("checkpoint predates the semantic-pixel DDT schema")
+        raise ValueError("checkpoint predates the joint semantic-flow DDT schema")
     metadata = json.loads(metadata_path.read_text())
     if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
         raise ValueError("checkpoint schema is incompatible")
     config = load_checkpoint_config(directory / "config.json")
-    if require_rgb_complete and (
-        metadata.get("phase") != "pixel"
-        or not metadata.get("training_complete")
-    ):
-        raise ValueError("sampling requires completed pixel-phase training")
     weights = directory / "ema.safetensors"
     if not weights.is_file():
         raise FileNotFoundError(f"checkpoint EMA weights are missing: {weights}")

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .config import ObjectiveConfig
@@ -20,12 +20,18 @@ class GaussianFlowPath:
 
 
 @dataclass(frozen=True)
-class FlowLoss:
+class JointLoss:
     total: Tensor
-    velocity_mse: Tensor
-    pixel_auxiliary_mse: Tensor
-    weighted_pixel_auxiliary_mse: Tensor
-    pure_semantic_count: int
+    full_velocity_mse: Tensor
+    base_velocity_mse: Tensor
+    pixel_l1: Tensor
+    pixel_lpips: Tensor
+    weighted_base_velocity_mse: Tensor
+    weighted_pixel_l1: Tensor
+    weighted_pixel_lpips: Tensor
+
+
+FlowLoss = JointLoss
 
 
 def _broadcast_timestep(timestep: Tensor, values: Tensor) -> Tensor:
@@ -80,42 +86,49 @@ def x0_to_velocity(
     return (noisy - clean_prediction) / denominator
 
 
+def build_lpips(device: torch.device | str) -> nn.Module:
+    """Build the frozen VGG LPIPS evaluator outside the trainable DDT."""
+    import lpips
+
+    perceptual = lpips.LPIPS(net="vgg").to(device).eval()
+    perceptual.requires_grad_(False)
+    return perceptual
+
+
 def flow_matching_loss(
     path: GaussianFlowPath,
     output: DDTOutput,
     pixel_target: Tensor,
-    pixel_ratio: Tensor,
+    lpips_model: nn.Module,
     config: ObjectiveConfig,
-) -> FlowLoss:
-    if pixel_target.shape != path.clean.shape:
-        raise ValueError("pixel target must have the clean endpoint shape")
-    if pixel_ratio.shape != (path.clean.shape[0],):
-        raise ValueError("pixel_ratio must have shape [B]")
-    predicted_velocity = x0_to_velocity(
-        path.noisy,
-        output.prediction,
-        path.timestep,
-        config.denominator_floor,
+) -> JointLoss:
+    """Compute full/base semantic flow loss and raw-RGB reconstruction loss."""
+    if output.rgb is None:
+        raise ValueError("joint training requires RGB decoding")
+    if pixel_target.ndim != 4 or pixel_target.shape != output.rgb.shape:
+        raise ValueError("pixel targets and RGB predictions must have equal BCHW shapes")
+    full_velocity = x0_to_velocity(
+        path.noisy, output.full_x0, path.timestep, config.denominator_floor
     )
-    velocity_mse = F.mse_loss(predicted_velocity.float(), path.velocity.float())
-    pure_semantic = pixel_ratio == 0
-    pure_semantic_count = int(pure_semantic.sum().item())
-    if pure_semantic_count:
-        if output.pixel_x0 is None:
-            raise ValueError("pure-semantic items require a pixel prediction")
-        pixel_auxiliary_mse = F.mse_loss(
-            output.pixel_x0[pure_semantic].float(),
-            pixel_target[pure_semantic].float(),
-        )
-    elif output.pixel_x0 is not None:
-        pixel_auxiliary_mse = output.pixel_x0.float().sum() * 0
-    else:
-        pixel_auxiliary_mse = velocity_mse.new_zeros(())
-    weighted = config.pixel_auxiliary_mse_weight * pixel_auxiliary_mse
-    return FlowLoss(
-        velocity_mse + weighted,
-        velocity_mse,
-        pixel_auxiliary_mse,
-        weighted,
-        pure_semantic_count,
+    base_velocity = x0_to_velocity(
+        path.noisy, output.base_x0, path.timestep, config.denominator_floor
+    )
+    full_mse = F.mse_loss(full_velocity.float(), path.velocity.float())
+    base_mse = F.mse_loss(base_velocity.float(), path.velocity.float())
+    pixel_l1 = F.l1_loss(output.rgb.float(), pixel_target.float())
+    predicted_lpips = output.rgb.float().mul(2).sub(1)
+    target_lpips = pixel_target.float().mul(2).sub(1)
+    pixel_lpips = lpips_model(predicted_lpips, target_lpips).float().mean()
+    weighted_base = config.base_velocity_weight * base_mse
+    weighted_l1 = config.pixel_l1_weight * pixel_l1
+    weighted_lpips = config.pixel_lpips_weight * pixel_lpips
+    return JointLoss(
+        full_mse + weighted_base + weighted_l1 + weighted_lpips,
+        full_mse,
+        base_mse,
+        pixel_l1,
+        pixel_lpips,
+        weighted_base,
+        weighted_l1,
+        weighted_lpips,
     )

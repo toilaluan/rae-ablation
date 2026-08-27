@@ -1,4 +1,4 @@
-"""Two-endpoint semantic-to-pixel DDT experiments."""
+"""Joint semantic-flow DDT with internally guided RGB generation."""
 
 from .config import load_config
 from .model import DDT, DDTOutput, build_model
@@ -10,4 +10,4 @@ __all__ = [
     "load_config",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

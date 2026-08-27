@@ -5,7 +5,7 @@ import json
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -14,9 +14,8 @@ from torch import Tensor, nn
 from .config import CONFIG_SCHEMA_VERSION, ExperimentConfig
 from .model.compile import clean_state_dict
 
-CHECKPOINT_SCHEMA_VERSION = 5
-TRAINING_STATE_SCHEMA_VERSION = 5
-TrainingPhase = Literal["semantic", "pixel"]
+CHECKPOINT_SCHEMA_VERSION = 6
+TRAINING_STATE_SCHEMA_VERSION = 6
 
 
 def _tensor_state(state: dict[str, object]) -> dict[str, Tensor]:
@@ -72,8 +71,6 @@ class ResumeState:
     schema_version: int
     completed_epoch: int
     global_step: int
-    phase: TrainingPhase
-    epoch_within_phase: int
     training_complete: bool
     images_seen: int
     estimated_flops: int
@@ -107,8 +104,6 @@ class CheckpointManager:
             "name": name,
             "completed_epoch": state.completed_epoch,
             "global_step": state.global_step,
-            "phase": state.phase,
-            "epoch_within_phase": state.epoch_within_phase,
             "training_complete": state.training_complete,
             "images_seen": state.images_seen,
             "estimated_flops": state.estimated_flops,
@@ -126,7 +121,6 @@ class CheckpointManager:
                 "name",
                 "completed_epoch",
                 "global_step",
-                "phase",
                 "data_fingerprint",
                 "representation_fingerprint",
             )
@@ -174,25 +168,6 @@ class CheckpointManager:
             idempotent=False,
         )
 
-    def save_phase_boundary(
-        self,
-        *,
-        model: nn.Module,
-        ema: EMA,
-        state: ResumeState,
-        config: ExperimentConfig,
-    ) -> Path:
-        if state.phase != "pixel" or state.epoch_within_phase != 0:
-            raise ValueError("phase boundary must be the beginning of the pixel phase")
-        return self._save_named(
-            "boundary-pixel",
-            model=model,
-            ema=ema,
-            state=state,
-            config=config,
-            idempotent=True,
-        )
-
     def load(
         self,
         checkpoint: str | Path,
@@ -209,7 +184,7 @@ class CheckpointManager:
             path = path.resolve()
         metadata_path = path / "metadata.json"
         if not metadata_path.is_file():
-            raise ValueError("checkpoint predates the semantic-pixel DDT schema")
+            raise ValueError("checkpoint predates the joint semantic-flow DDT schema")
         metadata = json.loads(metadata_path.read_text())
         if metadata.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
             raise ValueError("checkpoint schema is incompatible; old checkpoints are rejected")
@@ -220,8 +195,6 @@ class CheckpointManager:
         for name in (
             "completed_epoch",
             "global_step",
-            "phase",
-            "epoch_within_phase",
             "training_complete",
             "data_fingerprint",
             "representation_fingerprint",
@@ -231,8 +204,6 @@ class CheckpointManager:
         if (
             state.completed_epoch < 0
             or state.global_step < 0
-            or state.epoch_within_phase < 0
-            or state.phase not in {"semantic", "pixel"}
         ):
             raise ValueError("checkpoint training progress is invalid")
         for name, expected in (

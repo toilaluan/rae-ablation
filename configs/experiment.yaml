@@ -1,7 +1,7 @@
-schema_version: 7
+schema_version: 8
 
 experiment:
-  name: semantic-pixel-ddt
+  name: joint-semantic-pixel-ddt
   seed: 0
   output_directory: runs/experiment
 
@@ -24,18 +24,8 @@ encoder:
   apply_final_norm: true
 
 training:
-  mode: progressive
-  semantic:
-    epochs: 50
-    timestep_shift: 4.0
-    mixed_probability: 0.1
-    mix_ratio:
-      distribution: logit_normal
-      loc: 0.0
-      scale: 1.0
-  pixel:
-    epochs: 120
-    timestep_shift: 7.0
+  epochs: 200
+  timestep_shift: 4.0
 
 representations:
   directory: data/direct-representations
@@ -50,15 +40,21 @@ representations:
 model:
   architecture: ddt
   token_dim: 768
+  base_prediction_depth: 8
   encoder:
     width: 768
     depth: 12
     heads: 12
-  decoder:
+  semantic_decoder:
+    width: 2048
+    depth: 2
+    heads: 16
+  pixel_decoder:
     width: 2048
     depth: 3
-    semantic_depth: 2
     heads: 16
+    encoder_features: [4, 8, 12]
+    decoder_features: [1, 2]
   feedforward:
     mlp_ratio: 4.0
   attention:
@@ -76,7 +72,9 @@ objective:
   timestep_loc: 0.0
   timestep_scale: 1.0
   denominator_floor: 0.05
-  pixel_auxiliary_mse_weight: 1.0
+  base_velocity_weight: 1.0
+  pixel_l1_weight: 1.0
+  pixel_lpips_weight: 1.0
 
 optimizer:
   kind: adamw
@@ -96,9 +94,10 @@ sampling:
   steps: 50
   solver: euler
   timestep_shift: 1.0
-  guidance_scale: 3.0
-  guidance_start: 0.0
-  guidance_end: 1.0
+  internal_guidance:
+    scale: 1.78
+    t_min: 0.10
+    t_max: 1.0
   batch_size: 32
   seed: 0
 
@@ -110,7 +109,6 @@ validation:
 checkpoint:
   directory: checkpoints
   interval_epochs: 5
-  save_phase_boundary: true
   resume: null
 
 compile:
@@ -123,7 +121,7 @@ compile:
 wandb:
   enabled: true
   entity: null
-  project: semantic-pixel-ddt
+  project: joint-semantic-pixel-ddt
   name: null
   group: null
   tags: []

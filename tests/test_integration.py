@@ -1,29 +1,49 @@
 from __future__ import annotations
 
-import torch
+import os
 
-from cascade_dit.checkpoint import EMA, CheckpointManager, ResumeState
+import torch
+from torch import nn
+
+from cascade_dit.checkpoint import (
+    EMA,
+    TRAINING_STATE_SCHEMA_VERSION,
+    CheckpointManager,
+    ResumeState,
+)
 from cascade_dit.config import (
     DDTAttentionConfig,
-    DDTDecoderConfig,
     DDTPathConfig,
     ExperimentConfig,
     ModelConfig,
+    PixelDecoderConfig,
+    SemanticDecoderConfig,
 )
-from cascade_dit.data import PreparedEndpointBatch
-from cascade_dit.model import build_model
-from cascade_dit.optim import build_optimizer, parameter_count
+from cascade_dit.data import PreparedJointBatch
+from cascade_dit.model import DDT, build_model
+from cascade_dit.optim import build_optimizer
 from cascade_dit.rng import RNGStreams
 from cascade_dit.training import compute_training_loss
 
 
+class FastDetailer(nn.Module):
+    def forward(self, coarse: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        return coarse + 0.01 * context[:, :3, None, None]
+
+
+class LPIPSStub(nn.Module):
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return (prediction - target).abs().mean((1, 2, 3), keepdim=True)
+
+
 def _config() -> ExperimentConfig:
     config = ExperimentConfig()
-    config.training.semantic.epochs = 1
-    config.training.pixel.epochs = 1
+    config.training.epochs = 2
     config.model = ModelConfig(
+        base_prediction_depth=1,
         encoder=DDTPathConfig(16, 1, 1),
-        decoder=DDTDecoderConfig(32, 2, 1, 2),
+        semantic_decoder=SemanticDecoderConfig(32, 1, 2),
+        pixel_decoder=PixelDecoderConfig(32, 3, 2, [1], [1]),
         attention=DDTAttentionConfig(rope=False),
     )
     config.model.conditioning.num_classes = 4
@@ -34,59 +54,45 @@ def _config() -> ExperimentConfig:
     return config
 
 
-def _batch(ratio: float) -> PreparedEndpointBatch:
-    semantic = torch.randn(1, 64, 768)
-    pixel = torch.randn(1, 64, 768)
-    ratios = torch.tensor([ratio])
-    clean = torch.lerp(semantic, pixel, ratios[:, None, None])
-    return PreparedEndpointBatch(
-        clean,
-        semantic if ratio != 1 else None,
-        pixel,
-        ratios,
+def _model(config: ExperimentConfig) -> DDT:
+    model = build_model(config.model)
+    model.patch_detailer = FastDetailer()
+    return model
+
+
+def _batch() -> PreparedJointBatch:
+    return PreparedJointBatch(
+        torch.randn(1, 64, 768),
+        torch.rand(1, 3, 128, 128),
         torch.tensor([2]),
     )
 
 
-def test_progressive_boundary_keeps_optimizer_and_architecture_matches_baseline() -> None:
+def test_cpu_joint_training_smoke_updates_one_model_and_ema() -> None:
     config = _config()
-    model = build_model(config.model)
+    model = _model(config)
     optimizer = build_optimizer(model, config.optimizer)
-    optimizer_identity = id(optimizer)
     ema = EMA(model)
-    streams = RNGStreams.create(8)
-    for phase, ratio in (("semantic", 0.0), ("pixel", 1.0)):
-        optimizer.zero_grad(set_to_none=True)
-        result = compute_training_loss(
-            model,
-            _batch(ratio),
-            streams,
-            config,
-            phase=phase,  # type: ignore[arg-type]
-        )
-        result.loss.total.backward()
-        optimizer.step()
-        ema.update(model)
-        assert torch.isfinite(result.loss.total)
-    assert id(optimizer) == optimizer_identity
-
-    baseline_config = _config()
-    baseline_config.training.mode = "pixel_only"
-    baseline = build_model(baseline_config.model)
-    assert parameter_count(model) == parameter_count(baseline)
-    baseline_result = compute_training_loss(
-        baseline,
-        _batch(1.0),
+    optimizer.zero_grad(set_to_none=True)
+    result = compute_training_loss(
+        model,
+        _batch(),
         RNGStreams.create(8),
-        baseline_config,
-        phase="pixel",
+        config,
+        LPIPSStub(),
     )
-    assert torch.isfinite(baseline_result.loss.total)
+    result.loss.total.backward()
+    optimizer.step()
+    ema.update(model)
+    assert torch.isfinite(result.loss.total)
+    assert result.output.rgb is not None
+    assert result.output.rgb.shape == (1, 3, 128, 128)
 
 
-def test_cpu_ddp_pixel_mode_tolerates_unused_semantic_head(tmp_path) -> None:
+def test_cpu_ddp_joint_training_has_no_unused_phase_parameters(tmp_path) -> None:
     if torch.distributed.is_initialized():
         return
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
     torch.distributed.init_process_group(
         "gloo",
         init_method=f"file://{tmp_path / 'ddp-init'}",
@@ -95,45 +101,43 @@ def test_cpu_ddp_pixel_mode_tolerates_unused_semantic_head(tmp_path) -> None:
     )
     try:
         config = _config()
-        model = build_model(config.model)
-        execution = torch.nn.parallel.DistributedDataParallel(
-            model, find_unused_parameters=True
-        )
+        model = _model(config)
+        execution = torch.nn.parallel.DistributedDataParallel(model)
         result = compute_training_loss(
             execution,
-            _batch(1.0),
+            _batch(),
             RNGStreams.create(9),
             config,
-            phase="pixel",
+            LPIPSStub(),
         )
         result.loss.total.backward()
-        assert model.semantic_head.projection.weight.grad is None
+        assert model.full_head.projection.weight.grad is not None
+        assert model.base_head.projection.weight.grad is not None
+        assert model.coarse_patch_projection.weight.grad is not None
     finally:
         torch.distributed.destroy_process_group()
 
 
-def test_checkpoint_resume_state_supports_each_fixed_phase(tmp_path) -> None:
+def test_checkpoint_resume_state_is_single_phase(tmp_path) -> None:
     config = _config()
-    for phase, completed, within in (("semantic", 0, 0), ("pixel", 1, 0)):
-        model = build_model(config.model)
-        manager = CheckpointManager(tmp_path / phase)
-        state = ResumeState(
-            schema_version=5,
-            completed_epoch=completed,
-            global_step=3,
-            phase=phase,  # type: ignore[arg-type]
-            epoch_within_phase=within,
-            training_complete=False,
-            images_seen=4,
-            estimated_flops=5,
-            wall_clock_seconds=1.0,
-            optimizer=None,
-            scheduler=None,
-            rng_streams=RNGStreams.create(4).state_dict(),
-            data_fingerprint="data",
-            representation_fingerprint="representations",
-        )
-        saved = manager.save(model=model, ema=EMA(model), state=state, config=config)
-        loaded = manager.load(saved, model, EMA(model))
-        assert loaded.phase == phase
-        assert loaded.epoch_within_phase == within
+    model = _model(config)
+    manager = CheckpointManager(tmp_path)
+    state = ResumeState(
+        schema_version=TRAINING_STATE_SCHEMA_VERSION,
+        completed_epoch=1,
+        global_step=3,
+        training_complete=False,
+        images_seen=4,
+        estimated_flops=5,
+        wall_clock_seconds=1.0,
+        optimizer=None,
+        scheduler=None,
+        rng_streams=RNGStreams.create(4).state_dict(),
+        data_fingerprint="data",
+        representation_fingerprint="representations",
+    )
+    saved = manager.save(model=model, ema=EMA(model), state=state, config=config)
+    loaded = manager.load(saved, model, EMA(model))
+    assert loaded.completed_epoch == 1
+    assert not loaded.training_complete
+    assert not hasattr(loaded, "phase")

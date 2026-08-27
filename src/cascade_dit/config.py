@@ -6,14 +6,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 7
+CONFIG_SCHEMA_VERSION = 8
 
 IMAGE_SIZE = 128
 PATCH_SIZE = 16
 GRID_SIZE = 8
 TOKEN_COUNT = GRID_SIZE * GRID_SIZE
 TOKEN_DIM = 768
-PIXEL_REPRESENTATION_NAME = "rgb"
 
 DINO_REPOSITORY = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 DINO_REVISION = "5931719e67bbdb9737e363e781fb0c67687896bc"
@@ -26,9 +25,14 @@ def _positive(name: str, *values: int | float) -> None:
         raise ValueError(f"{name} must be finite and positive")
 
 
+def _non_negative(name: str, *values: int | float) -> None:
+    if any(not math.isfinite(float(value)) or value < 0 for value in values):
+        raise ValueError(f"{name} must be finite and non-negative")
+
+
 @dataclass
 class ExperimentOptions:
-    name: str = "semantic-pixel-ddt"
+    name: str = "joint-semantic-pixel-ddt"
     seed: int = 0
     output_directory: str = "runs/experiment"
 
@@ -56,31 +60,9 @@ class EncoderConfig:
 
 
 @dataclass
-class LogitNormalConfig:
-    distribution: str = "logit_normal"
-    loc: float = 0.0
-    scale: float = 1.0
-
-
-@dataclass
-class SemanticTrainingConfig:
-    epochs: int = 50
-    timestep_shift: float = 4.0
-    mixed_probability: float = 0.1
-    mix_ratio: LogitNormalConfig = field(default_factory=LogitNormalConfig)
-
-
-@dataclass
-class PixelTrainingConfig:
-    epochs: int = 120
-    timestep_shift: float = 7.0
-
-
-@dataclass
 class TrainingConfig:
-    mode: str = "progressive"
-    semantic: SemanticTrainingConfig = field(default_factory=SemanticTrainingConfig)
-    pixel: PixelTrainingConfig = field(default_factory=PixelTrainingConfig)
+    epochs: int = 200
+    timestep_shift: float = 4.0
 
 
 @dataclass
@@ -93,9 +75,7 @@ class SemanticRepresentationConfig:
 class RepresentationsConfig:
     directory: str = "data/direct-representations"
     manifest: str = "manifest.json"
-    semantic: SemanticRepresentationConfig = field(
-        default_factory=SemanticRepresentationConfig
-    )
+    semantic: SemanticRepresentationConfig = field(default_factory=SemanticRepresentationConfig)
     cache_batch_size: int = 256
     normalization_epsilon: float = 1e-6
     require_complete: bool = True
@@ -109,11 +89,23 @@ class DDTPathConfig:
 
 
 @dataclass
-class DDTDecoderConfig:
+class SemanticDecoderConfig:
+    width: int = 2048
+    depth: int = 2
+    heads: int = 16
+
+
+@dataclass
+class PixelDecoderConfig:
     width: int = 2048
     depth: int = 3
-    semantic_depth: int = 2
     heads: int = 16
+    encoder_features: list[int] = field(default_factory=lambda: [4, 8, 12])
+    decoder_features: list[int] = field(default_factory=lambda: [1, 2])
+
+
+# Retained as a constructor alias; the phase-era ``decoder`` field itself is gone.
+DDTDecoderConfig = SemanticDecoderConfig
 
 
 @dataclass
@@ -140,8 +132,10 @@ class DDTConditioningConfig:
 class ModelConfig:
     architecture: str = "ddt"
     token_dim: int = TOKEN_DIM
+    base_prediction_depth: int = 8
     encoder: DDTPathConfig = field(default_factory=DDTPathConfig)
-    decoder: DDTDecoderConfig = field(default_factory=DDTDecoderConfig)
+    semantic_decoder: SemanticDecoderConfig = field(default_factory=SemanticDecoderConfig)
+    pixel_decoder: PixelDecoderConfig = field(default_factory=PixelDecoderConfig)
     feedforward: DDTFeedForwardConfig = field(default_factory=DDTFeedForwardConfig)
     attention: DDTAttentionConfig = field(default_factory=DDTAttentionConfig)
     conditioning: DDTConditioningConfig = field(default_factory=DDTConditioningConfig)
@@ -161,7 +155,9 @@ class ObjectiveConfig:
     timestep_loc: float = 0.0
     timestep_scale: float = 1.0
     denominator_floor: float = 0.05
-    pixel_auxiliary_mse_weight: float = 1.0
+    base_velocity_weight: float = 1.0
+    pixel_l1_weight: float = 1.0
+    pixel_lpips_weight: float = 1.0
 
 
 @dataclass
@@ -189,13 +185,18 @@ class OptimizerConfig:
 
 
 @dataclass
+class InternalGuidanceConfig:
+    scale: float = 1.78
+    t_min: float = 0.10
+    t_max: float = 1.0
+
+
+@dataclass
 class SamplingConfig:
     steps: int = 40
     solver: str = "euler"
     timestep_shift: float = 1.0
-    guidance_scale: float = 1.0
-    guidance_start: float = 0.0
-    guidance_end: float = 1.0
+    internal_guidance: InternalGuidanceConfig = field(default_factory=InternalGuidanceConfig)
     batch_size: int = 32
     seed: int = 0
 
@@ -211,7 +212,6 @@ class ValidationConfig:
 class CheckpointConfig:
     directory: str = "checkpoints"
     interval_epochs: int = 5
-    save_phase_boundary: bool = True
     resume: str | None = None
 
 
@@ -228,7 +228,7 @@ class CompileConfig:
 class WandbConfig:
     enabled: bool = False
     entity: str | None = None
-    project: str = "semantic-pixel-ddt"
+    project: str = "joint-semantic-pixel-ddt"
     name: str | None = None
     group: str | None = None
     tags: list[str] = field(default_factory=list)
@@ -263,21 +263,10 @@ class ExperimentConfig:
 
     @property
     def total_epochs(self) -> int:
-        if self.training.mode == "pixel_only":
-            return self.training.pixel.epochs
-        return self.training.semantic.epochs + self.training.pixel.epochs
+        return self.training.epochs
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
-
-    def phase_for_epoch(self, epoch: int) -> tuple[str, int]:
-        if not 0 <= epoch < self.total_epochs:
-            raise ValueError("epoch is outside the training schedule")
-        if self.training.mode == "pixel_only":
-            return "pixel", epoch
-        if epoch < self.training.semantic.epochs:
-            return "semantic", epoch
-        return "pixel", epoch - self.training.semantic.epochs
 
     def validate(self) -> None:
         if self.schema_version != CONFIG_SCHEMA_VERSION:
@@ -285,24 +274,7 @@ class ExperimentConfig:
                 f"configuration schema {self.schema_version!r} is unsupported; "
                 f"schema_version: {CONFIG_SCHEMA_VERSION} is required"
             )
-        if self.training.mode not in {"progressive", "pixel_only"}:
-            raise ValueError("training.mode must be progressive or pixel_only")
-        _positive(
-            "training phase settings",
-            self.training.semantic.epochs,
-            self.training.semantic.timestep_shift,
-            self.training.pixel.epochs,
-            self.training.pixel.timestep_shift,
-        )
-        mixed_probability = self.training.semantic.mixed_probability
-        if not math.isfinite(mixed_probability) or not 0 <= mixed_probability <= 1:
-            raise ValueError("training.semantic.mixed_probability must be in [0,1]")
-        ratio = self.training.semantic.mix_ratio
-        if ratio.distribution != "logit_normal":
-            raise ValueError("training.semantic.mix_ratio.distribution must be logit_normal")
-        if not math.isfinite(ratio.loc):
-            raise ValueError("training.semantic.mix_ratio.loc must be finite")
-        _positive("training.semantic.mix_ratio.scale", ratio.scale)
+        _positive("training settings", self.training.epochs, self.training.timestep_shift)
         if self.data.image_size != IMAGE_SIZE:
             raise ValueError("data.image_size must be 128")
         if (self.data.repository, self.data.revision) != (
@@ -310,42 +282,37 @@ class ExperimentConfig:
             IMAGENET_REVISION,
         ):
             raise ValueError("data must use the pinned ImageNet repository revision")
+        if (self.encoder.repository, self.encoder.revision) != (
+            DINO_REPOSITORY,
+            DINO_REVISION,
+        ):
+            raise ValueError("encoder must use the pinned DINOv3-B/16 revision")
+        if (self.encoder.patch_size, self.encoder.hidden_size) != (PATCH_SIZE, TOKEN_DIM):
+            raise ValueError("DINO representations must use 16px patches and width 768")
+        if self.encoder.num_register_tokens != 4 or not self.encoder.apply_final_norm:
+            raise ValueError("DINO extraction requires four registers and final normalization")
         semantic = self.representations.semantic
-        if not semantic.name:
-            raise ValueError("representations.semantic.name must be non-empty")
-        if not 1 <= semantic.layer <= 12:
-            raise ValueError("representations.semantic.layer must be in [1,12]")
+        if not semantic.name or not 1 <= semantic.layer <= 12:
+            raise ValueError("the selected semantic representation must be a DINO layer in [1,12]")
         _positive(
             "representation settings",
             self.representations.cache_batch_size,
             self.representations.normalization_epsilon,
         )
-        if self.training.mode == "progressive":
-            if (self.encoder.repository, self.encoder.revision) != (
-                DINO_REPOSITORY,
-                DINO_REVISION,
-            ):
-                raise ValueError("encoder must use the pinned DINOv3-B/16 revision")
-            if (self.encoder.patch_size, self.encoder.hidden_size) != (
-                PATCH_SIZE,
-                TOKEN_DIM,
-            ):
-                raise ValueError("DINO representations must use 16px patches and width 768")
-            if self.encoder.num_register_tokens != 4 or not self.encoder.apply_final_norm:
-                raise ValueError("DINO extraction requires four registers and final normalization")
-            if not self.representations.require_complete:
-                raise ValueError("progressive training requires a complete representation cache")
+        if not self.representations.require_complete:
+            raise ValueError("joint training requires a complete semantic representation cache")
         self._validate_model()
         _positive(
             "objective settings",
             self.objective.timestep_scale,
             self.objective.denominator_floor,
         )
-        if (
-            not math.isfinite(self.objective.pixel_auxiliary_mse_weight)
-            or self.objective.pixel_auxiliary_mse_weight < 0
-        ):
-            raise ValueError("objective.pixel_auxiliary_mse_weight must be non-negative")
+        _non_negative(
+            "objective loss weights",
+            self.objective.base_velocity_weight,
+            self.objective.pixel_l1_weight,
+            self.objective.pixel_lpips_weight,
+        )
         self._validate_optimizer()
         if self.sampling.solver not in {"euler", "heun"}:
             raise ValueError("sampling.solver must be euler or heun")
@@ -354,9 +321,11 @@ class ExperimentConfig:
             self.sampling.steps,
             self.sampling.batch_size,
             self.sampling.timestep_shift,
+            self.sampling.internal_guidance.scale,
         )
-        if not 0 <= self.sampling.guidance_start < self.sampling.guidance_end <= 1:
-            raise ValueError("sampling guidance interval must satisfy 0 <= start < end <= 1")
+        guidance = self.sampling.internal_guidance
+        if not 0 <= guidance.t_min < guidance.t_max <= 1:
+            raise ValueError("internal-guidance interval must satisfy 0 <= t_min < t_max <= 1")
         if self.data.workers < 0 or self.data.prefetch_factor < 1:
             raise ValueError("data workers must be non-negative and prefetch_factor positive")
         if self.data.max_samples is not None and self.data.max_samples < 1:
@@ -378,22 +347,42 @@ class ExperimentConfig:
             raise ValueError("periodic validation samples cannot exceed final evaluation samples")
 
     def _validate_model(self) -> None:
-        if self.model.architecture != "ddt" or self.model.token_dim != TOKEN_DIM:
+        model = self.model
+        if model.architecture != "ddt" or model.token_dim != TOKEN_DIM:
             raise ValueError("model must be a 768-dimensional DDT")
-        for name, path in (("encoder", self.model.encoder), ("decoder", self.model.decoder)):
-            _positive(f"model {name}", path.width, path.depth, path.heads)
+        paths = (
+            ("encoder", model.encoder),
+            ("semantic_decoder", model.semantic_decoder),
+            ("pixel_decoder", model.pixel_decoder),
+        )
+        for name, path in paths:
+            _positive(f"model.{name}", path.width, path.depth, path.heads)
             if path.width % path.heads or (path.width // path.heads) % 4:
                 raise ValueError(f"model.{name} head width must be divisible by four")
-        if not 1 <= self.model.decoder.semantic_depth < self.model.decoder.depth:
-            raise ValueError("model.decoder.semantic_depth must satisfy 1 <= semantic_depth < depth")
+        if not 1 <= model.base_prediction_depth <= model.encoder.depth:
+            raise ValueError("model.base_prediction_depth must select an encoder block")
+        for name, selected, depth in (
+            ("encoder_features", model.pixel_decoder.encoder_features, model.encoder.depth),
+            (
+                "decoder_features",
+                model.pixel_decoder.decoder_features,
+                model.semantic_decoder.depth,
+            ),
+        ):
+            if not selected:
+                raise ValueError(f"model.pixel_decoder.{name} must not be empty")
+            if len(set(selected)) != len(selected):
+                raise ValueError(f"model.pixel_decoder.{name} must contain unique blocks")
+            if any(not 1 <= block <= depth for block in selected):
+                raise ValueError(f"model.pixel_decoder.{name} contains an out-of-range block")
         _positive(
             "model settings",
-            self.model.feedforward.mlp_ratio,
-            self.model.num_classes,
-            self.model.conditioning.timestep_tokens,
-            self.model.conditioning.class_tokens,
+            model.feedforward.mlp_ratio,
+            model.num_classes,
+            model.conditioning.timestep_tokens,
+            model.conditioning.class_tokens,
         )
-        if not 0 <= self.model.class_dropout_probability < 1:
+        if not 0 <= model.class_dropout_probability < 1:
             raise ValueError("class dropout probability must be in [0,1)")
 
     def _validate_optimizer(self) -> None:
@@ -402,9 +391,7 @@ class ExperimentConfig:
             raise ValueError("optimizer.kind must be adamw")
         if values.scheduler.kind not in {"constant", "cosine"}:
             raise ValueError("optimizer.scheduler.kind must be constant or cosine")
-        if len(values.adamw.betas) != 2 or not all(
-            0 <= beta < 1 for beta in values.adamw.betas
-        ):
+        if len(values.adamw.betas) != 2 or not all(0 <= beta < 1 for beta in values.adamw.betas):
             raise ValueError("optimizer.adamw.betas must contain two values in [0,1)")
         _positive(
             "optimizer settings",
@@ -442,8 +429,8 @@ def _require_current(values: object, source: str | Path) -> dict[str, Any]:
     if version != CONFIG_SCHEMA_VERSION:
         raise ValueError(
             f"{source} uses unsupported configuration schema {version!r}; "
-            f"schema_version: {CONFIG_SCHEMA_VERSION} is required. Schema-v5/v6 "
-            "curriculum configurations are intentionally not migrated."
+            f"schema_version: {CONFIG_SCHEMA_VERSION} is required. Phase-based "
+            "configurations are intentionally not migrated."
         )
     return values
 

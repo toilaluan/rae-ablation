@@ -6,15 +6,15 @@ import torch
 from torch import Tensor, nn
 
 from .config import ExperimentConfig
-from .data import EndpointPhase, PreparedEndpointBatch
+from .data import PreparedJointBatch
 from .model import DDTOutput
-from .objective import FlowLoss, flow_matching_loss, gaussian_flow_path, sample_timesteps
+from .objective import JointLoss, flow_matching_loss, gaussian_flow_path, sample_timesteps
 from .rng import RNGStreams
 
 
 @dataclass(frozen=True)
 class TrainingStep:
-    loss: FlowLoss
+    loss: JointLoss
     output: DDTOutput
     noisy_tokens: Tensor
     timesteps: Tensor
@@ -22,37 +22,31 @@ class TrainingStep:
 
 def compute_training_loss(
     model: nn.Module,
-    batch: PreparedEndpointBatch,
+    batch: PreparedJointBatch,
     rng: RNGStreams,
     config: ExperimentConfig,
+    lpips_model: nn.Module,
     *,
-    phase: EndpointPhase,
     timestep_shift: float | None = None,
 ) -> TrainingStep:
-    if phase not in {"semantic", "pixel"}:
-        raise ValueError("phase must be semantic or pixel")
-    active_shift = (
-        config.training.semantic.timestep_shift
-        if phase == "semantic"
-        else config.training.pixel.timestep_shift
-    )
+    active_shift = config.training.timestep_shift
     if timestep_shift is not None:
         active_shift = timestep_shift
     timesteps = sample_timesteps(
-        batch.clean.shape[0],
+        batch.semantic.shape[0],
         rng.timesteps,
-        batch.clean.device,
+        batch.semantic.device,
         loc=config.objective.timestep_loc,
         scale=config.objective.timestep_scale,
         shift=active_shift,
     )
     noise = torch.randn(
-        batch.clean.shape,
+        batch.semantic.shape,
         generator=rng.noise,
-        device=batch.clean.device,
-        dtype=batch.clean.dtype,
+        device=batch.semantic.device,
+        dtype=batch.semantic.dtype,
     )
-    path = gaussian_flow_path(batch.clean, noise, timesteps)
+    path = gaussian_flow_path(batch.semantic, noise, timesteps)
     drop = torch.rand(
         batch.labels.shape,
         generator=rng.label_dropout,
@@ -62,8 +56,7 @@ def compute_training_loss(
         path.noisy,
         timesteps,
         batch.labels,
-        batch.pixel_ratio,
-        prediction_mode="mixed" if phase == "semantic" else "pixel",
+        decode_pixels=True,
         force_class_drop=drop,
     )
     if not isinstance(output, DDTOutput):
@@ -71,8 +64,8 @@ def compute_training_loss(
     loss = flow_matching_loss(
         path,
         output,
-        batch.pixel,
-        batch.pixel_ratio,
+        batch.pixels,
+        lpips_model,
         config.objective,
     )
     return TrainingStep(loss, output, path.noisy, timesteps)

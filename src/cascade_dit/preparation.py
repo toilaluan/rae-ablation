@@ -9,12 +9,11 @@ from safetensors.torch import save_file
 from torch import Tensor
 from torch.utils.data import DataLoader, Subset
 
-from .config import PIXEL_REPRESENTATION_NAME, TOKEN_DIM, ExperimentConfig
+from .config import TOKEN_DIM, ExperimentConfig
 from .data import (
     data_fingerprint,
     load_imagenet,
-    prepare_pixels,
-    validate_endpoint_manifest,
+    validate_joint_manifest,
 )
 from .representations import (
     ChannelStatistics,
@@ -23,7 +22,6 @@ from .representations import (
     RepresentationManifest,
     cached_stages_include,
     fingerprint,
-    patchify_rgb,
     preflight_representation_capacity,
 )
 from .vision import DINOMultiLayerEncoder, encoder_fingerprint, load_dino_encoder
@@ -87,18 +85,11 @@ def representation_manifest_fingerprint(manifest: RepresentationManifest) -> str
 
 def _stage_payload(config: ExperimentConfig) -> list[dict[str, object]]:
     semantic = config.representations.semantic
-    pixel = {
-        "name": PIXEL_REPRESENTATION_NAME,
-        "source": {"kind": "rgb", "layer": None},
-    }
-    if config.training.mode == "pixel_only":
-        return [pixel]
     return [
         {
             "name": semantic.name,
             "source": {"kind": "dino", "layer": semantic.layer},
-        },
-        pixel,
+        }
     ]
 
 
@@ -132,7 +123,7 @@ def preparation_fingerprint(
 def validate_manifest_compatibility(
     config: ExperimentConfig, manifest: RepresentationManifest
 ) -> None:
-    validate_endpoint_manifest(config, manifest, load_semantic=True)
+    validate_joint_manifest(config, manifest)
     requested_stages = _stage_payload(config)
     cached_stages = manifest.stages
     if not cached_stages_include(cached_stages, requested_stages):
@@ -164,8 +155,6 @@ def _loader(dataset: object, indices: Tensor, config: ExperimentConfig) -> DataL
 
 
 def _dino_stage_layers(config: ExperimentConfig) -> dict[str, int]:
-    if config.training.mode == "pixel_only":
-        return {}
     semantic = config.representations.semantic
     return {semantic.name: semantic.layer}
 
@@ -211,18 +200,14 @@ def _collect_statistics(
     config: ExperimentConfig,
     rank: int,
     world_size: int,
-    device: torch.device,
 ) -> dict[str, ChannelStatistics]:
     accumulators = {
-        **{name: ChannelStatisticsAccumulator(TOKEN_DIM) for name in caches},
-        PIXEL_REPRESENTATION_NAME: ChannelStatisticsAccumulator(TOKEN_DIM),
+        name: ChannelStatisticsAccumulator(TOKEN_DIM) for name in caches
     }
     indices = torch.arange(rank, len(dataset), world_size)
-    for pixels, _labels, batch_indices in _loader(dataset, indices, config):
+    for _pixels, _labels, batch_indices in _loader(dataset, indices, config):
         for name, cache in caches.items():
             accumulators[name].update(cache.lookup(batch_indices))
-        rgb = patchify_rgb(prepare_pixels(pixels, device)).cpu()
-        accumulators[PIXEL_REPRESENTATION_NAME].update(rgb)
     return {
         name: _merge_statistics(
             accumulator, config.representations.normalization_epsilon
@@ -300,16 +285,9 @@ def prepare_representations(
     if manifest_path.is_file():
         existing = RepresentationManifest.load(
             manifest_path,
-            required_stages=(
-                None
-                if config.training.mode == "progressive"
-                else [PIXEL_REPRESENTATION_NAME]
-            ),
+            required_stages=[config.representations.semantic.name],
         )
-        if config.training.mode == "progressive":
-            validate_manifest_compatibility(config, existing)
-        else:
-            validate_endpoint_manifest(config, existing, load_semantic=False)
+        validate_manifest_compatibility(config, existing)
         return existing
 
     dataset = load_imagenet(config.data, config.data.image_size)
@@ -359,7 +337,7 @@ def prepare_representations(
         cache.values.flush()
         cache.completion.flush()
     statistics = _collect_statistics(
-        dataset, caches, config, rank, world_size, device
+        dataset, caches, config, rank, world_size
     )
     if rank == 0:
         save_file(

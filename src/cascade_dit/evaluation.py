@@ -269,7 +269,6 @@ def save_evaluation(
     plan_hash: str,
     *,
     num_samples: int | None = None,
-    phase: str | None = None,
 ) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -277,7 +276,5 @@ def save_evaluation(
     values: dict[str, Any] = {"sampling_plan_hash": plan_hash, "metrics": metrics}
     if num_samples is not None:
         values["num_samples"] = num_samples
-    if phase is not None:
-        values["phase"] = phase
     temporary.write_text(json.dumps(values, indent=2, sort_keys=True) + "\n")
     temporary.replace(target)

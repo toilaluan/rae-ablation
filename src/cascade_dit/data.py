@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -13,18 +12,8 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
-from .config import (
-    IMAGE_SIZE,
-    PIXEL_REPRESENTATION_NAME,
-    TOKEN_COUNT,
-    TOKEN_DIM,
-    DataConfig,
-    ExperimentConfig,
-)
-from .representations import ChannelStatistics, RepresentationManifest, patchify_rgb
-
-EndpointPhase = Literal["semantic", "pixel"]
-PHASES: tuple[EndpointPhase, ...] = ("semantic", "pixel")
+from .config import IMAGE_SIZE, TOKEN_COUNT, TOKEN_DIM, DataConfig, ExperimentConfig
+from .representations import ChannelStatistics, RepresentationManifest
 
 
 def prepare_pixels(
@@ -68,12 +57,7 @@ def data_fingerprint(config: DataConfig, image_size: int = IMAGE_SIZE) -> str:
 
 
 class ImageNetDataset(Dataset[tuple[Tensor, int, int]]):
-    def __init__(
-        self,
-        dataset: Any,
-        labels: Any,
-        image_size: int,
-    ) -> None:
+    def __init__(self, dataset: Any, labels: Any, image_size: int) -> None:
         self.dataset = dataset
         self.labels = labels
         self.image_size = image_size
@@ -120,9 +104,7 @@ def load_imagenet(
     return ImageNetDataset(dataset, labels, image_size)
 
 
-def _statistics(
-    manifest: RepresentationManifest, name: str
-) -> ChannelStatistics:
+def _statistics(manifest: RepresentationManifest, name: str) -> ChannelStatistics:
     try:
         values = manifest.statistics[name]
         return ChannelStatistics(
@@ -134,262 +116,139 @@ def _statistics(
         raise ValueError(f"representation manifest has invalid {name} statistics") from error
 
 
-def _item_seed(seed: int, epoch: int, source_index: int) -> int:
-    payload = f"{seed}:{epoch}:{source_index}".encode()
-    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little")
+JointSample = tuple[Tensor, Tensor, int]
 
 
-def sample_pixel_ratio(
-    config: ExperimentConfig,
-    epoch: int,
-    source_index: int,
-    *,
-    phase: EndpointPhase = "semantic",
-) -> float:
-    """Deterministically choose a pure-semantic or logit-normal mixed item."""
-    if epoch < 0 or source_index < 0:
-        raise ValueError("epoch and source index must be non-negative")
-    if phase == "pixel":
-        return 1.0
-    if phase != "semantic":
-        raise ValueError("phase must be semantic or pixel")
-    settings = config.training.semantic
-    rng = np.random.default_rng(_item_seed(config.experiment.seed, epoch, source_index))
-    if float(rng.random()) >= settings.mixed_probability:
-        return 0.0
-    ratio = settings.mix_ratio
-    logit = float(rng.normal(ratio.loc, ratio.scale))
-    if logit >= 0:
-        value = 1 / (1 + math.exp(-logit))
-    else:
-        exponential = math.exp(logit)
-        value = exponential / (1 + exponential)
-    epsilon = float(torch.finfo(torch.float32).eps)
-    return min(max(value, epsilon), 1 - epsilon)
-
-
-EndpointSample = tuple[Tensor | None, Tensor, Tensor, int]
-
-
-class EndpointDataset(Dataset[EndpointSample]):
-    """Load exactly the semantic and RGB endpoints required by the active phase."""
+class JointDataset(Dataset[JointSample]):
+    """Always load cached semantic tokens, raw RGB, and a class label."""
 
     def __init__(
         self,
         dataset: ImageNetDataset,
-        phase: EndpointPhase,
-        epoch: int,
         config: ExperimentConfig,
         manifest: RepresentationManifest,
         root: str | Path,
-        *,
-        load_semantic: bool,
     ) -> None:
         self.dataset = dataset
-        self.config = config
-        self.manifest = manifest
-        self.load_semantic = load_semantic
-        self._phase_epoch = torch.tensor(0, dtype=torch.int64).share_memory_()
-        self.set_epoch(phase, epoch)
-        self.semantic_cache: np.memmap | None = None
-        if load_semantic:
-            name = config.representations.semantic.name
-            try:
-                cache_path = Path(root) / manifest.cache_files[name]
-            except KeyError as error:
-                raise ValueError("selected semantic cache is missing from the manifest") from error
-            self.semantic_cache = np.memmap(
-                cache_path,
-                mode="r",
-                dtype=np.uint16,
-                shape=(len(dataset), TOKEN_COUNT, TOKEN_DIM),
-            )
-
-    @property
-    def phase(self) -> EndpointPhase:
-        return PHASES[int(self._phase_epoch.item()) % len(PHASES)]
-
-    @property
-    def epoch(self) -> int:
-        return int(self._phase_epoch.item()) // len(PHASES)
-
-    def set_epoch(self, phase: EndpointPhase, epoch: int) -> None:
-        if phase not in PHASES:
-            raise ValueError("phase must be semantic or pixel")
-        if phase == "semantic" and not self.load_semantic:
-            raise ValueError("semantic phase requires a semantic cache")
-        if epoch < 0:
-            raise ValueError("epoch must be non-negative")
-        self._phase_epoch.fill_(epoch * len(PHASES) + PHASES.index(phase))
+        name = config.representations.semantic.name
+        try:
+            cache_path = Path(root) / manifest.cache_files[name]
+        except KeyError as error:
+            raise ValueError("selected semantic cache is missing from the manifest") from error
+        self.semantic_cache = np.memmap(
+            cache_path,
+            mode="r",
+            dtype=np.uint16,
+            shape=(len(dataset), TOKEN_COUNT, TOKEN_DIM),
+        )
 
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, index: int) -> EndpointSample:
-        state = int(self._phase_epoch.item())
-        phase = PHASES[state % len(PHASES)]
-        epoch = state // len(PHASES)
+    def __getitem__(self, index: int) -> JointSample:
         pixels, label, source_index = self.dataset.get_item(index)
-        if phase == "pixel":
-            return None, pixels, torch.tensor(1.0), label
-        if self.semantic_cache is None:
-            raise ValueError("semantic phase requires a semantic cache")
         raw = np.asarray(self.semantic_cache[source_index]).copy()
         semantic = torch.from_numpy(raw).view(torch.bfloat16)
-        ratio = sample_pixel_ratio(self.config, epoch, source_index, phase=phase)
-        return semantic, pixels, torch.tensor(ratio), label
+        return semantic, pixels, label
 
 
-class EndpointBatch(NamedTuple):
-    semantic: Tensor | None
+class JointBatch(NamedTuple):
+    semantic: Tensor
     pixels: Tensor
-    pixel_ratio: Tensor
     labels: Tensor
 
 
-class PreparedEndpointBatch(NamedTuple):
-    clean: Tensor
-    semantic: Tensor | None
-    pixel: Tensor
-    pixel_ratio: Tensor
+class PreparedJointBatch(NamedTuple):
+    semantic: Tensor
+    pixels: Tensor
     labels: Tensor
 
 
-def endpoint_collator(samples: Sequence[EndpointSample]) -> EndpointBatch:
-    semantic, pixels, ratios, labels = zip(*samples, strict=True)
-    available = [values is not None for values in semantic]
-    if any(available) and not all(available):
-        raise ValueError("endpoint batch mixes semantic and pixel phases")
-    semantic_batch = (
-        torch.stack([values for values in semantic if values is not None])
-        if all(available)
-        else None
-    )
-    return EndpointBatch(
-        semantic_batch,
+def joint_collator(samples: Sequence[JointSample]) -> JointBatch:
+    semantic, pixels, labels = zip(*samples, strict=True)
+    return JointBatch(
+        torch.stack(semantic),
         torch.stack(pixels),
-        torch.stack(ratios).float(),
         torch.tensor(labels, dtype=torch.int64),
     )
 
 
-class EndpointBatchPreprocessor:
-    """Normalize semantic and RGB endpoints independently, then interpolate."""
+class JointBatchPreprocessor:
+    """Normalize DINO targets while leaving RGB in its raw [0,1] range."""
 
     def __init__(
         self,
         config: ExperimentConfig,
         manifest: RepresentationManifest,
         device: torch.device | str,
-        *,
-        load_semantic: bool,
     ) -> None:
         self.device = torch.device(device)
-        self.pixel_statistics = _statistics(manifest, PIXEL_REPRESENTATION_NAME)
-        self.semantic_statistics = (
-            _statistics(manifest, config.representations.semantic.name)
-            if load_semantic
-            else None
+        self.semantic_statistics = _statistics(
+            manifest, config.representations.semantic.name
         )
 
     @torch.no_grad()
-    def __call__(self, batch: EndpointBatch) -> PreparedEndpointBatch:
-        ratios = batch.pixel_ratio.to(self.device, non_blocking=True)
-        labels = batch.labels.to(self.device, non_blocking=True)
-        pixels = patchify_rgb(
-            prepare_pixels(batch.pixels, self.device, non_blocking=True)
+    def __call__(self, batch: JointBatch) -> PreparedJointBatch:
+        semantic = self.semantic_statistics.normalize(
+            batch.semantic.to(self.device, non_blocking=True).float()
         )
-        pixel = self.pixel_statistics.normalize(pixels)
-        semantic = None
-        if batch.semantic is not None:
-            if self.semantic_statistics is None:
-                raise ValueError("semantic values were provided without semantic statistics")
-            semantic = self.semantic_statistics.normalize(
-                batch.semantic.to(self.device, non_blocking=True).float()
-            )
-            clean = torch.lerp(semantic, pixel, ratios[:, None, None].to(pixel))
-        else:
-            if torch.any(ratios != 1):
-                raise ValueError("a pixel-only batch must have pixel_ratio=1")
-            clean = pixel
-        return PreparedEndpointBatch(clean, semantic, pixel, ratios, labels)
+        pixels = prepare_pixels(batch.pixels, self.device, non_blocking=True)
+        labels = batch.labels.to(self.device, non_blocking=True)
+        return PreparedJointBatch(semantic, pixels, labels)
 
 
-def _required_manifest_stages(config: ExperimentConfig, load_semantic: bool) -> list[str]:
-    names = [PIXEL_REPRESENTATION_NAME]
-    if load_semantic:
-        names.insert(0, config.representations.semantic.name)
-    return names
-
-
-def validate_endpoint_manifest(
-    config: ExperimentConfig,
-    manifest: RepresentationManifest,
-    *,
-    load_semantic: bool,
+def validate_joint_manifest(
+    config: ExperimentConfig, manifest: RepresentationManifest
 ) -> None:
     stages = {
         str(stage.get("name")): stage.get("source")
         for stage in manifest.stages
         if isinstance(stage, dict)
     }
-    pixel_source = stages.get(PIXEL_REPRESENTATION_NAME)
-    if not isinstance(pixel_source, dict) or pixel_source.get("kind") != "rgb":
-        raise ValueError("representation manifest does not include RGB statistics")
-    if load_semantic:
-        selected = config.representations.semantic
-        source = stages.get(selected.name)
-        if (
-            not isinstance(source, dict)
-            or source.get("kind") != "dino"
-            or source.get("layer") != selected.layer
-        ):
-            raise ValueError("representation manifest does not include the selected semantic endpoint")
+    selected = config.representations.semantic
+    source = stages.get(selected.name)
+    if (
+        not isinstance(source, dict)
+        or source.get("kind") != "dino"
+        or source.get("layer") != selected.layer
+    ):
+        raise ValueError("representation manifest does not include the selected semantic target")
     if manifest.dataset_fingerprint != data_fingerprint(
         config.data, config.data.image_size
     ):
         raise ValueError("prepared representations use a different dataset")
 
 
-def load_endpoint_manifest(
-    config: ExperimentConfig, *, load_semantic: bool
-) -> RepresentationManifest:
+def load_joint_manifest(config: ExperimentConfig) -> RepresentationManifest:
     root = Path(config.representations.directory)
     manifest = RepresentationManifest.load(
         root / config.representations.manifest,
         require_complete=config.representations.require_complete,
-        required_stages=_required_manifest_stages(config, load_semantic),
+        required_stages=[config.representations.semantic.name],
     )
-    validate_endpoint_manifest(config, manifest, load_semantic=load_semantic)
+    validate_joint_manifest(config, manifest)
     return manifest
 
 
-def make_endpoint_loader(
+def make_joint_loader(
     config: ExperimentConfig,
-    phase: EndpointPhase,
     *,
     rank: int = 0,
     world_size: int = 1,
     epoch: int = 0,
 ) -> DataLoader:
-    load_semantic = config.training.mode == "progressive"
-    if phase == "semantic" and not load_semantic:
-        raise ValueError("pixel_only training cannot enter the semantic phase")
-    manifest = load_endpoint_manifest(config, load_semantic=load_semantic)
+    manifest = load_joint_manifest(config)
     dataset = load_imagenet(config.data)
     if len(dataset) != manifest.dataset_size:
         raise ValueError("dataset size differs from prepared representations")
-    endpoint_dataset = EndpointDataset(
+    joint_dataset = JointDataset(
         dataset,
-        phase,
-        epoch,
         config,
         manifest,
         config.representations.directory,
-        load_semantic=load_semantic,
     )
     sampler = DistributedSampler(
-        endpoint_dataset,
+        joint_dataset,
         num_replicas=world_size,
         rank=rank,
         shuffle=config.data.shuffle,
@@ -400,10 +259,10 @@ def make_endpoint_loader(
         raise ValueError("global batch size must be divisible by world size")
     local_batch = config.optimizer.global_batch_size // world_size
     return DataLoader(
-        endpoint_dataset,
+        joint_dataset,
         batch_size=local_batch,
         sampler=sampler,
-        collate_fn=endpoint_collator,
+        collate_fn=joint_collator,
         num_workers=config.data.workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=config.data.workers > 0,
@@ -412,17 +271,12 @@ def make_endpoint_loader(
     )
 
 
-def set_endpoint_loader_epoch(
-    loader: DataLoader,
-    phase: EndpointPhase,
-    epoch: int,
-) -> None:
-    """Advance a reusable loader while preserving its persistent workers."""
-    dataset = loader.dataset
+def set_joint_loader_epoch(loader: DataLoader, epoch: int) -> None:
     sampler = loader.sampler
-    if not isinstance(dataset, EndpointDataset):
-        raise TypeError("endpoint loader has an unexpected dataset")
+    if not isinstance(loader.dataset, JointDataset):
+        raise TypeError("joint loader has an unexpected dataset")
     if not isinstance(sampler, DistributedSampler):
-        raise TypeError("endpoint loader has an unexpected sampler")
-    dataset.set_epoch(phase, epoch)
+        raise TypeError("joint loader has an unexpected sampler")
+    if epoch < 0:
+        raise ValueError("epoch must be non-negative")
     sampler.set_epoch(epoch)

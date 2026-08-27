@@ -14,53 +14,50 @@ from cascade_dit.objective import (
     x0_to_velocity,
 )
 from cascade_dit.sample_runtime import noise_for_seeds
-from cascade_dit.sampling import sample_semantic_then_pixel, sample_tokens
+from cascade_dit.sampling import (
+    internal_guidance_x0,
+    sample_semantic_then_pixel,
+    sample_tokens,
+)
 
 
-def test_ratio_mixed_x0_is_converted_to_velocity_after_interpolation() -> None:
-    semantic = torch.full((2, 1, 1), 2.0)
-    pixel = torch.full((2, 1, 1), 6.0)
-    ratio = torch.tensor([0.25, 0.75])
-    clean = torch.lerp(semantic, pixel, ratio[:, None, None])
-    path = gaussian_flow_path(clean, torch.full_like(clean, -1), torch.tensor([0.25, 0.5]))
-    output = DDTOutput(clean, semantic_x0=semantic, pixel_x0=pixel)
-    loss = flow_matching_loss(path, output, pixel, ratio, ObjectiveConfig())
-    assert loss.velocity_mse.item() == pytest.approx(0)
-    assert loss.pixel_auxiliary_mse.item() == pytest.approx(0)
+class LPIPSStub(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inputs: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        self.inputs = (prediction.detach(), target.detach())
+        return (prediction - target).abs().mean((1, 2, 3), keepdim=True)
 
 
-def test_auxiliary_mse_masks_only_pure_semantic_items_and_applies_weight() -> None:
-    clean = torch.zeros(3, 1, 1)
-    path = gaussian_flow_path(clean, torch.ones_like(clean), torch.full((3,), 0.5))
-    ratio = torch.tensor([0.0, 0.5, 1.0])
-    pixel_target = torch.tensor([[[2.0]], [[100.0]], [[100.0]]])
-    pixel_prediction = torch.tensor([[[0.0]], [[0.0]], [[0.0]]])
-    config = ObjectiveConfig(pixel_auxiliary_mse_weight=3.0)
+def test_joint_loss_has_four_terms_and_lpips_receives_minus_one_to_one() -> None:
+    clean = torch.zeros(1, 2, 3)
+    path = gaussian_flow_path(clean, torch.ones_like(clean), torch.tensor([0.5]))
+    pixels = torch.full((1, 3, 4, 4), 0.25)
+    target = torch.full_like(pixels, 0.75)
+    stub = LPIPSStub()
+    config = ObjectiveConfig(
+        base_velocity_weight=2,
+        pixel_l1_weight=3,
+        pixel_lpips_weight=4,
+    )
     loss = flow_matching_loss(
         path,
-        DDTOutput(clean, pixel_x0=pixel_prediction),
-        pixel_target,
-        ratio,
+        DDTOutput(clean, torch.full_like(clean, 0.25), pixels),
+        target,
+        stub,
         config,
     )
-    assert loss.pixel_auxiliary_mse.item() == pytest.approx(4)
-    assert loss.weighted_pixel_auxiliary_mse.item() == pytest.approx(12)
-    assert loss.total.item() == pytest.approx(12)
-    assert loss.pure_semantic_count == 1
-
-
-def test_auxiliary_empty_mask_is_safe() -> None:
-    clean = torch.zeros(2, 1, 1)
-    path = gaussian_flow_path(clean, torch.ones_like(clean), torch.full((2,), 0.5))
-    loss = flow_matching_loss(
-        path,
-        DDTOutput(clean, pixel_x0=torch.ones_like(clean)),
-        torch.zeros_like(clean),
-        torch.tensor([0.2, 1.0]),
-        ObjectiveConfig(),
-    )
-    assert loss.pixel_auxiliary_mse.item() == 0
-    assert loss.pure_semantic_count == 0
+    assert loss.full_velocity_mse.item() == pytest.approx(0)
+    assert loss.base_velocity_mse.item() == pytest.approx(0.25)
+    assert loss.pixel_l1.item() == pytest.approx(0.5)
+    assert loss.pixel_lpips.item() == pytest.approx(1)
+    assert loss.total.item() == pytest.approx(6)
+    assert stub.inputs is not None
+    prediction_input, target_input = stub.inputs
+    assert torch.all(prediction_input == -0.5)
+    assert torch.all(target_input == 0.5)
 
 
 def test_shifted_logit_normal_timesteps_are_seeded_and_bounded() -> None:
@@ -75,57 +72,72 @@ def test_shifted_logit_normal_timesteps_are_seeded_and_bounded() -> None:
     assert near_zero.item() == pytest.approx(20)
 
 
-class EndpointOracle(nn.Module):
+def test_internal_guidance_interpolation_and_inclusive_boundaries() -> None:
+    full = torch.full((4, 1, 1), 2.0)
+    base = torch.full_like(full, 1.0)
+    times = torch.tensor([0.099, 0.1, 1.0, 0.0])
+    guided = internal_guidance_x0(
+        full, base, times, scale=1.78, t_min=0.1, t_max=1
+    )
+    assert guided[:, 0, 0].tolist() == pytest.approx([2, 2.78, 2.78, 2])
+
+
+class JointOracle(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.calls: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+        self.calls: list[tuple[torch.Tensor, torch.Tensor, bool]] = []
 
     def forward(
         self,
         values: torch.Tensor,
         timestep: torch.Tensor,
         _labels: torch.Tensor,
-        pixel_ratio: torch.Tensor,
         *,
-        prediction_mode: str,
+        decode_pixels: bool,
     ) -> DDTOutput:
         self.calls.append(
-            (prediction_mode, timestep.detach().clone(), pixel_ratio.detach().clone())
+            (values.detach().clone(), timestep.detach().clone(), decode_pixels)
         )
-        prediction = torch.full_like(values, 2 if prediction_mode == "semantic" else 6)
-        return DDTOutput(prediction)
+        full = torch.full_like(values, 2)
+        base = torch.full_like(values, 1)
+        rgb = (
+            torch.full((values.shape[0], 3, 128, 128), 6.0)
+            if decode_pixels
+            else None
+        )
+        return DDTOutput(full, base, rgb)
 
 
-def test_semantic_sampling_has_one_final_t0_ratio_zero_pixel_decode() -> None:
-    model = EndpointOracle()
-    noise = torch.randn(2, 3, 4)
+def test_sampling_uses_one_conditional_call_per_ode_call_and_one_t0_decode() -> None:
+    model = JointOracle()
+    noise = torch.zeros(2, 3, 4)
     sampled = sample_semantic_then_pixel(
-        model, noise, torch.tensor([1, 2]), steps=3, num_classes=10
+        model,
+        noise,
+        torch.tensor([1, 2]),
+        steps=3,
+        internal_guidance_scale=1.78,
     )
-    semantic_calls = [call for call in model.calls if call[0] == "semantic"]
-    pixel_calls = [call for call in model.calls if call[0] == "pixel"]
-    assert len(semantic_calls) == 3
+    ode_calls = [call for call in model.calls if not call[2]]
+    pixel_calls = [call for call in model.calls if call[2]]
+    assert len(ode_calls) == 3
+    assert all(values.shape[0] == 2 for values, _time, _decode in ode_calls)
     assert len(pixel_calls) == 1
     assert torch.equal(pixel_calls[0][1], torch.zeros(2))
-    assert torch.equal(pixel_calls[0][2], torch.zeros(2))
     assert torch.all(sampled == 6)
 
 
-def test_pixel_sampling_uses_ratio_one_and_noise_is_batch_invariant() -> None:
-    model = EndpointOracle()
-    noise = torch.randn(1, 3, 4)
-    ratio = torch.ones(1)
+def test_one_step_sampling_applies_internal_guidance_and_noise_is_batch_invariant() -> None:
+    model = JointOracle()
     sampled = sample_tokens(
         model,
-        noise,
+        torch.zeros(1, 3, 4),
         torch.tensor([2]),
-        ratio,
-        prediction_mode="pixel",
         steps=1,
-        num_classes=10,
+        internal_guidance_scale=2,
     )
-    assert torch.allclose(sampled, torch.full_like(noise, 6))
-    assert torch.equal(model.calls[0][2], ratio)
+    assert torch.allclose(sampled, torch.full_like(sampled, 3))
+    assert len(model.calls) == 1
 
     seeds = torch.tensor([12, 33])
     together = noise_for_seeds(seeds, (2, 3), "cpu")
