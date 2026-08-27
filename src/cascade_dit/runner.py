@@ -53,10 +53,30 @@ from .sample_runtime import (
     state_dict_sha256,
 )
 from .sampling import sample_semantic_then_pixel
-from .training import ScheduledTrainingModel, compute_training_loss, prepare_training_path
+from .training import (
+    ScheduledTrainingModel,
+    cleanest_timestep_indices,
+    compute_training_loss,
+    prepare_training_path,
+)
 from .validation import ValidationPlan, create_validation_plan, validate_joint_loss
 
 ImageLog = Callable[[str, str, int, str], None]
+
+
+def _uses_scheduled_decoder(config: ExperimentConfig) -> bool:
+    decoder = config.training.decoder
+    return (
+        decoder.update_interval != 1
+        or decoder.updates_per_active_step != 1
+        or not decoder.backpropagate_to_flow
+        or decoder.samples_per_batch is not None
+    )
+
+
+def _decoder_has_variable_parameter_usage(config: ExperimentConfig) -> bool:
+    decoder = config.training.decoder
+    return decoder.update_interval != 1 or decoder.updates_per_active_step != 1
 
 
 def load_representation_manifest(
@@ -409,19 +429,15 @@ class ExperimentRunner:
                 self.scheduler.load_state_dict(self._pending_scheduler_state)
                 self._pending_scheduler_state = None
         execution: nn.Module = compile_model_regions(self.model, self.config.compile)
-        decoder = self.config.training.decoder
-        scheduled_decoder = (
-            decoder.update_interval != 1
-            or decoder.updates_per_active_step != 1
-            or not decoder.backpropagate_to_flow
-        )
+        scheduled_decoder = _uses_scheduled_decoder(self.config)
+        variable_parameter_usage = _decoder_has_variable_parameter_usage(self.config)
         if scheduled_decoder:
             execution = ScheduledTrainingModel(execution)
         if self.world_size > 1:
             execution = torch.nn.parallel.DistributedDataParallel(
                 execution,
                 device_ids=[self.device.index] if self.device.type == "cuda" else None,
-                find_unused_parameters=scheduled_decoder,
+                find_unused_parameters=variable_parameter_usage,
             )
         return execution
 
@@ -434,6 +450,16 @@ class ExperimentRunner:
         active = self.global_step % decoder.update_interval == 0
         prepared = prepare_training_path(batch, self.rng, self.config)
         path = prepared.path
+        pixel_indices = (
+            cleanest_timestep_indices(path.timestep, decoder.samples_per_batch)
+            if active
+            else None
+        )
+        pixel_target = (
+            batch.pixels
+            if pixel_indices is None
+            else batch.pixels.index_select(0, pixel_indices)
+        )
         self.optimizer.zero_grad(set_to_none=True)
         with torch.autocast(
             device_type=self.device.type,
@@ -447,6 +473,7 @@ class ExperimentRunner:
                     batch.labels,
                     mode="joint",
                     force_class_drop=prepared.force_class_drop,
+                    pixel_indices=pixel_indices,
                     detach_flow=not decoder.backpropagate_to_flow,
                 )
                 if not isinstance(result, tuple) or len(result) != 2:
@@ -457,7 +484,7 @@ class ExperimentRunner:
                     raise TypeError("joint training execution did not decode RGB")
                 pixel_loss = pixel_reconstruction_loss(
                     output.rgb,
-                    batch.pixels,
+                    pixel_target,
                     self.lpips_model,
                     self.config.objective,
                 )
@@ -506,7 +533,7 @@ class ExperimentRunner:
                     )
                     extra_pixel_loss = pixel_reconstruction_loss(
                         pixels,
-                        batch.pixels,
+                        pixel_target,
                         self.lpips_model,
                         self.config.objective,
                     )
@@ -524,12 +551,18 @@ class ExperimentRunner:
             "base_velocity_mse": float(semantic_loss.base_velocity_mse.detach()),
             "decoder_active": int(active),
             "decoder_updates": len(pixel_losses),
+            "decoder_samples": pixel_target.shape[0] if active else 0,
             "decoder_update_ratio": (
                 decoder.updates_per_active_step / decoder.update_interval
             ),
             "gradient_norm": float(gradient_norm),
         }
         if pixel_losses:
+            selected_timesteps = (
+                path.timestep
+                if pixel_indices is None
+                else path.timestep.index_select(0, pixel_indices)
+            )
             metrics["pixel_l1"] = sum(
                 float(loss.pixel_l1.detach()) for loss in pixel_losses
             ) / len(pixel_losses)
@@ -538,6 +571,9 @@ class ExperimentRunner:
             ) / len(pixel_losses)
             metrics["pixel_l1_final"] = float(pixel_losses[-1].pixel_l1.detach())
             metrics["pixel_lpips_final"] = float(pixel_losses[-1].pixel_lpips.detach())
+            metrics["decoder_timestep_min"] = float(selected_timesteps.min())
+            metrics["decoder_timestep_mean"] = float(selected_timesteps.mean())
+            metrics["decoder_timestep_max"] = float(selected_timesteps.max())
         return metrics
 
     def run(self, *, max_steps: int | None = None) -> None:
@@ -554,16 +590,17 @@ class ExperimentRunner:
             execution.train()
             for raw_batch in loader:
                 batch = self.batch_preprocessor(raw_batch)
-                decoder = self.config.training.decoder
-                scheduled_decoder = (
-                    decoder.update_interval != 1
-                    or decoder.updates_per_active_step != 1
-                    or not decoder.backpropagate_to_flow
-                )
+                scheduled_decoder = _uses_scheduled_decoder(self.config)
                 if scheduled_decoder:
                     step_metrics = self._run_scheduled_training_step(execution, batch)
                     decoder_active = bool(step_metrics["decoder_active"])
                     decoder_updates = int(step_metrics["decoder_updates"])
+                    decoder_sample_fraction = (
+                        int(step_metrics["decoder_samples"])
+                        / batch.semantic.shape[0]
+                        if decoder_active
+                        else 0.0
+                    )
                 else:
                     self.optimizer.zero_grad(set_to_none=True)
                     with torch.autocast(
@@ -596,11 +633,13 @@ class ExperimentRunner:
                         "pixel_lpips": float(result.loss.pixel_lpips.detach()),
                         "decoder_active": 1,
                         "decoder_updates": 1,
+                        "decoder_samples": batch.semantic.shape[0],
                         "decoder_update_ratio": 1.0,
                         "gradient_norm": float(gradient_norm),
                     }
                     decoder_active = True
                     decoder_updates = 1
+                    decoder_sample_fraction = 1.0
                 assert self.scheduler is not None
                 self.scheduler.step()
                 self.global_step += 1
@@ -609,6 +648,7 @@ class ExperimentRunner:
                     self.config,
                     decoder_active=decoder_active,
                     decoder_updates=decoder_updates,
+                    decoder_sample_fraction=decoder_sample_fraction,
                 )
                 metrics: dict[str, float | int | str] = {
                     "epoch": epoch,

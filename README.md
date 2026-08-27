@@ -62,7 +62,9 @@ flowing into the semantic trunk. `training.decoder.update_interval=N` runs pixel
 every `N` outer steps; `updates_per_active_step=K` reuses detached hidden states for
 the remaining `K-1` decoder-only updates. Average decoder work therefore scales with
 `K/N`. Set `backpropagate_to_flow=false` to isolate all pixel gradients from the flow
-trunk.
+trunk. `samples_per_batch=M` selects the `M` lowest-timestep (cleanest) samples on each
+rank with fixed-shape `topk` indices and runs the pixel decoder only on that subset.
+The default `null` uses the full local batch.
 
 ## Sampling
 

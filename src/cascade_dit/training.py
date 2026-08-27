@@ -48,6 +48,7 @@ class ScheduledTrainingModel(nn.Module):
         mode: str,
         force_class_drop: Tensor | None = None,
         pixel_features: PixelFeatureBundle | None = None,
+        pixel_indices: Tensor | None = None,
         detach_flow: bool = False,
     ) -> DDTOutput | tuple[DDTOutput, PixelFeatureBundle] | Tensor:
         if mode == "decoder":
@@ -68,11 +69,34 @@ class ScheduledTrainingModel(nn.Module):
         if mode == "semantic":
             return semantic
         assert features is not None
+        if pixel_indices is not None:
+            features = features.index_select(pixel_indices)
         pixels = self.model.decode_pixel_features(features, detach_flow=detach_flow)
         return (
             DDTOutput(semantic.full_x0, semantic.base_x0, pixels),
             features.detached(),
         )
+
+
+def cleanest_timestep_indices(
+    timesteps: Tensor,
+    samples_per_batch: int | None,
+) -> Tensor | None:
+    """Return a fixed-size, ascending-timestep subset for compiled pixel decoding."""
+    if samples_per_batch is None:
+        return None
+    if timesteps.ndim != 1:
+        raise ValueError("decoder timestep selection requires a one-dimensional tensor")
+    if not 1 <= samples_per_batch <= timesteps.shape[0]:
+        raise ValueError(
+            "training.decoder.samples_per_batch exceeds the local training batch"
+        )
+    return torch.topk(
+        timesteps,
+        k=samples_per_batch,
+        largest=False,
+        sorted=True,
+    ).indices
 
 
 def prepare_training_path(

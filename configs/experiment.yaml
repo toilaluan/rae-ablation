@@ -30,6 +30,7 @@ training:
     update_interval: 1
     updates_per_active_step: 1
     backpropagate_to_flow: true
+    samples_per_batch: null
 
 representations:
   directory: data/direct-representations

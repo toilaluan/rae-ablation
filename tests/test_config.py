@@ -31,6 +31,7 @@ def test_checked_in_joint_schema_config() -> None:
         "update_interval": 1,
         "updates_per_active_step": 1,
         "backpropagate_to_flow": True,
+        "samples_per_batch": None,
     }
     assert vars(config.sampling.internal_guidance) == {
         "scale": 1.78,
@@ -94,6 +95,11 @@ def test_feature_base_and_weight_validation() -> None:
     config = ExperimentConfig()
     config.training.decoder.update_interval = 0
     with pytest.raises(ValueError, match="decoder optimization"):
+        config.validate()
+
+    config = ExperimentConfig()
+    config.training.decoder.samples_per_batch = 0
+    with pytest.raises(ValueError, match="samples_per_batch"):
         config.validate()
 
 

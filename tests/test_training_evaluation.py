@@ -141,3 +141,18 @@ def test_runner_reuses_one_loader_and_one_execution_wrapper(monkeypatch) -> None
 
     assert builds == [1]
     assert advances == [0, 1, 2]
+
+
+def test_flow_detachment_or_sample_selection_does_not_require_unused_parameter_scan() -> None:
+    config = ExperimentConfig()
+    config.training.decoder.backpropagate_to_flow = False
+    assert runner_module._uses_scheduled_decoder(config)
+    assert not runner_module._decoder_has_variable_parameter_usage(config)
+
+    config.training.decoder.backpropagate_to_flow = True
+    config.training.decoder.samples_per_batch = 2
+    assert runner_module._uses_scheduled_decoder(config)
+    assert not runner_module._decoder_has_variable_parameter_usage(config)
+
+    config.training.decoder.update_interval = 2
+    assert runner_module._decoder_has_variable_parameter_usage(config)

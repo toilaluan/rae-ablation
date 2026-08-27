@@ -85,10 +85,14 @@ def model_flops_per_step(
     *,
     decoder_active: bool = True,
     decoder_updates: int = 1,
+    decoder_sample_fraction: float = 1.0,
 ) -> int:
     if decoder_updates < 0 or (not decoder_active and decoder_updates):
         raise ValueError("decoder update count is inconsistent with decoder activity")
+    if not 0 <= decoder_sample_fraction <= 1:
+        raise ValueError("decoder sample fraction must be in [0,1]")
     semantic = ddt_forward_flops(config, decode_pixels=False)
     decoder = ddt_forward_flops(config, decode_pixels=True) - semantic
     updates = decoder_updates if decoder_active else 0
-    return config.optimizer.global_batch_size * 3 * (semantic + updates * decoder)
+    decoder_cost = int(updates * decoder_sample_fraction * decoder)
+    return config.optimizer.global_batch_size * 3 * (semantic + decoder_cost)

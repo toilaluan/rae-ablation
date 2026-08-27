@@ -417,6 +417,14 @@ class PixelFeatureBundle:
             tuple(values.detach() for values in self.decoder),
         )
 
+    def index_select(self, indices: Tensor) -> PixelFeatureBundle:
+        if indices.ndim != 1 or indices.dtype != torch.int64:
+            raise ValueError("pixel feature indices must be a one-dimensional int64 tensor")
+        return PixelFeatureBundle(
+            tuple(values.index_select(0, indices) for values in self.encoder),
+            tuple(values.index_select(0, indices) for values in self.decoder),
+        )
+
 
 class DDT(nn.Module):
     """Joint semantic flow with RAEv2 base prediction and DiP RGB decoding."""

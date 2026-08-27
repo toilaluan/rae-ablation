@@ -64,6 +64,7 @@ class DecoderOptimizationConfig:
     update_interval: int = 1
     updates_per_active_step: int = 1
     backpropagate_to_flow: bool = True
+    samples_per_batch: int | None = None
 
 
 @dataclass
@@ -307,6 +308,11 @@ class ExperimentConfig:
             self.training.decoder.update_interval,
             self.training.decoder.updates_per_active_step,
         )
+        if (
+            self.training.decoder.samples_per_batch is not None
+            and self.training.decoder.samples_per_batch < 1
+        ):
+            raise ValueError("training.decoder.samples_per_batch must be positive")
         if self.data.image_size != IMAGE_SIZE:
             raise ValueError("data.image_size must be 128")
         if (self.data.repository, self.data.revision) != (

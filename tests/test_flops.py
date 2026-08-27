@@ -26,9 +26,16 @@ def test_layer_attention_fusion_and_sparse_updates_are_counted() -> None:
     three_decoders = model_flops_per_step(
         layer_attention, decoder_active=True, decoder_updates=3
     )
+    half_batch = model_flops_per_step(
+        layer_attention,
+        decoder_active=True,
+        decoder_updates=1,
+        decoder_sample_fraction=0.5,
+    )
     decoder_step = layer_attention.optimizer.global_batch_size * 3 * layer_pixels
     assert one_decoder - semantic_step == decoder_step
     assert three_decoders - semantic_step == 3 * decoder_step
+    assert half_batch - semantic_step == decoder_step // 2
 
 
 def test_flop_count_rejects_inactive_decoder_updates() -> None:

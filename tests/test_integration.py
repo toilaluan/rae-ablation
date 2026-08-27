@@ -24,7 +24,11 @@ from cascade_dit.model import DDT, build_model
 from cascade_dit.optim import build_optimizer
 from cascade_dit.rng import RNGStreams
 from cascade_dit.runner import ExperimentRunner
-from cascade_dit.training import ScheduledTrainingModel, compute_training_loss
+from cascade_dit.training import (
+    ScheduledTrainingModel,
+    cleanest_timestep_indices,
+    compute_training_loss,
+)
 
 
 class FastDetailer(nn.Module):
@@ -164,6 +168,46 @@ def test_sparse_decoder_schedule_reuses_features_for_inner_updates() -> None:
         for name, parameter in model.named_parameters()
         if name in pixel_before
     )
+
+
+def test_cleanest_fixed_size_subset_limits_decoder_batch() -> None:
+    timesteps = torch.tensor([0.8, 0.1, 0.6, 0.2])
+    indices = cleanest_timestep_indices(timesteps, 2)
+    assert indices is not None
+    assert torch.equal(indices, torch.tensor([1, 3]))
+
+    config = _config()
+    model = _model(config)
+    execution = ScheduledTrainingModel(model)
+    output, cached = execution(
+        torch.randn(4, 64, 768),
+        timesteps,
+        torch.tensor([0, 1, 2, 3]),
+        mode="joint",
+        pixel_indices=indices,
+    )
+    assert output.full_x0.shape[0] == 4
+    assert output.rgb is not None and output.rgb.shape[0] == 2
+    assert all(values.shape[0] == 2 for values in cached.all)
+
+
+def test_cleanest_subset_selection_compiles_without_dynamic_shapes() -> None:
+    compiled = torch.compile(
+        lambda timesteps: cleanest_timestep_indices(timesteps, 2),
+        backend="eager",
+        fullgraph=True,
+    )
+    selected = compiled(torch.tensor([0.7, 0.3, 0.1, 0.9]))
+    assert torch.equal(selected, torch.tensor([2, 1]))
+
+
+def test_cleanest_subset_rejects_more_than_local_batch() -> None:
+    try:
+        cleanest_timestep_indices(torch.tensor([0.2, 0.4]), 3)
+    except ValueError as error:
+        assert "local training batch" in str(error)
+    else:
+        raise AssertionError("decoder subset must fit within each rank's local batch")
 
 
 def test_cpu_ddp_sparse_decoder_modes_support_unused_parameters(tmp_path) -> None:
