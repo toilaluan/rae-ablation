@@ -109,6 +109,7 @@ def build_lpips(device: torch.device | str) -> nn.Module:
 
     perceptual = lpips.LPIPS(net="vgg").to(device).eval()
     perceptual.requires_grad_(False)
+    perceptual = torch.compile(perceptual)
     return perceptual
 
 

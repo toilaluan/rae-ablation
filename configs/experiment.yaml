@@ -30,7 +30,7 @@ training:
     update_interval: 1
     updates_per_active_step: 1
     backpropagate_to_flow: true
-    samples_per_batch: null
+    samples_per_batch: 64
 
 representations:
   directory: data/direct-representations
@@ -45,7 +45,7 @@ representations:
 model:
   architecture: ddt
   token_dim: 768
-  base_prediction_depth: 8
+  base_prediction_depth: 4
   encoder:
     width: 768
     depth: 12
@@ -55,18 +55,18 @@ model:
     depth: 2
     heads: 16
   pixel_decoder:
-    width: 2048
-    depth: 3
+    width: 1024
+    depth: 8
     heads: 16
-    encoder_features: [4, 8, 12]
+    encoder_features: [2, 4, 6, 8, 12]
     decoder_features: [1, 2]
     fusion:
-      kind: concatenate
+      kind: layer_attention
       layer_attention:
-        width: 768
-        depth: 1
-        heads: 12
-        mlp_ratio: 2.0
+        width: 1024
+        depth: 2
+        heads: 16
+        mlp_ratio: 4.0
   feedforward:
     mlp_ratio: 4.0
   attention:
